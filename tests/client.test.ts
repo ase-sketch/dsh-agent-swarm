@@ -549,12 +549,14 @@ describe("client bundle integration", () => {
     expect(typeof modExports.apply).toBe("function");
   });
 
-  /** 用替身上下文跑一次 apply，捕获槽位注册选项与释放句柄。 */
+  /** 用替身上下文跑一次 apply，捕获槽位注册选项、子插件声明与释放句柄。 */
   async function applyPlugin(modExports: any) {
     const remoteDispose = vi.fn();
     const slotDispose = vi.fn();
     let slotOptions: any;
-    const ctx = {
+    let panelPlugin: any;
+    let panelDispose: (() => void) | undefined;
+    const ctx: any = {
       remote: { $mount: vi.fn(async () => remoteDispose) },
       slots: {
         // 官方 ui-jobs 插件同款契约：inject(key, () => register(options, Component))。
@@ -572,10 +574,48 @@ describe("client bundle integration", () => {
       effect: vi.fn((cb: () => unknown) => {
         cb();
       }),
+      // 父/子 fiber 拆分：真实宿主用 ctx.plugin 加载内联子插件。
+      // 这里同步执行子 apply 并保留其释放句柄；子 ctx 复用同一批替身，既有断言照旧生效。
+      plugin: vi.fn((plugin: any) => {
+        panelPlugin = plugin;
+        const childCtx = {
+          remote: ctx.remote,
+          slots: ctx.slots,
+          locale: ctx.locale,
+          effect: ctx.effect,
+        };
+        panelDispose = plugin.apply(childCtx) as (() => void) | undefined;
+        return { dispose: () => panelDispose?.() };
+      }),
     };
     const dispose = await modExports.apply(ctx);
-    return { ctx, slotOptions, slotDispose, remoteDispose, dispose };
+    return { ctx, slotOptions, slotDispose, remoteDispose, dispose, getPanelPlugin: () => panelPlugin };
   }
+
+  it("命名空间服务只对声明它的 fiber 可见：必须在子 fiber 的 inject 里声明 remote.swarm，且挂载先于子插件加载", async () => {
+    const { modExports } = await loadPluginExports();
+    const fake = installFakeDocument();
+    try {
+      const { ctx, getPanelPlugin } = await applyPlugin(modExports);
+      const panel = getPanelPlugin();
+
+      expect(panel).toBeDefined();
+      // 消费侧：子 fiber 必须逐字声明点号服务名，否则运行期会被 cordis 隔离挡掉
+      //（0.3.4 面板报的 cannot get property "remote.swarm" without inject 就是这个原因）。
+      expect(panel.inject).toContain("remote.swarm");
+      expect(panel.inject).toContain("remote");
+      // 提供侧：父 fiber 绝不能声明自己挂载出来的服务——那要等它自己的 apply 跑完，会死锁。
+      expect(modExports.inject).not.toContain("remote.swarm");
+      // 顺序：先 $mount 提供命名空间，再加载子插件消费。
+      expect(ctx.remote.$mount).toHaveBeenCalledTimes(1);
+      expect(ctx.plugin).toHaveBeenCalledTimes(1);
+      expect(ctx.remote.$mount.mock.invocationCallOrder[0]).toBeLessThan(
+        ctx.plugin.mock.invocationCallOrder[0] as number,
+      );
+    } finally {
+      fake.restore();
+    }
+  });
 
   it("apply 期一次性注入样式（不再每次 re-render 都查 DOM）", async () => {
     const { modExports } = await loadPluginExports();

@@ -16,7 +16,9 @@ src/
   remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符（零宿主依赖）
   index.ts               插件入口 apply(ctx)：注册工具、接 ctx.subagents、装配调度器与 registry
   client/                同包 client 半（由 scripts/build-client.mjs 单独打包，不进 tsc 产物）
-    index.ts               client 入口 apply(ctx)：$mount Remote、注入标题栏槽位、注册字典
+    index.ts               client 入口 apply(ctx)：**父 fiber** 只做 $mount Remote（提供 remote.swarm 命名空间），
+                       随后用 ctx.plugin 载入**子 fiber**（inject 声明 remote.swarm）注册槽位与字典
+                       —— 提供与消费必须分属两个 fiber，理由见决策笔记 2026-10-01-client-namespace-inject-isolation.md
     model.ts               会话/成员视图的内存模型（useSwarm 的订阅源）
     service.ts             按会话引用计数订阅 swarm/roster 流
     SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式）

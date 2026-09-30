@@ -383,3 +383,27 @@
 
 **本轮回归证据**：全量 `pnpm test` 由 172 → **217** 条（7 文件），`pnpm typecheck` exit 0；每笔都有红→绿（重构类用定向变异或 21 场景 XML 快照逐字节一致作证）。
 
+### 交付后实测缺陷：面板流从未连通（0.3.5 修复）
+
+**发现方式**：用户重启 DSH 后目测（本轮唯一能覆盖"真实宿主装配"的手段），面板显示
+`流连接中断：cannot get property "remote.swarm" without inject`。此前该错误被静默吞掉（P2 才让流异常可见），
+所以缺陷一直存在但不可见——**这也说明本报告的"已验证"此前只到文件级，未到运行时装配级**。
+
+**根因**（读客户端 bundle 复验，非推测）：DSH 的 `installNamespace` 用
+`this.ownerCtx.plugin({ name: remoteServiceKey(name), apply: (ctx) => new RemoteNamespaceService(ctx, name, …) })`
+创建命名空间，而 `remoteServiceKey(ns) === "remote." + ns`；其注释明确"消费方 park 在该服务上"。
+cordis 的服务解析按 fiber 链查找并用 isolate 键隔离，未在 `inject` 里声明的访问直接抛
+`cannot get property "…" without inject`。官方消费方正是这样声明的：
+`@deepseek-ai/dsh-api-job-controller/client` 的 `inject = ["remote", "remote.job"]`。
+
+**为什么原实现必然失败**：本插件既是提供者又是消费者。静态 `inject` 在 `apply` 之前解析，
+而该服务要等本 fiber 的 `apply` 跑完才存在——声明→死锁，不声明→被隔离挡掉。
+
+**修法**：客户端入口拆成"父 fiber 提供 / 子 fiber 消费"——父 fiber 只做 `$mount`，
+子 fiber 以 `inject: ["remote","slots","locale","remote.swarm"]` 注册槽位、字典与服务。
+决策与备选方案见决策笔记 `2026-10-01-client-namespace-inject-isolation.md`。
+
+**证据**：新增用例「命名空间服务只对声明它的 fiber 可见」钉住三点——子 `inject` 必须含 `remote.swarm`、
+父 `inject` 必须**不含**它（防死锁回退）、`$mount` 调用必须早于 `ctx.plugin`；全量 218/218 绿、typecheck 0。
+**仍未验证**：真实浏览器/Electron 下的渲染与流连通，需再次重启目测。
+
