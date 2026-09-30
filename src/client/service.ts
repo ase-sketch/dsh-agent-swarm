@@ -159,10 +159,12 @@ export class ClientSwarmService {
           : String(error);
 
     this.model.streamFailed(sessionId, message);
-    console.warn(
-      `[agent-swarm] roster stream for session ${sessionId} terminated: ${message}`,
-      error,
-    );
+    // 只在确实有错误对象时把它作为附加参数（否则 Node 会把 undefined 也打出来，日志里多一个噪音 "undefined"）
+    if (error === undefined) {
+      console.warn(`[agent-swarm] roster stream for session ${sessionId} terminated: ${message}`);
+    } else {
+      console.warn(`[agent-swarm] roster stream for session ${sessionId} terminated: ${message}`, error);
+    }
 
     entry.stop();
   }
