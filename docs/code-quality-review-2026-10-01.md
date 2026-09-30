@@ -280,3 +280,39 @@
 - 客户端：`src/client/service.ts:40-94`、`src/client/index.ts:17/42-56`、`src/client/SwarmHeaderAction.tsx:5/297/441-449`
 - 测试：`tests/client.test.ts:47/113`、`tests/plugin.test.ts:664-671/711`、`tests/scheduler.test.ts:64/136-146/279/556-577`
 - 文档：`ARCHITECTURE.md:7-22`、`docs/spec.md`（功能清单 3 / 二期）、`THIRD-PARTY-NOTICES.md:8-16/20-26`、`src/validate.ts:5`、`src/types.ts:4-6`
+
+---
+
+## 十、修复进展（第一轮，2026-10-01 当日完成）
+
+修复分两个波次落地。开始修复前先补建版本控制（`3e1ab2a`），因此每一笔都可逐笔回溯/回退。
+
+| 条目 | 处置 | 落在哪 |
+|---|---|---|
+| P1-1 限流子系统不可达 + 注释矛盾 | 对齐文档、**不盲接**（理由见决策笔记） | `1edce1a` + `docs/spec.md`「交付状态」+ 决策笔记 |
+| P1-2 中断后 registry 与 XML 结论相反 | 已修复（含残余竞态） | `cd7be49`：通知覆盖未启动成员 + `markSettled` 终态粘性守卫 |
+| P1-3 属性值未做字符引用转义 | 已修复 | `1edce1a`（6 条规范性测试） |
+| P1-4 空/空白 item 放行 | 已修复（新增第六道校验） | `1edce1a`（`ITEM_EMPTY`/`ITEM_NOT_STRING` + 8 条失败路径用例） |
+| P1-5 结果块丢弃 `agent_id` | 已修复 | `1edce1a`（6 条用例） |
+| P1-6 测试与交付物错位 | 已修复 | `1edce1a`（先构建 + 内存打包 + 真实 dist 加载 + 红线用例） |
+| P1-7 `ARCHITECTURE.md` 过期 | 已修复 | `1edce1a`（12 源文件 + 依赖/数据流/构建链 + 维护规则） |
+| P1-8 第三方登记与文案 | 已修复 | `1edce1a`（两条）+ `cd7be49`（第三条）+ NOTICES §1/§2/§3/§7 |
+| P1-9 无版本控制 | 已处置 | `3e1ab2a`（`git init` + `.gitignore` + 基线提交）；旧 `.tgz` 保留未删（可逆优先） |
+
+**关键证据（父代理亲自复跑，非子代理自证）**
+
+- 全量：`pnpm test` **167/167 绿**（7 文件，基线 137）；`pnpm typecheck` exit 0。
+- P1-2 红→绿：`expected 'failed' to be 'aborted'`、`expected [] to deeply equal [2..8]` → 全绿。
+- P1-2 残余竞态双版本对照：基线（无守卫）`{成员 failed, 批次 failed}` → 有守卫 `{成员 aborted, 批次 aborted}`。
+- P1-6 变异测试：向 `dist/index.js` 注入 `export default` / 改名 → 新红线用例如期变红。
+
+**未修（登记为 backlog，理由见各条）**：全部 P2（调度器死代码内的 4 条潜在缺陷、可维护性、客户端僵尸订阅与倒计时、测试断言松弛）；其中"引入 jsdom/@testing-library 做 React 渲染测试"按"引入依赖先问"纪律未做。
+
+**新增已知项（本轮发现、未改动）**：单成员 `stopReason=aborted` 时 registry 落 aborted 而 XML 落 failed —— 即既有的"取消与失败未分档"，已在 `THIRD-PARTY-NOTICES.md` §6 登记。
+
+**未验证（诚实声明）**：
+
+- 修复后的真实 provider 行为（429 退避仍不可达，属 P1-1 的既定处置）；
+- 面板真机渲染（需重启 DSH 后目测）；
+- `pnpm pack` 产物在三个 profile 的安装结果（见交付说明）。
+
