@@ -314,7 +314,9 @@
 
 - 修复后的真实 provider 行为（429 退避仍不可达，属 P1-1 的既定处置）；
 - 面板真机渲染（需重启 DSH 后目测）；
-- **已验证（2026-10-01 交付）**：`dsh-agent-swarm-0.3.3.tgz`（67,308 B）已装入 web / desktop / headless 三个 profile——安装前后 `package.json` 差异**只有本包依赖行**（依赖数 12→12、bundles 14→14），三个 profile 的 `dist/index.js` 与工作区**逐字节一致**，三者 `dsh --profile <p> --dump-config` 均 exit 0 且 `agent-swarm` 恰 1 行、无 bundle 被 skip。
+- **已验证（2026-10-01 交付）**：`dsh-agent-swarm-0.3.3.tgz`（67,308 B）已装入 web / desktop / headless 三个 profile。
+  · **文件级**（三者都核过）：安装前后 `package.json` 差异**只有本包依赖行**（依赖数 12→12、bundles 14→14 未变），三个 profile 的 `dist/index.js` 与工作区**逐字节一致**，版本均 0.3.3。
+  · **运行级**：`dsh --profile web|headless --dump-config` 均 exit 0、`agent-swarm` 恰 1 行；**desktop 无法用 CLI 验证**——`dsh` 明确拒绝（`error: profile "desktop" is managed exclusively by the Electron application`，设计如此，非本次改动所致），其运行时生效需用户重启 Electron 后确认。
 
 ### 十·补、独立验证与跟进（同日）
 
