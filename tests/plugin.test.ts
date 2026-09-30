@@ -16,6 +16,12 @@ import { Context } from "@deepseek-ai/cordis";
 import Loader from "@deepseek-ai/cordis-plugin-loader";
 import * as plugin from "../src/index.js";
 import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
+import {
+  DEFAULT_SWARM_SCHEDULER_CONFIG,
+  DEFAULT_TASK_TIMEOUT_MS,
+  SWARM_MAX_SUBAGENTS,
+  SWARM_MIN_ITEMS,
+} from "../src/types.js";
 import type { SwarmBatch, SwarmPhase, SwarmRegistry } from "../src/swarm-registry.js";
 
 // ───────────────────────── mock Context ─────────────────────────
@@ -164,7 +170,7 @@ describe("A. 插件声明形态", () => {
   });
 
   it("Config 给全部字段默认值：provider=spawn、超时 2h、maxItems=128、调度参数取默认表", () => {
-    const resolved = (plugin.Config as (v?: unknown) => unknown)();
+    const resolved = (plugin.Config as (v?: unknown) => unknown)() as Record<string, unknown>;
     expect(resolved).toMatchObject({
       provider: "spawn",
       firstWave: 5,
@@ -173,9 +179,14 @@ describe("A. 插件声明形态", () => {
       retryFactor: 2,
       shrinkDebounceMs: 2000,
       recoverIntervalMs: 180_000,
-      taskTimeoutMs: 7_200_000,
       maxItems: 128,
     });
+    // 单任务超时默认值与宿主配置共用同一具名常量（src/types.ts 的 DEFAULT_TASK_TIMEOUT_MS）
+    expect(resolved.taskTimeoutMs).toBe(DEFAULT_TASK_TIMEOUT_MS);
+    // 2h 只属于"宿主侧默认值"：绝不能并入调度器默认表——调度器的 timeoutMs 默认语义是
+    // undefined = 不超时，把它一起默认成 2h 属于行为变更，这里钉死这条边界。
+    expect("timeoutMs" in DEFAULT_SWARM_SCHEDULER_CONFIG).toBe(false);
+    expect(DEFAULT_SWARM_SCHEDULER_CONFIG.timeoutMs).toBeUndefined();
   });
 });
 
@@ -207,8 +218,8 @@ describe("B. defineTool 注册形态", () => {
     const description = definition.description;
     expect(description).toMatch(/subagents/i);
     // 六道硬校验
-    expect(description).toMatch(/at least 2 entries/);
-    expect(description).toMatch(/at most 128 entries/);
+    expect(description).toMatch(/at least \d+ entries/);
+    expect(description).toMatch(/at most \d+ entries/);
     expect(description).toMatch(/prompt_template/);
     expect(description).toMatch(/\{\{item\}\}/);
     // 与单个 subagent 工具的分工
@@ -216,6 +227,22 @@ describe("B. defineTool 注册形态", () => {
     // 禁止嵌套
     expect(description).toMatch(/depth is capped at 1/i);
     expect(description).toMatch(/[Nn]esting a swarm/);
+  });
+
+  it("工具描述的数量由 SWARM_MIN_ITEMS / SWARM_MAX_SUBAGENTS 插值：常量一动，文案必须跟着动", () => {
+    // 期望文本刻意用常量拼出，而不是写死 "2"/"128"：文案若退回硬编码字面量、
+    // 常量又被改过，这条就会红——守护的正是"模型收到的说明 == 实际校验用的常量"。
+    const { definition } = createHarness();
+    const description = definition.description;
+    expect(description).toContain(`N (${String(SWARM_MIN_ITEMS)} to ${String(SWARM_MAX_SUBAGENTS)})`);
+    expect(description).toContain(`items must contain at least ${String(SWARM_MIN_ITEMS)} entries.`);
+    expect(description).toContain(`items must contain at most ${String(SWARM_MAX_SUBAGENTS)} entries.`);
+
+    // 参数级文案同源：items 的说明同样在告诉模型数量边界
+    const items = (definition.parameters as { properties: { items: { description: string } } }).properties.items;
+    expect(items.description).toContain(
+      `at least ${String(SWARM_MIN_ITEMS)} and at most ${String(SWARM_MAX_SUBAGENTS)} entries.`,
+    );
   });
 
   it("output.schema 是 {xml:string}，render 两参并返回内容块数组", () => {
@@ -953,5 +980,66 @@ describe("G. WP-C2：中断 / 失败 / 超时三类收场的结论一致性", ()
     expect(phasesOf(batch)).toEqual(["failed", "failed"]);
     // 自报的原因没丢，只是相位与 XML 对齐成 failed
     expect(batch?.members.get(1)?.detail).toContain("aborted");
+  });
+});
+
+// ───────────────────────── H. WP-P2-2：宿主终态映射与 XML 渲染同结论 ─────────────────────────
+
+/** 从 XML 按渲染顺序取出每个成员的 (item, outcome)，供与 registry 相位逐项对照。 */
+function memberOutcomesFromXml(xml: string): Array<{ item: string; outcome: string }> {
+  return [...xml.matchAll(/<subagent\b([^>]*)>/g)].map((match) => {
+    const attrs = match[1] ?? "";
+    return {
+      item: /item="([^"]*)"/.exec(attrs)?.[1] ?? "",
+      outcome: /outcome="([^"]*)"/.exec(attrs)?.[1] ?? "",
+    };
+  });
+}
+
+/** registry 侧的同一批成员，按 index 升序（= XML 各成员的渲染顺序）。 */
+function memberPhasesOf(batch: SwarmBatch | undefined): Array<{ item: string; outcome: string }> {
+  if (batch === undefined) return [];
+  return [...batch.members.values()]
+    .sort((a, b) => a.index - b.index)
+    .map((member) => ({ item: member.item, outcome: member.phase }));
+}
+
+describe("H. WP-P2-2：内部结局经宿主映射后与 XML 渲染同结论", () => {
+  it("completed 档与 cancelled（批次中断、成员尚未启动）档：逐成员相位与 XML outcome 一致", async () => {
+    // ① completed 档：成员真的跑完 → 走宿主 toSettledPhase 的 completed 分支
+    const completedHarness = createHarness();
+    const completedRun = (await completedHarness.definition.execute(
+      validArgs(),
+      makeExec() as never,
+    )) as { xml: string };
+    expect(memberOutcomesFromXml(completedRun.xml).map((member) => member.outcome)).toEqual([
+      "completed",
+      "completed",
+      "completed",
+    ]);
+    // 同一输入：宿主经 helper 落到 registry 的相位，必须与 XML 渲染出的 outcome 逐成员同结论
+    expect(memberOutcomesFromXml(completedRun.xml)).toEqual(
+      memberPhasesOf(latestBatchOf(completedHarness.ctx)),
+    );
+
+    // ② cancelled 档：批次在任何成员启动之前就已被中断——这些成员只能经调度器
+    //    onAbandoned（outcome: "cancelled"）落终态，也就是宿主 toSettledPhase 的 cancelled 分支。
+    const interruptedHarness = createHarness();
+    const controller = new AbortController();
+    controller.abort();
+    const interruptedRun = (await interruptedHarness.definition.execute(
+      validArgs(),
+      makeExec(controller.signal) as never,
+    )) as { xml: string };
+    // 前置条件：一个成员都没启动（否则测到的是"成员已在跑"的另一条路径）
+    expect(interruptedHarness.startCalls).toHaveLength(0);
+    expect(memberOutcomesFromXml(interruptedRun.xml).map((member) => member.outcome)).toEqual([
+      "aborted",
+      "aborted",
+      "aborted",
+    ]);
+    expect(memberOutcomesFromXml(interruptedRun.xml)).toEqual(
+      memberPhasesOf(latestBatchOf(interruptedHarness.ctx)),
+    );
   });
 });

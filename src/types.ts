@@ -121,6 +121,16 @@ export const DEFAULT_SWARM_SCHEDULER_CONFIG: SwarmSchedulerConfig = {
   capacityRecoveryIntervalMs: 180_000,
 };
 
+/**
+ * 宿主插件（src/index.ts 的 `Config.taskTimeoutMs`）单任务超时的默认值：2 小时。
+ *
+ * 为什么是独立常量、不进 {@link DEFAULT_SWARM_SCHEDULER_CONFIG}：
+ * 调度器对超时的默认语义是 **undefined（或 <=0）= 不超时**（见 {@link SwarmSchedulerConfig.timeoutMs}）。
+ * 把 2h 塞进上面那张默认表，等于把调度器自身的默认从"不超时"改成"2h"——那是行为变更，
+ * 不是文案/常量归位。因此这里只给宿主侧默认值一个具名常量，由宿主显式透传给调度器。
+ */
+export const DEFAULT_TASK_TIMEOUT_MS = 7_200_000;
+
 /** 限流惩罚档位建议。执行函数无法区分时返回 `in-flight-limited`（轻罚，安全默认）。 */
 export type SwarmRateLimitClass = "first-request-blocked" | "in-flight-limited";
 
