@@ -124,34 +124,62 @@ export interface SwarmPluginConfig {
   agentOptions?: SwarmAgentOptions;
 }
 
-// ───────────────────────── 工具描述（面向模型，全文自拟）─────────────────────────
+// ──────────────────────── 生效上限（描述与校验的唯一口径）────────────────────────
+
+/**
+ * 生效的 items 上限 = min(config.maxItems, SWARM_MAX_SUBAGENTS)。
+ *
+ * 这是全插件**唯一**算上限的地方：工具描述、参数描述与运行时校验全部调它。
+ * 集中在一处是本条契约能成立的唯一保证——三处各算一遍，
+ * 即便写法一样，下一次改其中一处就会重新分叉出“文案说 10、校验按 128”或反之的偏差。
+ *
+ * 协议常量 128 是硬上限，宿主只允许调低；调高（如 999）在这里被静默收敛回 128。
+ */
+function effectiveMaxItems(config: SwarmPluginConfig): number {
+  return Math.min(config.maxItems, SWARM_MAX_SUBAGENTS);
+}
+
+// ──────────────────────── 工具描述（面向模型，全文自拟）────────────────────────
 
 /**
  * 工具描述：英文、面向模型、全部自拟（clean-room，未复制任何上游原文）。
  * 覆盖四块：用途 / 六道硬校验 / 与单个 subagent 工具的分工 / 禁止嵌套（maxDepth=1）。
  *
- * 两处数量（`N (x to y)` 与校验 1/2 的条目数）由 SWARM_MIN_ITEMS / SWARM_MAX_SUBAGENTS
- * **插值生成**，不写字面量：否则改常量不会同步改文案，模型收到的说明会与实际校验不符。
+ * 文案里的**上界一律取生效上限**（{@link effectiveMaxItems}），不是协议常量 128。
+ * 理由：模型是照着这段说明去规划批量的——若宿主把 config.maxItems 调到 10，
+ * 描述却仍写 "at most 128"，模型会按 128 去切批，然后被第 11 条以
+ * TOO_MANY_SUBAGENTS 拒掉，"描述与运行时校验不符"会变成稳定可复现的浪费。
+ * 因此描述在 apply 期按 config 生成（每个插件实例各一份），与校验走同一个上限函数，
+ * 不存在"文案一个数、校验另一个数"的可能。
+ *
+ * 下界仍取 SWARM_MIN_ITEMS（协议常量，宿主不可调）。
+ *
+ * 协议硬上限的说明始终保留：它解释的是"为什么宿主只能调低"，即便生效上限正好等于
+ * 128（宿主未调低）也要写——否则配置作者看不到这条不可绕过的边界。
  */
-const TOOL_DESCRIPTION = [
-  "Dispatch a batch of independent, same-shaped tasks as multiple parallel subagents, and receive every member's result in one aggregated XML report.",
-  "",
-  `Use this when you have N (${String(SWARM_MIN_ITEMS)} to ${String(SWARM_MAX_SUBAGENTS)}) self-contained subtasks of the same kind that can run in parallel without depending on each other's output — reviewing N files the same way, researching N independent topics, applying one transform to N inputs. Each entry in items is substituted into prompt_template and dispatched as its own subagent; the call returns a single <agent_swarm_result> block listing every member's outcome and output.`,
-  "",
-  "Hard requirements (the call is rejected before any subagent starts if violated):",
-  `1. items must contain at least ${String(SWARM_MIN_ITEMS)} entries.`,
-  `2. items must contain at most ${String(SWARM_MAX_SUBAGENTS)} entries.`,
-  "3. if you provide items, you must also provide prompt_template.",
-  "4. prompt_template must contain the {{item}} placeholder, which is replaced once per item.",
-  "5. every item must expand to a distinct prompt; items that expand to the same prompt are rejected.",
-  "",
-  "How to choose between this tool and a single-subagent tool:",
-  "- Use this tool for several independent, same-shaped tasks that benefit from running at the same time.",
-  "- Use a single-subagent tool when the work is one cohesive task, or when a later step depends on an earlier step's result — swarm members cannot see each other or your intermediate work.",
-  "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported (delegation depth is capped at 1); call it from your own turn instead.",
-  "",
-  "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
-].join("\n");
+function buildToolDescription(effectiveMax: number): string {
+  return [
+    "Dispatch a batch of independent, same-shaped tasks as multiple parallel subagents, and receive every member's result in one aggregated XML report.",
+    "",
+    `Use this when you have N (${String(SWARM_MIN_ITEMS)} to ${String(effectiveMax)}) self-contained subtasks of the same kind that can run in parallel without depending on each other's output — reviewing N files the same way, researching N independent topics, applying one transform to N inputs. Each entry in items is substituted into prompt_template and dispatched as its own subagent; the call returns a single <agent_swarm_result> block listing every member's outcome and output.`,
+    "",
+    "Hard requirements (the call is rejected before any subagent starts if violated):",
+    `1. items must contain at least ${String(SWARM_MIN_ITEMS)} entries.`,
+    `2. items must contain at most ${String(effectiveMax)} entries.`,
+    "3. if you provide items, you must also provide prompt_template.",
+    "4. prompt_template must contain the {{item}} placeholder, which is replaced once per item.",
+    "5. every item must expand to a distinct prompt; items that expand to the same prompt are rejected.",
+    "",
+    `Item-count limit: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} entries and cannot be raised; the host can only lower it, and the effective limit on this deployment is ${String(effectiveMax)}. Plan and split your batch against the number stated in requirement 2 above — submitting more than the effective limit is rejected.`,
+    "",
+    "How to choose between this tool and a single-subagent tool:",
+    "- Use this tool for several independent, same-shaped tasks that benefit from running at the same time.",
+    "- Use a single-subagent tool when the work is one cohesive task, or when a later step depends on an earlier step's result — swarm members cannot see each other or your intermediate work.",
+    "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported (delegation depth is capped at 1); call it from your own turn instead.",
+    "",
+    "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
+  ].join("\n");
+}
 
 // ───────────────────────── 限流判定（一期：时间与存活率启发式）─────────────────────────
 
@@ -391,27 +419,34 @@ async function runOneTask(
 
 // ───────────────────────── 工具注册与 apply ─────────────────────────
 
-/** 扁平参数映射：description / prompt_template / items；required 只写布尔 true。 */
-const TOOL_PARAMETERS = {
-  description: {
-    type: "string",
-    required: true,
-    description: "One short sentence describing what this whole batch accomplishes.",
-  },
-  prompt_template: {
-    type: "string",
-    required: true,
-    description:
-      "Prompt template sent to every member, containing the {{item}} placeholder. Each entry of items is substituted for it to form one member's full prompt.",
-  },
-  items: {
-    type: "array",
-    items: { type: "string" },
-    required: true,
-    // 与 TOOL_DESCRIPTION 同一套常量插值：文案里的数量永远跟随校验常量。
-    description: `The independent per-member inputs, at least ${String(SWARM_MIN_ITEMS)} and at most ${String(SWARM_MAX_SUBAGENTS)} entries.`,
-  },
-} as const;
+/**
+ * 扁平参数映射：description / prompt_template / items；required 只写布尔 true。
+ *
+ * 与 buildToolDescription 同理：items 的上界取**生效上限**而非协议常量 128。
+ * 参数描述是模型填参时直接对着的文案，
+ * 它说 128 就会让模型往里塞 128 条，因此与工具描述同一标准（同一上限函数）。
+ */
+function buildToolParameters(effectiveMax: number) {
+  return {
+    description: {
+      type: "string",
+      required: true,
+      description: "One short sentence describing what this whole batch accomplishes.",
+    },
+    prompt_template: {
+      type: "string",
+      required: true,
+      description:
+        "Prompt template sent to every member, containing the {{item}} placeholder. Each entry of items is substituted for it to form one member's full prompt.",
+    },
+    items: {
+      type: "array",
+      items: { type: "string" },
+      required: true,
+      description: `The independent per-member inputs, at least ${String(SWARM_MIN_ITEMS)} and at most ${String(effectiveMax)} entries. Plan against this number: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} and cannot be raised, so on this deployment the host can only lower the cap, and more than ${String(effectiveMax)} entries is rejected before any subagent starts.`,
+    },
+  } as const;
+}
 
 /** 输出契约：{ xml: string }，render 两参（args, value），返回内容块数组。 */
 const TOOL_OUTPUT = {
@@ -452,7 +487,8 @@ function resolveSwarmSpecs(args: SwarmExecuteArgs, config: SwarmPluginConfig): S
 
   // 宿主策略上限：M1 的 128 硬校验不可绕过，config.maxItems 只能把它调低。
   // 与六道硬校验同一层（同样结构化报错），同样在启动任何子代理之前拒绝。
-  const effectiveMax = Math.min(config.maxItems, SWARM_MAX_SUBAGENTS);
+  // 取值走 effectiveMaxItems：与描述同一口径，正是为了防“校验说 10、文案说 128”的分叉。
+  const effectiveMax = effectiveMaxItems(config);
   if (specs.length > effectiveMax) {
     throw swarmValidationError({
       code: SWARM_ERROR_CODES.TOO_MANY_SUBAGENTS,
@@ -575,10 +611,14 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
     new SwarmRemote(ctx, registry);
   }
 
+  // 描述在 apply 期按**生效上限**生成，不是模块级常量：宿主把 config.maxItems 调低后，
+  // 模型收到的必须与下面 resolveSwarmSpecs 拒绝它时用的是同一个数。
+  const effectiveMax = effectiveMaxItems(config);
+
   const agentSwarm = defineTool({
     name: "agent_swarm",
-    description: TOOL_DESCRIPTION,
-    parameters: TOOL_PARAMETERS,
+    description: buildToolDescription(effectiveMax),
+    parameters: buildToolParameters(effectiveMax),
     output: TOOL_OUTPUT,
     // 与官方 subagent 工具一致：允许模型在同一条消息里并发调用多个 agent_swarm。
     isConcurrencySafe: () => true,

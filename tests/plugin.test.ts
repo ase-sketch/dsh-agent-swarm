@@ -34,6 +34,8 @@ interface StartCall {
 interface MockContextOptions {
   /** 每个成员的 stopReason（按调用次序循环取用）。 */
   stopReasons?: string[];
+  /** 覆盖 apply 收到的 config（默认为 defaultConfig()）；用于观察描述是否跟随 config 变。 */
+  config?: Parameters<typeof plugin.apply>[1];
   /** start() 直接抛错的调用序号（0-based）。 */
   failStartAt?: number[];
   /** run.result 是否 reject。 */
@@ -108,7 +110,7 @@ function createHarness(options: MockContextOptions = {}): MockHarness {
     },
   });
 
-  const dispose = plugin.apply(ctx, defaultConfig());
+  const dispose = plugin.apply(ctx, options.config ?? defaultConfig());
   if (registry.current === undefined) throw new Error("apply() did not register a tool");
   return {
     ctx,
@@ -229,19 +231,22 @@ describe("B. defineTool 注册形态", () => {
     expect(description).toMatch(/[Nn]esting a swarm/);
   });
 
-  it("工具描述的数量由 SWARM_MIN_ITEMS / SWARM_MAX_SUBAGENTS 插值：常量一动，文案必须跟着动", () => {
-    // 期望文本刻意用常量拼出，而不是写死 "2"/"128"：文案若退回硬编码字面量、
-    // 常量又被改过，这条就会红——守护的正是"模型收到的说明 == 实际校验用的常量"。
+  it("工具描述的数量插值生效上限：宿主调低 maxItems 后文案必须跟着调低", () => {
+    // 期望文本刻意用 effectiveMax = min(config.maxItems, SWARM_MAX_SUBAGENTS) 拼出，
+    // 而不是写死 "2"/"128"：文案若退回协议常量，宿主一调低就会红——
+    // 守护的正是"模型收到的上界 == 实际拒绝它时用的上界"。
+    const effectiveMax = Math.min(defaultConfig().maxItems, SWARM_MAX_SUBAGENTS);
+    expect(effectiveMax).toBe(SWARM_MAX_SUBAGENTS); // 本用例走默认配置，生效值就是协议常量
     const { definition } = createHarness();
     const description = definition.description;
-    expect(description).toContain(`N (${String(SWARM_MIN_ITEMS)} to ${String(SWARM_MAX_SUBAGENTS)})`);
+    expect(description).toContain(`N (${String(SWARM_MIN_ITEMS)} to ${String(effectiveMax)})`);
     expect(description).toContain(`items must contain at least ${String(SWARM_MIN_ITEMS)} entries.`);
-    expect(description).toContain(`items must contain at most ${String(SWARM_MAX_SUBAGENTS)} entries.`);
+    expect(description).toContain(`items must contain at most ${String(effectiveMax)} entries.`);
 
     // 参数级文案同源：items 的说明同样在告诉模型数量边界
     const items = (definition.parameters as { properties: { items: { description: string } } }).properties.items;
     expect(items.description).toContain(
-      `at least ${String(SWARM_MIN_ITEMS)} and at most ${String(SWARM_MAX_SUBAGENTS)} entries.`,
+      `at least ${String(SWARM_MIN_ITEMS)} and at most ${String(effectiveMax)} entries.`,
     );
   });
 
@@ -1041,5 +1046,102 @@ describe("H. WP-P2-2：内部结局经宿主映射后与 XML 渲染同结论", (
     expect(memberOutcomesFromXml(interruptedRun.xml)).toEqual(
       memberPhasesOf(latestBatchOf(interruptedHarness.ctx)),
     );
+  });
+});
+
+// ───────────────────────────────────── I. WP-P2-6：描述上限与运行时校验同源 ───────────────────────────────
+
+/**
+ * 模型能看见的两份文案：工具描述与参数 items 描述。
+ * 两者都必须写**生效上限**，而非协议常量 128。
+ */
+function descriptionsOf(definition: ToolDefinition): { tool: string; items: string } {
+  return {
+    tool: definition.description,
+    items: (definition.parameters as { properties: { items: { description: string } } }).properties.items
+      .description,
+  };
+}
+
+describe("I. WP-P2-6：策略上限与工具描述联动", () => {
+  it("① maxItems=10：工具描述与参数描述都写 10，不存在“可提交 128 条”的误导表述", () => {
+    // 修复前的病态：描述写死常量 128，模型照 128 规划，然后被第 11 条拒掉。
+    const { definition } = createHarness({ config: { ...defaultConfig(), maxItems: 10 } });
+    const { tool, items } = descriptionsOf(definition);
+
+    // 两份文案的可提交上界各自写 10（工具描述说 "at most 10 entries"，
+    // 参数描述说 "at least 2 and at most 10 entries"）——两者不得分叉。
+    expect(tool).toContain("items must contain at most 10 entries.");
+    expect(items).toContain("at least 2 and at most 10 entries.");
+    // 工具描述另一处数量（N 的范围）也跟着调低
+    expect(tool).toContain("N (2 to 10)");
+
+    for (const text of [tool, items]) {
+      // 任何把 128 写成"可提交上限"的表述都不得存在
+      expect(text).not.toMatch(/at most 128/);
+      expect(text).not.toMatch(/N \\(2 to 128\\)/);
+      // 但协议硬上限的说明必须保留：它解释的是"宿主为什么只能调低"
+      expect(text).toContain("protocol hard limit is 128");
+      expect(text).toContain("cannot be raised");
+      // 且必须明说本部署生效值，避免把 128 误读成本部署上限
+      expect(text).toMatch(/effective limit on this deployment is 10|host can only lower the cap, and more than 10/);
+    }
+  });
+
+  it("② maxItems=10：传 11 条时报错的 details.max 与描述里的上限完全一致", async () => {
+    // 同一个数字同时出现在文案与错误 details 里，才算"描述 == 校验"。
+    const harness = createHarness({ config: { ...defaultConfig(), maxItems: 10 } });
+    const items = Array.from({ length: 11 }, (_, i) => `item-${String(i)}`);
+    await expect(
+      harness.definition.execute(validArgs({ items }), makeExec() as never),
+    ).rejects.toMatchObject({
+      name: "SwarmValidationError",
+      swarmErrorCode: "TOO_MANY_SUBAGENTS",
+      swarmErrorDetails: { total: 11, max: 10 },
+    });
+    // 拒绝发生在任何子代理启动之前
+    expect(harness.startCalls).toHaveLength(0);
+
+    // 把描述里的上限拿出来与 details.max 对照：两份文案写的是同一个数，
+    // 而非仅似然相等的两个常量。
+    const { tool, items: paramText } = descriptionsOf(harness.definition);
+    const toolLimit = /at most (\d+) entries/.exec(tool)?.[1];
+    const paramLimit = /at least \d+ and at most (\d+) entries/.exec(paramText)?.[1];
+    expect(toolLimit).toBe("10");
+    expect(paramLimit).toBe("10");
+  });
+
+  it("③ 默认配置（未设 maxItems）：描述写 128，且仍保留协议硬上限说明", () => {
+    // 回归护栏：本次改动只能让描述跟随 maxItems，不能改动未设该项时的默认口径。
+    // 这里走 Schema 解析的真实默认值（而非测试自己写的 defaultConfig）。
+    const appliedConfig = (plugin.Config as (v?: unknown) => unknown)() as Parameters<
+      typeof plugin.apply
+    >[1];
+    const effectiveMax = Math.min(appliedConfig.maxItems, SWARM_MAX_SUBAGENTS);
+    expect(effectiveMax).toBe(SWARM_MAX_SUBAGENTS);
+
+    const { definition } = createHarness({ config: appliedConfig });
+    const { tool, items } = descriptionsOf(definition);
+    expect(tool).toContain(`N (${String(SWARM_MIN_ITEMS)} to ${String(SWARM_MAX_SUBAGENTS)})`);
+    expect(tool).toContain(`items must contain at most ${String(SWARM_MAX_SUBAGENTS)} entries.`);
+    expect(items).toContain(
+      `at least ${String(SWARM_MIN_ITEMS)} and at most ${String(SWARM_MAX_SUBAGENTS)} entries.`,
+    );
+    for (const text of [tool, items]) {
+      expect(text).toContain("protocol hard limit is 128");
+      expect(text).toContain("cannot be raised");
+    }
+  });
+
+  it("④ maxItems 调高无效：生效上限仍是 128，不会把宿主拼的数写进描述", () => {
+    // 协议常量不可绕过：文案必须与校验一样对 128 收敛，
+    // 否则会出现"文案允许 999、校验只收 128"的新分叉。
+    const { definition } = createHarness({ config: { ...defaultConfig(), maxItems: 999 } });
+    const { tool, items } = descriptionsOf(definition);
+    expect(tool).toContain("items must contain at most 128 entries.");
+    expect(items).toContain("at least 2 and at most 128 entries.");
+    for (const text of [tool, items]) {
+      expect(text).not.toContain("999");
+    }
   });
 });
