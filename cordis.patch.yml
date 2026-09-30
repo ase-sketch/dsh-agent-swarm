@@ -1,0 +1,15 @@
+# dsh-agent-swarm bundle patch.
+#
+# This package is both the bundle shell and the plugin it mounts: one row,
+# inserted by the bundle layer, whose name is this very package. The profile's
+# own cordis.patch.yml loads after every bundle layer (see the profile root
+# cordis.yml), so it can still address this row by id to reconfigure or disable
+# it — it must NOT re-insert a second row, which would duplicate the loader id.
+#
+# A plain cordis plugin must not be listed in dsh.profile.bundles on its own
+# (measured 2026-09-17: boot crashes). The bundle declaration is what makes the
+# profile manager accept this package as a layer.
+
+- insert:
+    - id: agent-swarm
+      name: 'dsh-agent-swarm'

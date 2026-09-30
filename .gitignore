@@ -1,0 +1,13 @@
+# 依赖与构建产物（由 pnpm run build / prepublishOnly 重新生成）
+node_modules/
+dist/
+
+# 本地打包产物
+*.tgz
+
+# 本地私有配置（约定：AGENTS.local.md 不进版本库）
+AGENTS.local.md
+
+# 系统噪声
+Thumbs.db
+.DS_Store

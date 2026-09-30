@@ -1,0 +1,4 @@
+# pnpm 11 起，构建脚本白名单不再读 package.json 的 pnpm 字段，改由此文件承载。
+# esbuild 是 vitest 的传递依赖，必须放行其安装脚本；否则 pnpm 会以 exit 1 阻断 install/test。
+allowBuilds:
+  esbuild: true
