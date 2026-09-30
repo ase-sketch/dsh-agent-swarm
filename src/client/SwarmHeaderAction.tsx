@@ -2,7 +2,7 @@
  * dsh-agent-swarm — 会话标题栏 Swarm 状态动作与弹层组件
  */
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import type { SwarmMemberView, SwarmPhase } from "../swarm-registry.js";
 import type { SwarmClientState } from "./model.js";
 
@@ -250,10 +250,33 @@ const CSS_CONTENT = `
   font-size: 12px;
   box-sizing: border-box;
 }
+
+.dsh-swarm-trigger.error {
+  color: var(--dsw-alias-state-error-primary, #ef4444);
+}
+
+.dsh-swarm-stream-error {
+  padding: 6px 14px;
+  font-size: 11px;
+  color: var(--dsw-alias-state-error-primary, #ef4444);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #ef4444) 12%, transparent);
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.06));
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  flex: none;
+  box-sizing: border-box;
+}
 `;
 
-function ensureCssInjected() {
-  if (typeof document === "undefined") return;
+/**
+ * 一次性注入面板样式。
+ *
+ * 幂等：重复调用只会复用/更新同一个 style 标签。调用点在 apply 期（渲染之前），
+ * 组件挂载时再兜底调一次——都不在渲染函数体内，因此不会每次 re-render 都查 DOM。
+ */
+export function ensureCssInjected(): void {
+  if (typeof document === "undefined" || !document.head) return;
+
   const existing = document.querySelector(`style[data-plugin-css="${CSS_TAG_ID}"]`);
   if (!existing) {
     const style = document.createElement("style");
@@ -263,6 +286,69 @@ function ensureCssInjected() {
     document.head.appendChild(style);
   } else if (existing.textContent !== CSS_CONTENT) {
     existing.textContent = CSS_CONTENT;
+  }
+}
+
+/**
+ * 找出最近一次限流重试的发起时刻。
+ *
+ * 只有 phase === "retrying" 且带 retryReadyAt 的成员参与计算；没有这类成员时返回 null
+ * ——调用方据此决定"要不要保留倒计时定时器"。
+ */
+export function earliestRetryAt(members: readonly SwarmMemberView[] | undefined): number | null {
+  let earliest: number | null = null;
+  for (const member of members ?? []) {
+    if (member.phase !== "retrying") continue;
+    const readyAt = member.retryReadyAt;
+    if (typeof readyAt !== "number") continue;
+    if (earliest === null || readyAt < earliest) earliest = readyAt;
+  }
+  return earliest;
+}
+
+/** 距发起还剩几秒（向上取整，最少 1）；已到点返回 0，供 UI 决定是否隐藏倒计时。 */
+export function retrySecondsLeft(deadline: number, now: number): number {
+  const remaining = deadline - now;
+  if (remaining <= 0) return 0;
+  return Math.max(1, Math.ceil(remaining / 1000));
+}
+
+/**
+ * 限流退避倒计时用的 1 秒节拍器。
+ *
+ * 只在"存在尚未到点的重试"期间存在：sync(null) 或截止时刻已过即停止（到点自停），
+ * 因此不会留下常驻定时器。抽成独立类是为了让"定时器何时存在"可被断言，
+ * 而不是埋在 React effect 里无从观察。
+ */
+export class RetryTicker {
+  private handle: ReturnType<typeof setInterval> | null = null;
+
+  constructor(private readonly onTick: () => void) {}
+
+  /** 当前是否有 1 秒定时器在跑。 */
+  get running(): boolean {
+    return this.handle !== null;
+  }
+
+  /** 按最近的重试截止时刻同步：需要倒计时就保证在跑，否则立即清理。 */
+  sync(deadline: number | null): void {
+    if (deadline === null || deadline <= Date.now()) {
+      this.stop();
+      return;
+    }
+    if (this.handle !== null) return;
+    this.handle = setInterval(() => {
+      this.onTick();
+      // 到点即自停，避免退避结束后留下常驻定时器
+      this.sync(deadline);
+    }, 1000);
+  }
+
+  /** 幂等清理。 */
+  stop(): void {
+    if (this.handle === null) return;
+    clearInterval(this.handle);
+    this.handle = null;
   }
 }
 
@@ -294,12 +380,18 @@ export interface SwarmHeaderActionProps {
 }
 
 export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHeaderActionProps) {
-  ensureCssInjected();
-
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [menuShift, setMenuShift] = useState(0);
+  // 倒计时基准时钟：仅在存在待重试成员时由 RetryTicker 推进
+  const [now, setNow] = useState(() => Date.now());
+  const tickerRef = useRef<RetryTicker | null>(null);
+
+  // 样式兜底注入：apply 期已注入过一次，这里按挂载再确认一次（不在渲染期查 DOM）
+  useEffect(() => {
+    ensureCssInjected();
+  }, []);
 
   // 挂载时开启当前会话的流监听
   useEffect(() => {
@@ -348,11 +440,28 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
     };
   }, [open]);
 
-  // 从 Model 订阅当前会话数据
+  // 从 Model 订阅当前会话数据与流失败态
   const batch = useSwarm((state) => state.bySession[sessionId]);
+  const streamFailure = useSwarm((state) => state.streamFailures[sessionId]);
 
   const hasBatch = Boolean(batch && batch.total > 0);
   const isLive = Boolean(batch && batch.activeCount > 0);
+
+  // 最近一次限流重试的发起时刻；没有待重试成员时为 null
+  const retryDeadline = useMemo(() => earliestRetryAt(batch?.members), [batch]);
+
+  // 只有存在尚未到点的重试时才让 1 秒定时器活着；否则立即清理（无常驻定时器）
+  useEffect(() => {
+    let ticker = tickerRef.current;
+    if (!ticker) {
+      ticker = new RetryTicker(() => setNow(Date.now()));
+      tickerRef.current = ticker;
+    }
+    // 截止时刻变化时对齐一次时钟，避免用陈旧快照渲染出偏大的秒数
+    setNow(Date.now());
+    ticker.sync(retryDeadline);
+    return () => ticker.stop();
+  }, [retryDeadline]);
 
   const badgeText = useMemo(() => {
     if (!batch || batch.total === 0) return "0";
@@ -364,9 +473,9 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
     <div className="dsh-swarm-root" ref={rootRef}>
       <button
         type="button"
-        className={`dsh-swarm-trigger ${isLive ? "active" : ""}`}
+        className={`dsh-swarm-trigger ${isLive ? "active" : ""} ${streamFailure ? "error" : ""}`}
         onClick={() => setOpen(!open)}
-        title="Swarm 智能体队列"
+        title={streamFailure ? `流连接中断：${streamFailure.message}` : "Swarm 智能体队列"}
       >
         <SwarmIcon />
         <span>Swarm</span>
@@ -402,6 +511,12 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
             )}
           </div>
 
+          {streamFailure && (
+            <div className="dsh-swarm-stream-error" title={streamFailure.message}>
+              流连接中断：{streamFailure.message}
+            </div>
+          )}
+
           {hasBatch && batch ? (
             <>
               <div className="dsh-swarm-stats">
@@ -418,6 +533,8 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
               <div className="dsh-swarm-list">
                 {batch.members.map((m: SwarmMemberView) => {
                   const cfg = PHASE_CONFIG[m.phase] ?? PHASE_CONFIG.pending;
+                  const secondsLeft =
+                    m.retryReadyAt === undefined ? 0 : retrySecondsLeft(m.retryReadyAt, now);
                   return (
                     <div key={m.index} className="dsh-swarm-row">
                       <div className="dsh-swarm-row-main">
@@ -441,8 +558,8 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
                       {m.phase === "retrying" && (
                         <div className="dsh-swarm-detail">
                           第 {m.retryCount} 次限流重试
-                          {m.retryReadyAt && m.retryReadyAt > Date.now() ? (
-                            <span> · 约 {Math.max(1, Math.ceil((m.retryReadyAt - Date.now()) / 1000))} 秒后发起</span>
+                          {secondsLeft > 0 ? (
+                            <span> · 约 {secondsLeft} 秒后发起</span>
                           ) : null}
                           {m.detail ? <span> ({m.detail})</span> : null}
                         </div>
