@@ -691,6 +691,30 @@ describe("中断", () => {
     await p;
     expect(aborted).toBe(2);
   });
+
+  it("回归：批次中断时，从未启动的排队成员也必须收到 onAbandoned(cancelled)", async () => {
+    const controller = new AbortController();
+    const abandoned: { index: number; agentId?: string }[] = [];
+    const h = harness({
+      signal: controller.signal,
+      onAbandoned: (e) =>
+        abandoned.push({ index: e.spec.index, ...(e.agentId === undefined ? {} : { agentId: e.agentId }) }),
+    });
+    const p = runSwarm(specsOf(8), h.deps, { initialLaunchLimit: 1 });
+    await flush(0);
+    expect(h.started()).toEqual([1]); // 首波只放 1 个，其余 7 个仍在队列里
+
+    controller.abort();
+    await p;
+
+    // 跑起来的 #1 由 abort 路径处理终态；从未启动的 #2..#8 必须走同一条放弃路径，
+    // 否则宿主（registry）永远不知道它们已经不可能再启动。
+    expect(abandoned.map((e) => e.index)).toEqual([2, 3, 4, 5, 6, 7, 8]);
+    // 从未启动的成员没有 agentId —— 事件里不得伪造
+    expect(abandoned.every((e) => e.agentId === undefined)).toBe(true);
+    // 中断路径必须把那支"首波之后每 700ms 放一个"的定时器清干净（leftovers=0 回归护栏）
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 // ───────────────────────── 超时 ─────────────────────────

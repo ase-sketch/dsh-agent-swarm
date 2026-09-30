@@ -262,6 +262,15 @@ export class SwarmRegistry {
     if (!batch) return;
     const member = batch.members.get(index);
     if (!member) return;
+    // 终态**粘性**：落定之后不再改变（与 markSuspended 的终态守卫对称）。
+    //
+    // 为什么必须如此：批次中断时调度器的 #abandonSuspended 会先把"尚未 ready"的成员
+    // 通知成 aborted；而此刻可能仍有在飞的 ctx.subagents.start，它之后才 reject，
+    // 宿主 catch 里会再调一次 markSettled("failed")。若允许覆写，这次"后到者"会把
+    // 已落定的 aborted 改成 failed，批次又被 endBatch 推导成 failed，与 XML 侧
+    // "全员 aborted"的结论重新矛盾——即 2026-10-01 审查 P1-2 的残余时序。
+    // 反序同理：先到的终态才是真实发生过的那个结局。
+    if (member.phase === "completed" || member.phase === "failed" || member.phase === "aborted") return;
     member.phase = outcome;
     member.settledAt = now;
     if (detail !== undefined) {
@@ -276,6 +285,19 @@ export class SwarmRegistry {
     batch.endedAt = now;
 
     // 根据成员状态推导批次最终状态
+    //
+    // 前提（中断收敛，WP-B 修复后）：调度器会把批次中断通知给**每一个**还没走到终态的
+    // 成员——包括从未启动的排队成员（SwarmAbandonedEvent 的 agentId 可选，缺省即未启动）。
+    // 因此正常结束时此处不应再看到 pending/starting/running/retrying：被中断的成员在
+    // onAbandoned 里落 aborted，在跑的成员由宿主侧 run.result 回执落终态。
+    //
+    // 但仍保留 "非全 completed 且无 aborted → failed" 这条兜底，且**不**把残留相位强行
+    // 归位成 aborted。为什么：残留相位在两种真实情况下仍可能出现——
+    //   ① 批次根本没进调度器（runSwarm 在构造时因 config 非法直接抛出，宿主 finally 仍会
+    //      调 endBatch），此时全员仍是 pending；
+    //   ② 宿主接线漏挂了 onAbandoned 回调（或被中断时进程刚好结束），终态通知从未送达。
+    // 这两种都是"批次没跑成"，推导成 failed 才如实；把它们改写成 aborted 等于把
+    // "宿主没收到通知"伪装成"用户主动取消"，正是本次修复要消灭的那类静默失真。
     let hasFailed = false;
     let hasAborted = false;
     let allCompleted = true;

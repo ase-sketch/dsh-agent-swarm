@@ -1,6 +1,14 @@
 
 import { describe, it, expect } from "vitest";
+import { runSwarm } from "../src/scheduler.js";
+import { renderSwarmResult } from "../src/result-xml.js";
 import { SwarmRegistry } from "../src/swarm-registry.js";
+import type {
+  SwarmAttemptResult,
+  SwarmSchedulerDeps,
+  SwarmTaskResult,
+  SwarmTaskSpec,
+} from "../src/types.js";
 
 describe("SwarmRegistry state machine", () => {
   it("initializes members in pending phase and tracks counts correctly", () => {
@@ -144,5 +152,167 @@ describe("SwarmRegistry framesFor stream", () => {
     expect(frames[frames.length - 1].type).toBe("closed");
 
     ac.abort();
+  });
+});
+
+// ───────────────────────── 中断：registry 与调度器结论必须一致 ─────────────────────────
+
+/**
+ * 中断全链回归（WP-B）：
+ * 一批 8 个成员、首波只启动 1 个就中断时，调度器必须为**从未启动**的排队成员
+ * 也发出放弃通知；否则它们在 registry 里永久停在 pending，批次被推导成 failed，
+ * 与 XML 里"全员 aborted"的结论互相矛盾。
+ *
+ * 这里不 mock 任何内部方法，而是照 src/index.ts:250-310 / 437-440 的真实接线
+ * 把 SwarmScheduler + SwarmRegistry 接起来，断言**可观测的最终状态**：
+ * 成员相位、批次状态、roster 计数、XML 文本。
+ */
+describe("中断后 registry 与调度器结论一致", () => {
+  it("8 个成员只启动 1 个就中断：无成员停在非终态、批次 aborted、XML 同为 aborted", async () => {
+    const registry = new SwarmRegistry();
+    const specs: SwarmTaskSpec[] = Array.from({ length: 8 }, (_, i) => ({
+      kind: "spawn" as const,
+      index: i + 1,
+      item: `item-${String(i + 1)}`,
+      prompt: `prompt-${String(i + 1)}`,
+    }));
+    const swarmId = registry.beginBatch("sess-abort", "中断场景", specs);
+    const controller = new AbortController();
+    const started: number[] = [];
+
+    const deps: SwarmSchedulerDeps = {
+      now: () => Date.now(),
+      setTimeout: (handler, ms) => setTimeout(handler, ms) as unknown,
+      clearTimeout: (handle) => {
+        clearTimeout(handle as ReturnType<typeof setTimeout>);
+      },
+      signal: controller.signal,
+      isRateLimitError: () => false,
+      classify: () => "in-flight-limited",
+      onAbandoned: (event) => {
+        registry.markSettled(
+          swarmId,
+          event.spec.index,
+          event.outcome === "cancelled" ? "aborted" : "failed",
+          event.error,
+        );
+      },
+      executor: {
+        run: (spec, attempt): Promise<SwarmAttemptResult> => {
+          // 与 src/index.ts 的 runOneTask 同序：markStarting → setAgentId → markReady
+          registry.markStarting(swarmId, spec.index);
+          return new Promise<SwarmAttemptResult>((_resolve, reject) => {
+            const agentId = `agent-${String(spec.index)}`;
+            attempt.setAgentId(agentId);
+            registry.setAgentId(swarmId, spec.index, agentId);
+            attempt.markReady();
+            registry.markReady(swarmId, spec.index);
+            started.push(spec.index);
+            attempt.signal.addEventListener(
+              "abort",
+              () => {
+                // 真实 provider 是在 signal 触发后的**下一个事件循环**才回
+                // stopReason="aborted"（index.ts:297-300 才 markSettled）。
+                // 这里保留这段异步延迟，否则成员 1 会在 endBatch 之前就落终态，
+                // 掩盖"批次被判 failed"的原始时序缺陷。
+                setTimeout(() => {
+                  registry.markSettled(swarmId, spec.index, "aborted", "interrupted");
+                  reject(new Error("interrupted"));
+                }, 0);
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    };
+
+    const promise = runSwarm(specs, deps, { initialLaunchLimit: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual([1]); // 首波只放 1 个，其余 7 个仍在队列里
+
+    controller.abort();
+
+    let results: readonly SwarmTaskResult[] = [];
+    try {
+      results = await promise;
+    } finally {
+      // 与 src/index.ts:468-470 的 finally 同序
+      registry.endBatch(swarmId);
+    }
+
+    const batch = registry.getBatch(swarmId);
+    expect(batch).toBeDefined();
+    // 批次状态必须在 endBatch 当场就是 aborted：此刻只有"放弃通知"能证明
+    // 未启动成员的终态，XML 侧的 aborted 结论与它同源。
+    expect(batch?.status).toBe("aborted");
+    // 未启动的成员不得伪造 agentId
+    const neverStarted = [...(batch?.members.values() ?? [])].filter((m) => m.index !== 1);
+    expect(neverStarted).toHaveLength(7);
+    expect(neverStarted.every((m) => m.agentId === undefined)).toBe(true);
+
+    // 等"在跑成员"的回执落地（真实系统里它晚于 endBatch）
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const phases = [...(batch?.members.values() ?? [])].map((m) => m.phase);
+    expect(phases.filter((p) => p === "pending" || p === "starting" || p === "running" || p === "retrying")).toEqual([]);
+    expect(phases.every((p) => p === "aborted")).toBe(true);
+
+    const roster = registry.toRosterFrame(batch!, Date.now());
+    expect(roster.abortedCount).toBe(8);
+    expect(roster.activeCount).toBe(0);
+
+    // XML 侧不回归
+    expect(results.map((r) => r.outcome)).toEqual(Array.from({ length: 8 }, () => "aborted"));
+    const xml = renderSwarmResult(results, { omitNotStarted: false });
+    expect(xml).toContain("<summary>aborted: 8</summary>");
+    expect(xml).not.toContain('outcome="failed"');
+    expect(xml.match(/outcome="aborted"/g)).toHaveLength(8);
+  });
+});
+
+/**
+ * 终态粘性回归（WP-B 之后由父代理补的守卫）：
+ * 中断时调度器会先把"尚未 ready"的成员落 aborted；而此刻可能仍有在飞的
+ * ctx.subagents.start，它之后才 reject，宿主 catch 会再调一次 markSettled("failed")。
+ * 若允许覆写，这次"后到者"会把 aborted 改成 failed，批次又被 endBatch 推导成 failed，
+ * 与 XML 侧"全员 aborted"的结论重新矛盾。守卫语义：**先到的终态才是真实结局**。
+ */
+describe("markSettled 的终态粘性", () => {
+  it("迟到的 start 失败不得把已落定的 aborted 改成 failed", () => {
+    const registry = new SwarmRegistry();
+    const swarmId = registry.beginBatch("sess-sticky", "中断竞态", [
+      { index: 1, item: "a" },
+      { index: 2, item: "b" },
+    ]);
+
+    // ① 中断路径：未 ready 的成员先落 aborted
+    registry.markSettled(swarmId, 1, "aborted", "The swarm was interrupted before this member finished.");
+    registry.markSettled(swarmId, 2, "aborted", "The swarm was interrupted before this member finished.");
+    // ② 在飞的 start 随后 reject → 宿主 catch 再落一次 failed
+    registry.markSettled(swarmId, 1, "failed", "Subagent could not be started: the run was aborted");
+
+    const member = registry.getBatch(swarmId)?.members.get(1);
+    expect(member?.phase).toBe("aborted");
+    expect(member?.detail).toBe("The swarm was interrupted before this member finished.");
+
+    registry.endBatch(swarmId);
+    expect(registry.getBatch(swarmId)?.status).toBe("aborted");
+  });
+
+  it("反向时序一致：先落 failed 的成员不被后到的 aborted 改写", () => {
+    const registry = new SwarmRegistry();
+    const swarmId = registry.beginBatch("sess-sticky-2", "反序", [
+      { index: 1, item: "a" },
+      { index: 2, item: "b" },
+    ]);
+
+    registry.markSettled(swarmId, 1, "failed", "Subagent could not be started: boom");
+    registry.markSettled(swarmId, 2, "completed");
+    registry.markSettled(swarmId, 1, "aborted", "interrupted");
+
+    expect(registry.getBatch(swarmId)?.members.get(1)?.phase).toBe("failed");
+    registry.endBatch(swarmId);
+    expect(registry.getBatch(swarmId)?.status).toBe("failed");
   });
 });

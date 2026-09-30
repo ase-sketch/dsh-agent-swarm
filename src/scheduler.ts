@@ -40,8 +40,15 @@ import {
   type SwarmTimerHandle,
 } from "./types.js";
 
-/** 限流挂起原因文案（写进 onSuspended 事件，供 UI/日志使用）。 */
-export const RATE_LIMIT_SUSPENDED_REASON = "Provider rate limit; subagent requeued for retry.";
+/**
+ * 限流挂起原因文案（写进 onSuspended 事件，供 UI/日志使用）。
+ *
+ * clean-room：本仓自拟英文文案（语义 = provider 限流、该成员已重排队等待重试），
+ * 与上游同语义文本不存在连续 6 词重合。改写它不影响任何机器判定——
+ * 机器判定只看 onSuspended 的 retryCount / retryReadyAt 与 outcome，不看这句人读文案。
+ */
+export const RATE_LIMIT_SUSPENDED_REASON =
+  "The provider applied a rate limit to this member; it is back in the queue and will be retried.";
 
 const ABORTED_WHILE_RUNNING = "The swarm was interrupted before this member finished.";
 const ABORTED_BEFORE_START = "The swarm was interrupted before this member was started.";
@@ -586,12 +593,28 @@ export class SwarmScheduler {
     };
   }
 
+  /**
+   * 批次中断时，把所有"还没走到终态"的成员统一通知宿主：它们已被放弃。
+   *
+   * 必须覆盖两类，缺一类宿主就收不到终态：
+   *   ① 仍在队列里的成员——既可能是**从未启动**的排队成员（没有 agentId），
+   *      也可能是限流重排队后带着上一次尝试 agentId 的成员；
+   *   ② 已建好但还没 markReady 的尝试——首个请求尚未真正生效。
+   *
+   * 为什么不能按 "agentId 是否存在" 过滤：SwarmAbandonedEvent.agentId 在契约里是
+   * **可选**的（types.ts:192，agentId?: string），所以未启动成员照样要发这条事件；
+   * 按 agentId 过滤会让它们在宿主的 registry 里永久停在 pending，批次被 endBatch
+   * 推导成 failed，与 XML 侧"全员 aborted"的结论互相矛盾。缺省语义 = 不带该字段，
+   * 而不是补一个假 id（agentId 是宿主跳转/resume 的凭据，伪造比缺失更危险）。
+   *
+   * 已经 ready 的尝试不在这里处理：它们由 abort 路径在宿主侧各自落终态
+   * （子代理 run.result 回执 / 超时），在这里重复通知会让宿主看到两次终态事件。
+   */
   #abandonSuspended(): void {
     for (const state of this.#pending) {
-      if (state.agentId === undefined) continue;
       this.#deps.onAbandoned?.({
         spec: state.spec,
-        agentId: state.agentId,
+        ...(state.agentId === undefined ? {} : { agentId: state.agentId }),
         outcome: "cancelled",
         error: ABORTED_BEFORE_START,
       });
@@ -599,10 +622,9 @@ export class SwarmScheduler {
     for (const attempt of this.#active) {
       if (attempt.ready) continue;
       const agentId = attempt.state.agentId;
-      if (agentId === undefined) continue;
       this.#deps.onAbandoned?.({
         spec: attempt.state.spec,
-        agentId,
+        ...(agentId === undefined ? {} : { agentId }),
         outcome: "cancelled",
         error: ABORTED_BEFORE_START,
       });
