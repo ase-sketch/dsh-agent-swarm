@@ -314,7 +314,7 @@
 
 - 修复后的真实 provider 行为（429 退避仍不可达，属 P1-1 的既定处置）；
 - 面板真机渲染（需重启 DSH 后目测）；
-- `pnpm pack` 产物在三个 profile 的安装结果（见交付说明）。
+- **已验证（2026-10-01 交付）**：`dsh-agent-swarm-0.3.3.tgz`（67,308 B）已装入 web / desktop / headless 三个 profile——安装前后 `package.json` 差异**只有本包依赖行**（依赖数 12→12、bundles 14→14），三个 profile 的 `dist/index.js` 与工作区**逐字节一致**，三者 `dsh --profile <p> --dump-config` 均 exit 0 且 `agent-swarm` 恰 1 行、无 bundle 被 skip。
 
 ### 十·补、独立验证与跟进（同日）
 
