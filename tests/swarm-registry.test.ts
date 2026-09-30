@@ -153,6 +153,133 @@ describe("SwarmRegistry framesFor stream", () => {
 
     ac.abort();
   });
+
+  /**
+   * 协议缺口回归：连接一个**已经结束**的批次时，帧序列必须包含 closed。
+   *
+   * 缺陷成因：生成器进入时把 lastEndedAt 初始化成 currentBatch?.endedAt，
+   * 于是循环里的「latest.endedAt !== undefined && lastEndedAt === undefined」
+   * 对「连接时批次已结束」恒为假 → 永远不发 closed。
+   * 任何以 frame.type === "closed" 作为结束信号的客户端会一直等。
+   *
+   * 顺序约定：opened → roster → closed（roster 先给全量快照，closed 收尾），
+   * 与循环内既有顺序保持一致。
+   */
+  it("连接时批次已结束：帧序列必须含 closed（opened → roster → closed）", async () => {
+    const reg = new SwarmRegistry({ flushMs: 10 });
+    const ac = new AbortController();
+
+    // 先把批次跑完，再建立连接
+    const swarmId = reg.beginBatch("sess-done", "已结束批次", [
+      { index: 1, item: "A" },
+      { index: 2, item: "B" },
+    ], 1000);
+    reg.markSettled(swarmId, 1, "completed", undefined, 1100);
+    reg.markSettled(swarmId, 2, "completed", undefined, 1200);
+    reg.endBatch(swarmId, 1300);
+    expect(reg.getBatch(swarmId)?.endedAt).toBe(1300);
+
+    const received: any[] = [];
+    for await (const frame of reg.framesFor("sess-done", ac.signal, 5)) {
+      received.push(frame);
+      if (frame.type === "closed") break;
+    }
+    ac.abort();
+
+    expect(received.length).toBe(3);
+    expect(received.map((f) => f.type)).toEqual(["opened", "roster", "closed"]);
+    expect(received[0].swarmId).toBe(swarmId);
+    expect(received[1].swarmId).toBe(swarmId);
+    expect(received[2].swarmId).toBe(swarmId);
+    expect(received[2].at).toBe(1300);
+  });
+
+  /**
+   * 连接时**仍在进行**、稍后结束：既有行为不得回退，且 closed 只发一次。
+   */
+  it("连接后进行中再结束：closed 仍会发且不重复发", async () => {
+    const reg = new SwarmRegistry({ flushMs: 10 });
+    const ac = new AbortController();
+
+    const swarmId = reg.beginBatch("sess-live", "进行中批次", [{ index: 1, item: "A" }], 1000);
+    reg.markReady(swarmId, 1, 1050);
+
+    const received: any[] = [];
+    const stream = (async () => {
+      try {
+        for await (const frame of reg.framesFor("sess-live", ac.signal, 5)) {
+          received.push(frame);
+          if (frame.type === "closed") break;
+        }
+      } catch (err) {
+        if (!ac.signal.aborted) throw err;
+      }
+    })();
+
+    // 让循环跑起来（连接时批次尚未结束）
+    await new Promise((r) => setTimeout(r, 20));
+    reg.markSettled(swarmId, 1, "completed", undefined, 1200);
+    reg.endBatch(swarmId, 1300);
+    // 结束后再补一次更新，closed 不得被二次发出
+    reg.markSettled(swarmId, 1, "completed", undefined, 1400);
+
+    await stream;
+    ac.abort();
+
+    const types = received.map((f) => f.type);
+    expect(types[0]).toBe("opened");
+    expect(types.filter((t) => t === "closed")).toHaveLength(1);
+    const lastClosed = received[received.length - 1];
+    expect(lastClosed.type).toBe("closed");
+    expect(lastClosed.at).toBe(1300);
+  });
+
+  /**
+   * 切换到新批次：新批次的 opened/roster 必须重发；若新批次同样是已结束的，
+   * 也要立刻补 closed（与「连接时已结束」同一条语义）。
+   */
+  it("新批次切换：重发 opened/roster，已结束的新批次补 closed", async () => {
+    const reg = new SwarmRegistry({ flushMs: 10 });
+    const ac = new AbortController();
+
+    const first = reg.beginBatch("sess-switch", "批次一", [{ index: 1, item: "A" }], 1000);
+    reg.markSettled(first, 1, "completed", undefined, 1050);
+    reg.endBatch(first, 1100);
+
+    const received: any[] = [];
+    const stream = (async () => {
+      try {
+        for await (const frame of reg.framesFor("sess-switch", ac.signal, 5)) {
+          received.push(frame);
+          // 连接后新开一个已结束的批次，等它的 closed 到达
+          if (frame.type === "roster" && frame.swarmId === first) {
+            const second = reg.beginBatch("sess-switch", "批次二", [{ index: 1, item: "B" }], 2000);
+            reg.markSettled(second, 1, "completed", undefined, 2050);
+            reg.endBatch(second, 2100);
+          }
+          if (frame.type === "closed" && frame.swarmId !== first) break;
+        }
+      } catch (err) {
+        if (!ac.signal.aborted) throw err;
+      }
+    })();
+
+    await stream;
+    ac.abort();
+
+    // 批次一：opened → roster → closed（连接时已结束）
+    const firstFrames = received.filter((f) => f.swarmId === first).map((f) => f.type);
+    expect(firstFrames.slice(0, 3)).toEqual(["opened", "roster", "closed"]);
+
+    // 批次二：新 opened/roster + closed，且 closed 末帧 at=2100
+    const secondFrames = received.filter((f) => f.swarmId !== first);
+    const secondTypes = secondFrames.map((f) => f.type);
+    expect(secondTypes[0]).toBe("opened");
+    expect(secondTypes).toContain("roster");
+    const secondClosed = secondFrames.filter((f) => f.type === "closed");
+    expect(secondClosed).toHaveLength(1);
+    expect(secondClosed[0].at).toBe(2100);
+  });
 });
 
 // ───────────────────────── 中断：registry 与调度器结论必须一致 ─────────────────────────

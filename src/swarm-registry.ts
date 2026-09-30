@@ -386,7 +386,10 @@ export class SwarmRegistry {
     try {
       let currentBatch = this.getLatestBatch(sessionId);
       let lastSwarmId: string | undefined = currentBatch?.swarmId;
-      let lastEndedAt: number | undefined = currentBatch?.endedAt;
+      // 初始一律置 undefined：让"连接时批次已结束"与"连接后才结束"共用同一条
+      // closed 判定路径。否则把 currentBatch?.endedAt 写进初值，连接时已结束的批次
+      // 会让下面的 `lastEndedAt === undefined` 恒为假，closed 帧永远不发。
+      let lastEndedAt: number | undefined = undefined;
 
       if (currentBatch) {
         yield {
@@ -398,6 +401,17 @@ export class SwarmRegistry {
           at: currentBatch.startedAt,
         };
         yield this.toRosterFrame(currentBatch);
+        // 连接时该批次已结束：立刻补 closed，否则以 closed 为结束信号的客户端会一直等。
+        // 顺序取 opened → roster → closed，与循环内 roster 先于 closed 的既有次序一致。
+        if (currentBatch.endedAt !== undefined) {
+          lastEndedAt = currentBatch.endedAt;
+          yield {
+            type: "closed",
+            swarmId: currentBatch.swarmId,
+            sessionId: currentBatch.sessionId,
+            at: currentBatch.endedAt,
+          };
+        }
       }
 
       while (true) {
