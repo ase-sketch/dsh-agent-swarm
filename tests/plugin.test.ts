@@ -16,6 +16,7 @@ import { Context } from "@deepseek-ai/cordis";
 import Loader from "@deepseek-ai/cordis-plugin-loader";
 import * as plugin from "../src/index.js";
 import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
+import type { SwarmBatch, SwarmPhase, SwarmRegistry } from "../src/swarm-registry.js";
 
 // ───────────────────────── mock Context ─────────────────────────
 
@@ -744,5 +745,213 @@ describe("F. 真实 Loader 加载路径", () => {
     expect(typeof dist.apply).toBe("function");
     expect(typeof dist.Config).toBe("function");
     expect(dist.inject).toEqual(["tools", "subagents"]);
+  });
+});
+
+// ───────────────────────── G. WP-C2：中断 / 失败 / 超时三类收场的 registry 与 XML 同结论 ─────────────────────────
+
+/**
+ * 读取插件自己持有的 registry（走真实接线：apply 里的 ctx.get("swarmRemote")）。
+ * 这里断言的是**对外可见的成员相位与批次状态**，不是内部方法有没有被调用。
+ */
+function registryOf(ctx: Context): SwarmRegistry {
+  const remote = ctx.get("swarmRemote") as unknown as { getRegistry?: () => SwarmRegistry } | undefined;
+  const registry = remote?.getRegistry?.();
+  if (registry === undefined) throw new Error("swarmRemote is not wired on this context");
+  return registry;
+}
+
+/** 最新批次的成员相位，按 index 升序（与 XML 里各成员的顺序一致）。 */
+function phasesOf(batch: SwarmBatch | undefined): SwarmPhase[] {
+  if (batch === undefined) return [];
+  return [...batch.members.values()].sort((a, b) => a.index - b.index).map((member) => member.phase);
+}
+
+function latestBatchOf(ctx: Context): SwarmBatch | undefined {
+  // 会话 id 与 makeExec() 里 FAKE_AGENT.session.id 一致
+  return registryOf(ctx).getLatestBatch("session-under-test");
+}
+
+/**
+ * "只受信号驱动"的 provider 桩：start 返回的 run.result 一直挂着，直到成员信号 abort 才收场。
+ * 这样测到的是"成员已经在跑、随后批次被中断"的真实时序，而不是"还没跑起来就被放弃"
+ * （后者走调度器 onAbandoned 路径，根本到不了宿主侧 catch）。
+ */
+function createSignalDrivenHarness(options: {
+  /** run.result 在成员信号 abort 后的收场方式。 */
+  settle: "reject" | "resolve-aborted";
+  /** 传给 apply 的单任务超时（0 = 不设超时）。 */
+  taskTimeoutMs: number;
+  /** 首个成员不等待信号、立刻因自身原因失败（用于"先失败、后中断"的到达顺序）。 */
+  firstFailsImmediately?: boolean;
+}): { ctx: Context; definition: ToolDefinition; memberSignals: AbortSignal[] } {
+  const ctx = new Context() as unknown as Context & Record<string, unknown>;
+  const memberSignals: AbortSignal[] = [];
+  let definition: ToolDefinition | undefined;
+
+  Object.defineProperty(ctx, "tools", {
+    configurable: true,
+    value: {
+      register: (def: ToolDefinition) => {
+        definition = def;
+        return () => {
+          definition = undefined;
+        };
+      },
+    },
+  });
+
+  Object.defineProperty(ctx, "subagents", {
+    configurable: true,
+    value: {
+      start: (_provider: string, request: Record<string, unknown>) => {
+        const signal = request.signal as AbortSignal;
+        memberSignals.push(signal);
+        return Promise.resolve({
+          id: "run-" + String(memberSignals.length),
+          localAgent: undefined,
+          result: new Promise((resolve, reject) => {
+            if (options.firstFailsImmediately === true && memberSignals.length === 1) {
+              reject(new Error("member 1 failed on its own before any interrupt"));
+              return;
+            }
+            const settle = (): void => {
+              if (options.settle === "resolve-aborted") {
+                resolve({ output: [], stopReason: "aborted" });
+                return;
+              }
+              reject(new Error("run.result rejected after the swarm was interrupted"));
+            };
+            if (signal.aborted) {
+              settle();
+              return;
+            }
+            signal.addEventListener("abort", settle, { once: true });
+          }),
+          dispose: () => Promise.resolve(),
+        });
+      },
+    },
+  });
+
+  plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: options.taskTimeoutMs });
+  if (definition === undefined) throw new Error("apply() did not register a tool");
+  return { ctx, definition, memberSignals };
+}
+
+describe("G. WP-C2：中断 / 失败 / 超时三类收场的结论一致性", () => {
+  it("① 批次中断后在跑成员以 reject 收场 → 成员 aborted、批次 aborted、XML aborted", async () => {
+    const harness = createSignalDrivenHarness({ settle: "reject", taskTimeoutMs: 0 });
+    const controller = new AbortController();
+    const pending = harness.definition.execute(
+      validArgs({ items: ["a.md", "b.md"] }),
+      makeExec(controller.signal) as never,
+    ) as Promise<{ xml: string }>;
+
+    // 前置条件：两个成员都已真正在跑（registry 相位 running = 已 markReady），此刻才中断。
+    // 未 ready 的尝试由调度器 onAbandoned 直接落 aborted，走不到宿主侧 catch——必须排掉。
+    await vi.waitFor(() => {
+      expect(phasesOf(latestBatchOf(harness.ctx))).toEqual(["running", "running"]);
+    });
+
+    controller.abort();
+    const result = await pending;
+
+    // XML（权威口径）：成员与 summary 都落在 aborted
+    expect(result.xml).toContain("<summary>aborted: 2</summary>");
+    expect(result.xml).toContain('outcome="aborted"');
+    expect(result.xml).not.toContain('outcome="failed"');
+
+    // registry：成员相位与批次状态必须与 XML 同结论
+    const batch = latestBatchOf(harness.ctx);
+    expect(batch?.status).toBe("aborted");
+    expect(phasesOf(batch)).toEqual(["aborted", "aborted"]);
+    // 终态 detail 仍然透传 reject 的原因（修复不得顺手丢掉它）。
+    // 成员索引自 1 起（与 XML 编号一致），故取 members.get(1)。
+    expect(batch?.members.get(1)?.detail).toContain("rejected after the swarm was interrupted");
+  });
+
+  it("② 纯失败（无中断）→ 成员 failed、批次 failed、XML failed（防过度修复）", async () => {
+    const harness = createHarness({ rejectResultAt: [0, 1, 2] });
+    const result = (await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string };
+
+    expect(result.xml).toContain("<summary>failed: 3</summary>");
+    expect(result.xml).not.toContain('outcome="aborted"');
+
+    const batch = latestBatchOf(harness.ctx);
+    expect(batch?.status).toBe("failed");
+    expect(phasesOf(batch)).toEqual(["failed", "failed", "failed"]);
+    expect(batch?.members.get(1)?.detail).toContain("infrastructure fault");
+  });
+
+  it("④ 先失败、后中断：已落定的失败不被随后的中断改写（另一种到达顺序）", async () => {
+    const harness = createSignalDrivenHarness({
+      settle: "reject",
+      taskTimeoutMs: 0,
+      firstFailsImmediately: true,
+    });
+    const controller = new AbortController();
+    const pending = harness.definition.execute(
+      validArgs({ items: ["a.md", "b.md"] }),
+      makeExec(controller.signal) as never,
+    ) as Promise<{ xml: string }>;
+
+    // 等成员① 自己失败并落定，成员② 仍在跑——此刻中断才是"后到"
+    await vi.waitFor(() => {
+      expect(phasesOf(latestBatchOf(harness.ctx))).toEqual(["failed", "running"]);
+    });
+
+    controller.abort();
+    const result = await pending;
+
+    expect(result.xml).toContain("<summary>failed: 1, aborted: 1</summary>");
+    expect(result.xml).toContain('outcome="failed"');
+    expect(result.xml).toContain('outcome="aborted"');
+
+    const batch = latestBatchOf(harness.ctx);
+    expect(phasesOf(batch)).toEqual(["failed", "aborted"]);
+    expect(batch?.status).toBe("failed");
+    // 成员① 的 detail 仍是它自己的失败原因，没有被中断文案覆写
+    expect(batch?.members.get(1)?.detail).toContain("failed on its own before any interrupt");
+  });
+
+  it("③a 超时（成员以 reject 收场）→ 成员 failed、批次 failed、XML failed，不误判成 aborted", async () => {
+    const harness = createSignalDrivenHarness({ settle: "reject", taskTimeoutMs: 20 });
+    const result = (await harness.definition.execute(
+      validArgs({ items: ["a.md", "b.md"] }),
+      makeExec() as never,
+    )) as { xml: string };
+
+    expect(result.xml).toContain("<summary>failed: 2</summary>");
+    expect(result.xml).toContain("Subagent timed out.");
+    expect(result.xml).not.toContain('outcome="aborted"');
+
+    // 判别式为什么不看成员信号：调度器自己的超时闸门会 abort 成员信号，
+    // reason 就是它写的那句超时文案——"超时"在成员信号上与"批次中断"完全同形。
+    expect(harness.memberSignals[0]?.aborted).toBe(true);
+    expect(String((harness.memberSignals[0]?.reason as Error | undefined)?.message)).toMatch(/timed out/i);
+
+    const batch = latestBatchOf(harness.ctx);
+    expect(batch?.status).toBe("failed");
+    expect(phasesOf(batch)).toEqual(["failed", "failed"]);
+  });
+
+  it("③b 超时（成员优雅自报 aborted）→ 成员 failed、批次 failed、XML failed", async () => {
+    const harness = createSignalDrivenHarness({ settle: "resolve-aborted", taskTimeoutMs: 20 });
+    const result = (await harness.definition.execute(
+      validArgs({ items: ["a.md", "b.md"] }),
+      makeExec() as never,
+    )) as { xml: string };
+
+    // 子代理自报 "aborted" 只说明它被取消，不说明**批次**被打断；XML 侧这条路径是 failed。
+    expect(result.xml).toContain("<summary>failed: 2</summary>");
+    expect(result.xml).toContain('outcome="failed"');
+    expect(result.xml).not.toContain('outcome="aborted"');
+
+    const batch = latestBatchOf(harness.ctx);
+    expect(batch?.status).toBe("failed");
+    expect(phasesOf(batch)).toEqual(["failed", "failed"]);
+    // 自报的原因没丢，只是相位与 XML 对齐成 failed
+    expect(batch?.members.get(1)?.detail).toContain("aborted");
   });
 });

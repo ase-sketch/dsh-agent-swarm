@@ -223,6 +223,35 @@ function failureDetail(result: { stopReason: string; diagnostic?: string }): str
 }
 
 /**
+ * 宿主侧成员终态的归属判定：**批次信号是否已 abort** 是唯一判据。
+ *
+ * 语义：批次被中断（用户取消 / 上游 abort）时，调度器在 #finishWithAbort 里把所有尚未落定结果的
+ * 成员统一判成 aborted，这是 XML 的权威口径；registry 因此必须按同一判据落终态，两个口径才不会
+ * 再次分叉。非中断收场（真实失败、单任务超时、子代理自报 aborted）一律 failed。
+ *
+ * ⚠️ 不要改用 attempt.signal.aborted 判——它"看起来更近"，却是错的：
+ *   调度器自己的超时闸门（scheduler.ts #linkAttemptSignals）在超时那一刻执行
+ *   attempt.controller.abort(new Error("Subagent timed out."))，而 attempt.controller.signal
+ *   正是 executor 拿到的 attempt.signal。也就是说**超时同样会把 attempt.signal 置成 aborted**，
+ *   与批次中断在这一位上完全同形；据此判定会把超时成员错记成 aborted，而 XML 侧对超时打的是
+ *   failed（调度器把任何 rejection 都落成 #failedResult，"Subagent timed out." 正是它的文案）。
+ *   tests/plugin.test.ts 的 WP-C2 ③a 用例就是这条反例的护栏。
+ *
+ * 两种到达顺序都成立：
+ *   ① 先中断、后收场（reject 或优雅 resolve）→ 此刻批次信号已 aborted → aborted，与 XML 一致
+ *      （该成员的结果尚未落定，被 #finishWithAbort 覆盖成 aborted）；
+ *   ② 先收场、后中断 → 本次判定发生在中断之前，批次信号尚未 aborted → failed；此时调度器已记录
+ *      该成员的结果，随后的中断不覆写它（#finishWithAbort 保留已有结果），XML 同样是 failed。
+ *
+ * 已知边界：判定与调度器真正落定该成员结果之间隔着 runOneTask finally 里的 await run.dispose()。
+ * 若中断恰好落进这段窗口，registry 会停在 failed 而 XML 已被 #finishWithAbort 改判 aborted；
+ * 彻底闭合需要改调度器/宿主的分工（把落终态推迟到 dispose 之后），不在本次改动范围内。
+ */
+function settleOutcomeAfter(batchSignal: AbortSignal | undefined): "aborted" | "failed" {
+  return batchSignal?.aborted === true ? "aborted" : "failed";
+}
+
+/**
  * 派发**一个**子代理并落成 SwarmAttemptResult。
  *
  * 红线（依赖顺序，缺一不可）：
@@ -230,6 +259,8 @@ function failureDetail(result: { stopReason: string; diagnostic?: string }): str
  *   2. stopReason "aborted" 归取消/超时，绝不当限流（spike Q5）
  *   3. 不向 start 传它不支持的字段（如 timeout；超时自建 AbortSignal.timeout）
  *   4. parent 传 exec.agent，子代理沙箱档位据此自动继承（spike Q9）
+ *   5. 成员终态由**批次信号**（batchSignal = exec.signal）归属，不是成员信号 attempt.signal：
+ *      调度器的超时闸门同样会 abort attempt.signal，用它会把超时误判成批次中断。见 settleOutcomeAfter。
  *
  * **失败必须用 throw 表达**：调度器把 executor 的「resolve」一律当作 completed
  * （scheduler.ts #runAttempt 无条件写 outcome:"completed"），只有 reject 才落 failed/aborted。
@@ -244,6 +275,8 @@ async function runOneTask(
   label: string,
   swarmId?: string,
   registry?: SwarmRegistry,
+  /** 批次级信号（exec.signal）：只判"批次是否被中断"，不判单个成员的信号。 */
+  batchSignal?: AbortSignal,
 ): Promise<SwarmAttemptResult> {
   // 向 provider 发出首个请求前不动；成功 start 之后立刻标记。
   // 这是区分"首个请求未发出就失败"（重罚）与"运行中失败"（轻罚）的唯一依据（types.ts 契约）。
@@ -294,17 +327,28 @@ async function runOneTask(
       return { result: joinContentBlocks(result.output), stopReason: result.stopReason };
     }
     const detail = failureDetail(result);
-    const outcome = result.stopReason === "aborted" ? "aborted" : "failed";
+    // 落终态与 catch 用同一条判据（批次信号），不用子代理自报的 stopReason：
+    // 子代理自报 "aborted" 只说明它被取消，不说明**批次**被打断——单任务超时同样会让成员优雅
+    // 收场成 aborted，而 XML 侧对这条路径打的是 failed。详见 settleOutcomeAfter。
+    const outcome = settleOutcomeAfter(batchSignal);
     if (registry && swarmId) {
       registry.markSettled(swarmId, spec.index, outcome, detail);
     }
     throw new SwarmTaskFailure(detail);
   } catch (error) {
     if (registry && swarmId) {
+      // 终态不覆写：上面的相位守卫挡一次，markSettled 内部对已落定成员也是粘性的。
       const batch = registry.getBatch(swarmId);
       const member = batch?.members.get(spec.index);
       if (member && member.phase !== "completed" && member.phase !== "failed" && member.phase !== "aborted") {
-        registry.markSettled(swarmId, spec.index, "failed", error instanceof Error ? error.message : String(error));
+        // 批次被中断 → aborted（与 XML 同结论）；其余（真实失败 / 超时）→ failed。
+        // 判别式为什么必须是批次信号而不是 attempt.signal，见 settleOutcomeAfter 的注释。
+        registry.markSettled(
+          swarmId,
+          spec.index,
+          settleOutcomeAfter(batchSignal),
+          error instanceof Error ? error.message : String(error),
+        );
       }
     }
     throw error;
@@ -449,6 +493,7 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
                   `${String(spec.index)}/${String(specs.length)}: ${String(spec.item)}`,
                   swarmId,
                   registry,
+                  exec.signal,
                 ),
             },
           },

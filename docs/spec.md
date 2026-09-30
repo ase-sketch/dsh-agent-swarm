@@ -14,7 +14,7 @@
 
 一期（本次）：
 1. `agent_swarm` 工具：`description` + `prompt_template`（含 `{{item}}`）+ `items[]` 展开为 N 个子代理任务
-2. 五条硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同
+2. 六道硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同；item 元素必须是非空字符串（第六道，2026-10-01 审查后补）
 3. 并发调度器：首波 5 并发、之后每 700ms 放 1 个、限流指数退避（3000ms×2ⁿ）、容量收缩防抖 2000ms、每 180s 恢复 +1（下限 1）、最后任务持续限流判 failed（死锁防护）、首个请求未发出的限流重罚
    —— **交付态修正（2026-10-01）**：本条前半（首波/放量/超时/中断/结果落位）已交付；**限流相关的后半（退避、容量收缩恢复、死锁防护、重罚）在交付态无触发路径**，详见下「交付状态」。
 4. 每任务超时（默认 2h 可配，**自建** `AbortSignal.any([父signal, AbortSignal.timeout])`——start() 无 timeout 字段）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`

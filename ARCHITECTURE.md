@@ -29,11 +29,13 @@ docs/                      spec.md、code-quality-review 报告、spike 笔记
 
 ## 依赖方向
 
-host 半：`index.ts`（唯一的 DSH 依赖面）→ `scheduler.ts`、`remote.ts` → `swarm-registry.ts`；
-`scheduler.ts` → `validate.ts`/`result-xml.ts` → `types.ts`。
+host 半：`index.ts` 是唯一装配点，向下引用 `scheduler.ts`、`validate.ts`、`result-xml.ts`、`swarm-registry.ts`、`remote.ts`；
+`remote.ts` → `swarm-registry.ts`；`scheduler.ts`、`validate.ts`、`result-xml.ts` → `types.ts`（三者**互不依赖**）。
 
-client 半：`client/index.ts` → `client/service.ts` + `client/model.ts` + `SwarmHeaderAction.tsx`；
-后两者对 `swarm-registry.ts` 只做**类型**引用，对 `remote-descriptor.ts` 做值引用。
+**方向别读错**：`scheduler.ts` 不依赖 `validate.ts` / `result-xml.ts`——它们在 `index.ts` 的执行链里先后被调用（那是**数据流**，见下节），不是模块依赖。
+
+client 半：`client/index.ts` → `client/model.ts`、`client/service.ts`、`SwarmHeaderAction.tsx`、`../remote-descriptor.ts`（其中 `remote-descriptor` 是值引用）。
+client 半的模块之间**只有类型引用**（`import type`）：模型实例经槽位 `inject` 注入到组件与服务，不存在运行时模块耦合。
 
 纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / remote-descriptor）**零 DSH 运行时依赖**，
 可脱离宿主单测；`remote.ts` 依赖 `@deepseek-ai/dsh-typert-protocol`，是 host 半里唯一的协议层依赖。
