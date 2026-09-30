@@ -316,3 +316,22 @@
 - 面板真机渲染（需重启 DSH 后目测）；
 - `pnpm pack` 产物在三个 profile 的安装结果（见交付说明）。
 
+### 十·补、独立验证与跟进（同日）
+
+第一次独立验证（fresh subagent、未参与产出）结论为**有条件通过**：9 条 P1 的逐条对账全部属实、167 绿被独立复跑复现，但**证伪出两条**——
+
+1. **残余竞态（真缺陷）**：中断时"已进入 running 的成员若以 Promise reject 收场"，宿主 `catch` 会把它落成 `failed`，而 XML 已是 `aborted`——与 P1-2 同类，只是走了另一条路径。
+2. **文档笔误（我写的）**：`ARCHITECTURE.md` 把**数据流**写成了**依赖方向**（`scheduler.ts → validate.ts/result-xml.ts`）；实际 `scheduler.ts` 只依赖 `types.ts`。
+
+两条处置于 `d0ffe68`：
+
+- **判据统一为批次信号**：新增 `settleOutcomeAfter(batchSignal)`（`batchSignal.aborted ⇒ aborted`，否则 `failed`），`stopReason` 分支与 `catch` 共用；子代理自报原因仍进 `detail`。
+  ⚠️ 修复过程**证伪了父代理最初的假设**（`attempt.signal.aborted`）：调度器自己的超时闸门 abort 的正是该信号，超时与中断在这一位上同形——用它会把超时误判成 aborted。该反例已固化为护栏用例。
+- **文档订正**：依赖方向按真实 import 图重写并明示"数据流 ≠ 依赖"；`spec.md` 五条 → 六道硬校验。
+
+**验证留痕后的验收基线**：`pnpm test` **172/172 绿**（7 文件，基线 137）；`pnpm typecheck` exit 0；`pnpm pack` → `dsh-agent-swarm-0.3.3.tgz`（67,309 B）。
+
+**新增已知边界（未闭合，已在代码注释与决策笔记登记）**：终态判定与调度器落定结果之间隔着 `finally { await run.dispose() }`；中断恰好落进该窗口时 registry 可能停在 failed 而 XML 已判 aborted。闭合它需要改调度器/宿主分工，评估为收益与代价不匹配，留待后续。
+
+**交付时新发现（本轮未处置）**：打包产物里**没有 `LICENSE` 文件**，而 `package.json` 声明 `"license": "MIT"`。对外分发惯例需带许可全文；因涉及版权署名归属，交用户拍板。
+
