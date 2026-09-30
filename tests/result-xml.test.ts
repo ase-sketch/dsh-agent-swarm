@@ -95,6 +95,53 @@ describe("summary 计数行", () => {
   });
 });
 
+describe("summary 穷尽匹配（未知 outcome 不再谎报 aborted）", () => {
+  /**
+   * 构造"类型层之外"的脏 outcome。
+   * 触发场景有两类：外部数据混入 3 值联合之外的字符串，或将来把 SwarmOutcome 扩成四值
+   * 而渲染端还没跟上。两者在运行期都表现为"一个合法枚举值都不匹配"。
+   */
+  function resWithRawOutcome(index: number, item: string, outcome: string): SwarmTaskResult {
+    return { ...res(index, item), outcome: outcome as SwarmTaskResult["outcome"] };
+  }
+
+  it("未知 outcome 单独计入 unknown，不并入 aborted", () => {
+    const rs = [
+      res(1, "a"),
+      res(2, "b", { outcome: "failed", error: "boom" }),
+      res(3, "c", { outcome: "aborted", error: "stopped" }),
+      resWithRawOutcome(4, "d", "timeout"),
+    ];
+    expect(renderSwarmSummary(rs)).toBe("completed: 1, failed: 1, aborted: 1, unknown: 1");
+  });
+
+  it("旧实现会把未知值算成 aborted——这里把那个谎钉成不允许", () => {
+    // 一个真 aborted + 一个未知值：正确输出是 aborted: 1, unknown: 1。
+    const rs = [
+      res(1, "c", { outcome: "aborted", error: "stopped" }),
+      resWithRawOutcome(2, "d", "timeout"),
+    ];
+    const summary = renderSwarmSummary(rs);
+    expect(summary).toBe("aborted: 1, unknown: 1");
+    expect(summary).not.toContain("aborted: 2");
+  });
+
+  it("多个不同的未知 outcome 合并进同一个未知桶", () => {
+    const rs = [resWithRawOutcome(1, "a", "timeout"), resWithRawOutcome(2, "b", "cancelled")];
+    expect(renderSwarmSummary(rs)).toBe("unknown: 2");
+  });
+
+  it("未知 outcome 在 <summary> 元素里可见（end-to-end 可观测面）", () => {
+    const xml = renderSwarmResult([res(1, "a"), resWithRawOutcome(2, "b", "timeout")]);
+    const parsed = parseResult(xml);
+    expect(parsed.summary).toBe("completed: 1, unknown: 1");
+    // 汇总行不能靠牺牲成员来换：未知 outcome 的成员照样渲染
+    expect(parsed.members).toHaveLength(2);
+    // 未知 outcome 本身仍是原样透出（渲染层不做值改写）
+    expect(parsed.members[1]?.attrs["outcome"]).toBe("timeout");
+  });
+});
+
 describe("整体渲染", () => {
   it("结构 = 封套 + summary + 每成员一条", () => {
     const xml = renderSwarmResult([res(1, "src/a.ts"), res(2, "src/b.ts")]);

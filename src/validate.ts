@@ -66,6 +66,27 @@ function describeInvalidItem(value: unknown): string {
   return `${kind} ${String(value)}`;
 }
 
+/**
+ * 碰撞信息里单侧文本片段的最大码元数。
+ *
+ * 为什么必须截断：item 与 prompt 都是模型给的自由文本，prompt 还是"模板 + item"展开的结果；
+ * 一条 item 完全可能是十几万字符（比如把整份文件塞进 item）。把原文整段放进 error.details，
+ * 本意是帮模型自纠，实际会先用一条超长报错挤爆上下文——比不报还糟。
+ * 120 是个折中：足以让模型认出重复的是哪段文本，人类一眼也能读完一行。
+ */
+export const DUPLICATE_SNIPPET_MAX_CHARS = 120;
+
+/**
+ * 取文本开头的定长片段：超出上限时截断并补一个省略号标记，未超出则原样返回（不留标记）。
+ *
+ * 刻意不改写片段的空白/控制字符：片段的唯一用途是"让人认出是哪段文本"，
+ * 任何重写都会让它在细节上与原文对不上号；长度信息由调用方另行给出（*Chars 字段）。
+ */
+function snippetOf(value: string): string {
+  if (value.length <= DUPLICATE_SNIPPET_MAX_CHARS) return value;
+  return `${value.slice(0, DUPLICATE_SNIPPET_MAX_CHARS)}…`;
+}
+
 function fail(
   code: SwarmValidationError["code"],
   message: string,
@@ -162,7 +183,19 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
       return fail(
         SWARM_ERROR_CODES.DUPLICATE_PROMPTS,
         `Items ${String(previousIndex)} and ${String(i + 1)} expand to the same prompt; swarm members must be distinct.`,
-        { previousIndex, index: i + 1 },
+        // 编号之外还要给"重复的是哪一段文本"——只报两个编号的话，模型知道"1 和 3 撞了"
+        // 却不知道该改哪一条。片段只给一份：模板固定且至少含一个 {{item}}（校验 5 已保证），
+        // prompt 关于 item 是**单射**的——prompt 相同 ⇔ item 相同，故首次出现处与碰撞处的
+        // 文本必然逐字一致，再复制一份 previousItem/previousPrompt 只是噪音。
+        // 长度（*Chars）另行给出，读取方能看出片段被截掉了多少。
+        {
+          previousIndex,
+          index: i + 1,
+          itemSnippet: snippetOf(item),
+          promptSnippet: snippetOf(prompt),
+          itemChars: item.length,
+          promptChars: prompt.length,
+        },
       );
     }
     seenPrompts.set(prompt, i + 1);

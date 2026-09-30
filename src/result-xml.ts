@@ -130,20 +130,58 @@ export function unescapeXmlText(value: string): string {
     .replaceAll("&amp;", "&");
 }
 
-/** summary 只列非零计数；全零时为空串。 */
+/**
+ * summary 只列非零计数；全零时为空串。计数顺序固定 completed → failed → aborted → unknown。
+ *
+ * 穷尽匹配（本轮改动）：原先写的是 `if completed / else if failed / else aborted`，
+ * 于是**任何**第三个值之外的东西都被静默算进 aborted——外部脏数据混入、或将来把
+ * SwarmOutcome 扩成四值时，一个尚未完成的成员会被报成"已中止"。summary 是读取方
+ * 唯一的汇总口径，它会说谎比它少算一项严重得多。
+ *
+ * 未知值为什么选择"单独计数"而不是抛错：
+ *   1. 渲染是这条链路的最后一环。抛错会让整份 `<agent_swarm_result>` 消失（读不到
+ *      闭合标签就整块报废），把上百个已经跑完的成员正文一起赔进去，
+ *      代价与收益完全不对称。编号错位（见 assertIndexAlignment）值得抛错，
+ *      是因为它会让"哪条结果属于谁"整体错位、渲染出来必然误导；
+ *      而一个未知 outcome 只影响汇总行的一个计数，成员正文仍然逐条准确。
+ *   2. 单独计数不再说谎（未知值不再冒充 aborted），同时"unknown: N 非零"本身就是
+ *      可观测信号——模型/用户能据此去查真实原因，而不是被一个假的 aborted 数字骗过。
+ *
+ * 编译期兜底：default 分支把收窄后的 outcome 赋给 `never`。将来给 SwarmOutcome 加
+ * 第四个值时，这里会**编译失败**，逼作者显式决定它该进哪一桶（真正的中止？还是新的一行？），
+ * 而不是让它悄悄落进 unknown。运行期之外，default 只承接类型层管不到的脏数据。
+ */
 export function renderSwarmSummary(results: readonly SwarmTaskResult[]): string {
   let completed = 0;
   let failed = 0;
   let aborted = 0;
+  let unknown = 0;
   for (const result of results) {
-    if (result.outcome === "completed") completed += 1;
-    else if (result.outcome === "failed") failed += 1;
-    else aborted += 1;
+    switch (result.outcome) {
+      case "completed":
+        completed += 1;
+        break;
+      case "failed":
+        failed += 1;
+        break;
+      case "aborted":
+        aborted += 1;
+        break;
+      default: {
+        // 编译期穷尽守卫：SwarmOutcome 一旦扩容，这一行立刻编译失败。
+        const unhandled: never = result.outcome;
+        void unhandled;
+        // 运行期：类型层之外的脏数据单独计数，绝不并入 aborted（那是说谎）。
+        unknown += 1;
+        break;
+      }
+    }
   }
   const parts: string[] = [];
   if (completed > 0) parts.push(`completed: ${String(completed)}`);
   if (failed > 0) parts.push(`failed: ${String(failed)}`);
   if (aborted > 0) parts.push(`aborted: ${String(aborted)}`);
+  if (unknown > 0) parts.push(`unknown: ${String(unknown)}`);
   return parts.join(", ");
 }
 
