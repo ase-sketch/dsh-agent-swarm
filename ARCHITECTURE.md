@@ -8,20 +8,21 @@ DSH host 插件：把"批量子代理任务"包装成一个模型可调用的 `a
 ```
 src/
   types.ts               纯类型：任务规格、结果、调度器配置、错误码、默认调度参数
-  validate.ts            纯函数：六道硬校验 + 模板展开（{{item}}）+ prompt 去重
+  validate.ts            纯函数：六道硬校验 + 模板展开（{{item}}）+ prompt 去重 + per-call 模型路由匹配（白名单）
   result-xml.ts          纯函数：<agent_swarm_result> 渲染（属性/body 转义、编号一致）
   scheduler.ts           纯逻辑调度器：首波/放量/退避/容量收缩恢复；执行函数、限流判定、时钟全部注入
   swarm-registry.ts      纯逻辑状态机：成员七态生命周期 + 100ms 合帧 roster 广播（面板的数据源）
   remote.ts              host 半 Remote 服务：TypertRemoteService 以 stream 暴露 swarm/roster
   remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符（零宿主依赖）
-  index.ts               插件入口 apply(ctx)：注册工具、接 ctx.subagents、装配调度器与 registry
+  index.ts               插件入口 apply(ctx)：注册工具、接 ctx.subagents、装配调度器与 registry、
+                         按需读 ctx.subagentModelSelection 白名单（可选服务，per-call model 的唯一权威源）
   client/                同包 client 半（由 scripts/build-client.mjs 单独打包，不进 tsc 产物）
     index.ts               client 入口 apply(ctx)：**父 fiber** 只做 $mount Remote（提供 remote.swarm 命名空间），
                        随后用 ctx.plugin 载入**子 fiber**（inject 声明 remote.swarm）注册槽位与字典
                        —— 提供与消费必须分属两个 fiber，理由见决策笔记 2026-10-01-client-namespace-inject-isolation.md
     model.ts               会话/成员视图的内存模型（useSwarm 的订阅源）
     service.ts             按会话引用计数订阅 swarm/roster 流
-    SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式）
+    SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式；成员按相位四组独立折叠、批次路由标签）
 scripts/build-client.mjs   esbuild 预构建：src/client/index.ts → dist/client.js（__ModuleLoader__ 包）
 tests/                     vitest：纯函数单测 + mock Context 契约测试 + 真实 Loader 测试 + client 模型/服务
 cordis.patch.yml           bundle 层：insert 唯一的 agent-swarm 行（name 自指本包）
@@ -44,14 +45,14 @@ client 半的模块之间**只有类型引用**（`import type`）：模型实�
 
 ## 数据流
 
-模型调 `agent_swarm` → validate 展开任务 → scheduler 按节奏并发执行
-→ 每个任务经 `ctx.subagents.start("spawn", …)` 派发 one-shot 子代理
+模型调 `agent_swarm` → validate 展开任务 → per-call model 经宿主白名单解析为批次路由（缺省继承父 agent）
+→ scheduler 按节奏并发执行 → 每个任务经 `ctx.subagents.start("spawn", …)` 派发 one-shot 子代理
 → 结果汇聚 → result-xml 渲染 → 工具结果返回模型。
 中断：AbortSignal 级联取消在跑任务并清空队列。
 
 ## host/client 双半数据流（面板）
 
-调度器相位变化 → 写入 `swarm-registry`（成员七态）→ registry 100ms 合帧广播三类帧（opened / roster / closed）
+调度器相位变化 → 写入 `swarm-registry`（成员七态 + 批次路由标签）→ registry 100ms 合帧广播三类帧（opened / roster / closed）
 → `remote.ts` 以 stream 下发 → client 的 `service.ts` 按会话引用计数订阅并写入 `model.ts`
 → `SwarmHeaderAction.tsx` 渲染标题栏徽标与弹层。
 

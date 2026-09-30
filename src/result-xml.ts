@@ -9,7 +9,10 @@
  *   D1（body 未转义 → 成员列表整体丢失）：本实现对**属性与 body 一并做 XML 转义**，
  *      因此 body 里出现 `<subagent ` 字面量时，读取端仍能无损还原成员列表。
  *   D2（swarmIndex 两套编号基 → 标签错位）：本实现只承认一种编号基——1 起始、
- *      与 specs 数组位置严格对齐；渲染前强制校验，不一致直接抛错而不是静默错位。
+ *      与 specs 数组位置严格对齐；渲染前强制校验，绝不静默错位。
+ *      默认不一致即抛错（严格断言）；生产装配走 degradeOnIndexMismatch ——
+ *      错位只说明"哪条属于谁"不可信，不说明正文不可信，抛错会把整批已跑完的正文一起赔进去，
+ *      故按实际顺序降级渲染并把错位写进 <summary>（2026-10-01 审查修复，理由见该选项注释）。
  */
 
 import { SWARM_MAX_SUBAGENTS, type SwarmTaskResult } from "./types.js";
@@ -196,16 +199,15 @@ function bodyOf(result: SwarmTaskResult): string {
  * 上游 D2 的根因正是"写入端与读取端各自假设了不同的编号基"，
  * 这里用一次显式断言把该不变量钉死在渲染边界上。
  */
-function assertIndexAlignment(results: readonly SwarmTaskResult[]): void {
+function findIndexAlignmentMismatch(results: readonly SwarmTaskResult[]): string | undefined {
   for (let i = 0; i < results.length; i += 1) {
     const expected = i + 1;
     const actual = (results[i] as SwarmTaskResult).spec.index;
     if (actual !== expected) {
-      throw new Error(
-        `Swarm result index mismatch at position ${String(i)}: expected ${String(expected)}, got ${String(actual)}.`,
-      );
+      return `Swarm result index mismatch at position ${String(i)}: expected ${String(expected)}, got ${String(actual)}.`;
     }
   }
+  return undefined;
 }
 
 /**
@@ -241,9 +243,21 @@ export interface RenderSwarmResultOptions {
    * 而放松"编号全链一致"这一不变量（上游 D2 的成因）。
    */
   omitNotStarted?: boolean;
+  /**
+   * 编号错位时**降级渲染**而不是抛错（2026-10-01 审查修复）。
+   *
+   * 为什么要有这个开关：编号错位是内部不变量被破坏，但它只说明"哪条结果属于谁"不可信，
+   * 并**不说明**结果内容不可信。抛错的代价是整份结果块（含上百个已跑完成员的正文）一起消失，
+   * 收益仅是"提前失败"——收益与代价完全不对称。降级后按 results 的**实际顺序**渲染，
+   * 每条 <subagent> 仍带着自己的 spec.index 与 item（可核对），
+   * 并把错位说明写进 <summary> 让模型与人都能看见（不静默吞错）。
+   *
+   * false / 未设 = 抛错（严格断言原行为，保持向后兼容与既有测试）。
+   */
+  degradeOnIndexMismatch?: boolean;
 }
 
-/** 渲染完整结果块。results 必须按 spec.index 升序且编号连续。 */
+/** 渲染完整结果块。results 必须按 spec.index 升序且编号连续（除非开启 degradeOnIndexMismatch）。 */
 export function renderSwarmResult(
   results: readonly SwarmTaskResult[],
   options: RenderSwarmResultOptions = {},
@@ -253,13 +267,21 @@ export function renderSwarmResult(
       `Cannot render ${String(results.length)} swarm members; the maximum is ${String(SWARM_MAX_SUBAGENTS)}.`,
     );
   }
-  assertIndexAlignment(results);
+  const mismatch = findIndexAlignmentMismatch(results);
+  if (mismatch !== undefined && options.degradeOnIndexMismatch !== true) {
+    throw new Error(mismatch);
+  }
   const members = options.omitNotStarted === true
     ? results.filter((result) => result.state !== "not_started")
     : [...results];
+  // 错位时把说明并进 summary：summary 是读取方必读的汇总行，放这里保证"降级了"这件事
+  // 一定被看到，而不是只写在某条成员正文里被淹没（不静默吞错）。
+  const summary = mismatch === undefined
+    ? renderSwarmSummary(members)
+    : renderSwarmSummary(members) + "; render degraded: " + mismatch;
   const lines = [
     `<${SWARM_RESULT_TAG}>`,
-    `<summary>${escapeXmlText(renderSwarmSummary(members))}</summary>`,
+    `<summary>${escapeXmlText(summary)}</summary>`,
     ...members.map((result) => renderSubagentElement(result)),
     `</${SWARM_RESULT_TAG}>`,
   ];

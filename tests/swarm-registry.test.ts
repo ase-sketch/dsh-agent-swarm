@@ -443,3 +443,23 @@ describe("markSettled 的终态粘性", () => {
     expect(registry.getBatch(swarmId)?.status).toBe("failed");
   });
 });
+
+
+describe("routeLabel（批次路由标签）", () => {
+  it("beginBatch 给了 routeLabel：roster 帧携带；没给：帧上缺省", () => {
+    const reg = new SwarmRegistry();
+    const withLabel = reg.beginBatch(
+      "sess-r",
+      "Routed batch",
+      [{ index: 1, item: "a" }],
+      1000,
+      "minimax/MiniMax-M2",
+    );
+    const batchWith = reg.getBatch(withLabel);
+    expect(reg.toRosterFrame(batchWith!, 1001).routeLabel).toBe("minimax/MiniMax-M2");
+
+    const without = reg.beginBatch("sess-r", "Plain batch", [{ index: 1, item: "b" }], 1002);
+    const batchWithout = reg.getBatch(without);
+    expect(reg.toRosterFrame(batchWithout!, 1003).routeLabel).toBeUndefined();
+  });
+});

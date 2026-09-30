@@ -6,6 +6,9 @@
  * 都是本仓独立拟写的（与上游文案无逐字等同、无长串连续同词）。
  *
  * 六条硬校验（一期，无 resume 运行时分支）：
+ *   0. **入参自身**必须是非 null 的非数组对象（INVALID_INPUT）——
+ *      排在最前是因为它是其余六条的前提；入参不是对象时读 .items 就会抛 TypeError，
+ *      而本文件的立意恰恰是"绝不让校验函数抛异常"（2026-10-01 审查实证该防护曾形同虚设）。
  *   1. items >= 2
  *   2. 展开后成员总数 <= 128
  *   3. 每个 item 元素必须是非空字符串（trim 后仍 >= 1 个字符）
@@ -19,6 +22,7 @@ import {
   SWARM_MAX_SUBAGENTS,
   SWARM_MIN_ITEMS,
   SWARM_PROMPT_PLACEHOLDER,
+  type SwarmModelRoute,
   type SwarmRequestInput,
   type SwarmTaskSpec,
   type SwarmValidationError,
@@ -96,11 +100,44 @@ function fail(
 }
 
 /**
+ * 入参自身的判型描述（复用 item 元素的同一套口径，故措辞一致）。
+ *
+ * 刻意不碰 value 自身的方法：对 `Object.create(null)` 这类无原型对象取 `.trim` 会抛，
+ * 而取 `typeof`/`Array.isArray` 不会——本函数的立意正是"绝不让入参形状把自己变成异常"。
+ */
+function describeInvalidInput(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  const kind = typeof value;
+  if (kind === "object") return "an object";
+  if (kind === "function") return "a function";
+  return `${kind} ${String(value)}`;
+}
+
+/**
  * 校验并入队。全部校验在任何子代理启动之前完成；本函数不产生任何副作用。
+ *
+ * **永不抛异常**（本文件的立意）：入参由模型给出，形状完全不可信，因此从入参自身到
+ * 每个 item 元素都按 unknown 收并逐层判型。原实现只兜住了 `items`（`input.items ?? []`），
+ * `input` 自身是 undefined/null 时会在读 `.items` 的那一刻抛 TypeError——
+ * 那恰是本文件要消灭的行为，却漏在了最外层。现由入口处的 INVALID_INPUT 挡住。
  *
  * 编号语义：`index` 从 1 开始、按 specs 顺序连续递增（全链一致的唯一编号基）。
  */
 export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationResult {
+  // 入参自身的前置防护：undefined / null / 数组 / 原始值 / 函数都不是合法的入参形状。
+  // 数组一并拒绝：数组上取 .items 是 undefined，落到校验 1 会报成"至少 2 条"——
+  // 而调用方真正的问题是把 items 直接当成了整个入参，报条数是误导。
+
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    const received = describeInvalidInput(input);
+    return fail(
+      SWARM_ERROR_CODES.INVALID_INPUT,
+      `Swarm input must be an object with items and prompt_template; received ${received}.`,
+      { received },
+    );
+  }
   // 类型层是 string[]，但真实入参由模型给出、运行时可能是 123/null/对象；
   // 所以这里按 unknown 收，逐个判型，绝不在元素上直接点 .trim()（那会抛 TypeError）。
   const rawItems: readonly unknown[] = input.items ?? [];
@@ -204,3 +241,112 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
 
   return { ok: true, specs };
 }
+
+
+// ───────────────────────── per-call 模型路由匹配（纯函数）─────────────────────────
+
+/**
+ * details 里允许清单的最大条数。
+ *
+ * 白名单是部署方维护的，理论上可以很长；整份塞进 error.details 会用一条超长报错
+ * 挤爆模型上下文（与 DUPLICATE_SNIPPET_MAX_CHARS 同一个考量）。
+ * 截断时另给 allowedCount，读取方知道清单被截掉了多少。
+ */
+export const ALLOWED_ROUTES_DETAILS_CAP = 20;
+
+export type SwarmModelResolution =
+  | { ok: true; route: SwarmModelRoute }
+  | { ok: false; error: SwarmValidationError };
+
+/** 把允许清单渲染成 details 用的紧凑形态（截断 + 总数）。 */
+function allowedRoutesDetails(allowed: readonly SwarmModelRoute[]): Record<string, unknown> {
+  return {
+    allowedRoutes: allowed.slice(0, ALLOWED_ROUTES_DETAILS_CAP).map((r) => `${r.provider}/${r.model}`),
+    allowedCount: allowed.length,
+  };
+}
+
+/**
+ * 把模型给出的 per-call `model` 参数解析成一条白名单内的精确路由。
+ *
+ * 两种写法：
+ *   - `"provider/model"` 精确式：按第一个 "/" 切分（model id 自身可能含 "/"，
+ *     如 fireworks 风格的层级 id，provider 段不会含 "/"），要求白名单里逐字命中；
+ *   - 裸 model id：白名单里按 model 段匹配，恰好一条才采用；
+ *     多条命中（多个 provider 提供同一 model id）报 MODEL_AMBIGUOUS 并列出候选。
+ *
+ * 永不抛异常（与 validateSwarmInput 同一立意）：入参由模型给出，形状完全不可信。
+ * 白名单本身由宿主服务保证形状（SubagentModelSelectionConfig.current() 自带断言），
+ * 这里对它按只读消费，不做防御性逐条判型。
+ */
+export function resolveSwarmModelRoute(
+  requested: unknown,
+  allowed: readonly SwarmModelRoute[],
+): SwarmModelResolution {
+  if (typeof requested !== "string" || requested.trim() === "") {
+    const received = describeInvalidItem(requested);
+    return {
+      ok: false,
+      error: {
+        code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
+        message: `model must be a non-empty string ("provider/model" or a whitelisted model id); received ${received}.`,
+        details: { received },
+      },
+    };
+  }
+  const value = requested.trim();
+
+  if (value.includes("/")) {
+    const slash = value.indexOf("/");
+    const provider = value.slice(0, slash);
+    const model = value.slice(slash + 1);
+    if (provider === "" || model === "") {
+      return {
+        ok: false,
+        error: {
+          code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
+          message: `model "${value}" is not a valid route: "provider/model" needs non-empty provider and model ids.`,
+          details: { received: value },
+        },
+      };
+    }
+    const hit = allowed.find((r) => r.provider === provider && r.model === model);
+    if (hit !== undefined) return { ok: true, route: { provider: hit.provider, model: hit.model } };
+    return {
+      ok: false,
+      error: {
+        code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
+        message: `Route "${provider}/${model}" is not in this deployment's allowed subagent models.`,
+        details: { requested: `${provider}/${model}`, ...allowedRoutesDetails(allowed) },
+      },
+    };
+  }
+
+  const matches = allowed.filter((r) => r.model === value);
+  if (matches.length === 1) {
+    const hit = matches[0] as SwarmModelRoute;
+    return { ok: true, route: { provider: hit.provider, model: hit.model } };
+  }
+  if (matches.length === 0) {
+    return {
+      ok: false,
+      error: {
+        code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
+        message: `Model "${value}" is not in this deployment's allowed subagent models.`,
+        details: { requested: value, ...allowedRoutesDetails(allowed) },
+      },
+    };
+  }
+  return {
+    ok: false,
+    error: {
+      code: SWARM_ERROR_CODES.MODEL_AMBIGUOUS,
+      message: `Model id "${value}" is offered by ${String(matches.length)} providers; pass it as "provider/model" instead.`,
+      details: {
+        requested: value,
+        candidates: matches.map((r) => `${r.provider}/${r.model}`),
+      },
+    },
+  };
+}
+

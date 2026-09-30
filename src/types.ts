@@ -46,6 +46,15 @@ export interface SwarmTaskResult {
 // ───────────────────────── 校验 ─────────────────────────
 
 export const SWARM_ERROR_CODES = {
+  /**
+   * 入参本身不是对象（undefined / null / 数组 / 原始值 / 函数）。
+   *
+   * 为什么单列一条而不是复用 ITEMS_TOO_FEW：那条码描述的是"数量不够"，
+   * 它的 message 与 details 都会把调用方引去数条数；而入参压根不是对象时
+   * 调用方要改的是**入参本身**，报"至少需要 2 条"是误导。
+   * 放在表首——它是所有其它校验的前置条件（见 validate.ts 的入口防护）。
+   */
+  INVALID_INPUT: "INVALID_INPUT",
   /** items 少于 2（一期无 resume 运行时分支，故没有豁免路径）。 */
   ITEMS_TOO_FEW: "ITEMS_TOO_FEW",
   /** 展开后成员总数超过 128。 */
@@ -60,6 +69,17 @@ export const SWARM_ERROR_CODES = {
   PROMPT_TEMPLATE_PLACEHOLDER_MISSING: "PROMPT_TEMPLATE_PLACEHOLDER_MISSING",
   /** 两个 item 展开出完全相同的 prompt。 */
   DUPLICATE_PROMPTS: "DUPLICATE_PROMPTS",
+  /**
+   * 给了 per-call `model`，但宿主的子代理模型选择不可用：
+   * 设置服务未挂载、或已挂载但 enabled=false。
+   * 权威源是宿主 `subagentModelSelection` 服务（设置页「子智能体 → Model selection」），
+   * 插件不自备第二份白名单（一事一处）。
+   */
+  MODEL_SELECTION_UNAVAILABLE: "MODEL_SELECTION_UNAVAILABLE",
+  /** per-call `model` 解析出的路由不在宿主白名单内。 */
+  MODEL_NOT_ALLOWED: "MODEL_NOT_ALLOWED",
+  /** 裸 model id 命中多个 provider 的路由，必须改写成 `provider/model` 精确式。 */
+  MODEL_AMBIGUOUS: "MODEL_AMBIGUOUS",
 } as const;
 
 export type SwarmErrorCode = (typeof SWARM_ERROR_CODES)[keyof typeof SWARM_ERROR_CODES];
@@ -71,7 +91,7 @@ export interface SwarmValidationError {
   details?: Record<string, unknown>;
 }
 
-/** 工具入参（一期子集）。 */
+/** 工具入参。 */
 export interface SwarmRequestInput {
   /** 整个 swarm 的简短描述（模型提供）。 */
   description?: string;
@@ -79,6 +99,17 @@ export interface SwarmRequestInput {
   promptTemplate?: string;
   /** 每个元素展开一个子代理。 */
   items?: readonly string[];
+  /**
+   * 可选的整批 LLM 路由：`"provider/model"` 精确式，或白名单内唯一的裸 model id。
+   * 缺省 = 沿用插件 config 的固定路由，再缺省 = 继承父 agent 路由。
+   */
+  model?: string;
+}
+
+/** 一条精确的 provider/model 路由（宿主白名单的元素形状）。 */
+export interface SwarmModelRoute {
+  provider: string;
+  model: string;
 }
 
 // ───────────────────────── 常量 ─────────────────────────
@@ -110,6 +141,22 @@ export interface SwarmSchedulerConfig {
   maxConcurrency?: number;
   /** 单任务超时；undefined 或 <=0 = 不超时。 */
   timeoutMs?: number;
+  /**
+   * 单成员限流重试上限：**与"是否唯一未完成"无关**的兜底判死阈值。
+   *
+   * 为什么需要它（2026-10-01 审查实证）：原判死条件只认"只剩它一个未完成且 retryCount>=1"，
+   * 于是 ≥2 个成员**同时**持续限流时该条件恒不成立，而退避分支没有上限——
+   * 批次被无限重排队，批次 Promise 永不 resolve。给上限后这条路必然落定，
+   * 且它是 per-task 的，不会因为某个成员限流就连坐拖死整批健康成员。
+   *
+   * undefined = **无上限**（保持该字段引入前的行为，向后兼容）。给定则必须是 >= 1 的整数。
+   *
+   * 为什么默认表 {@link DEFAULT_SWARM_SCHEDULER_CONFIG} 里**没有**它：
+   * 填默认值等于静默改变现网行为（现网限流分支恒不触发，见
+   * .agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md），
+   * 保持 undefined 才能让"宿主尚未接线"与"显式选择无限"这两种状态可区分。
+   */
+  maxRateLimitRetries?: number;
 }
 
 export const DEFAULT_SWARM_SCHEDULER_CONFIG: SwarmSchedulerConfig = {

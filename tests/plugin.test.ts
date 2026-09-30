@@ -40,6 +40,11 @@ interface MockContextOptions {
   failStartAt?: number[];
   /** run.result 是否 reject。 */
   rejectResultAt?: number[];
+  /**
+   * 宿主子代理模型选择服务（白名单）的桩；不传 = 服务未挂载。
+   * 走真实 ctx.provide 注册——插件经 ctx.get 读取，与生产同一条路径。
+   */
+  modelSelection?: { enabled: boolean; allowedModels: { provider: string; model: string }[] };
 }
 
 interface MockHarness {
@@ -109,6 +114,16 @@ function createHarness(options: MockContextOptions = {}): MockHarness {
       },
     },
   });
+
+  if (options.modelSelection !== undefined) {
+    const selection = options.modelSelection;
+    ctx.provide("subagentModelSelection", {
+      current: () => ({
+        enabled: selection.enabled,
+        allowedModels: selection.allowedModels.map((r) => ({ ...r })),
+      }),
+    });
+  }
 
   const dispose = plugin.apply(ctx, options.config ?? defaultConfig());
   if (registry.current === undefined) throw new Error("apply() did not register a tool");
@@ -205,6 +220,7 @@ describe("B. defineTool 注册形态", () => {
     expect(Object.keys(parameters.properties).sort()).toEqual([
       "description",
       "items",
+      "model",
       "prompt_template",
     ]);
     expect(parameters.required?.slice().sort()).toEqual([
@@ -677,6 +693,71 @@ describe("E. 收齐全部结果再渲染，个别失败不拖垮整次调用", (
   });
 });
 
+/**
+ * 回归（2026-10-01 审查缺陷 2 的生产接线侧）：renderSwarmResult 抛错时，
+ * 生产调用点（src/index.ts 的 execute）必须有兜底，否则一次编号错位就让整批结果消失。
+ *
+ * 触发方式选"provider 返回脏 stopReason（非字符串）"：
+ * 校验层管不到它（它来自 provider 而非模型入参），但渲染期 escapeXmlAttribute(42)
+ * 会抛——即一条成员的数据形态足以让整批渲染炸掉，正是需要兜底的场景。
+ *
+ * 断言重点是"**只有**坏的那条降级，好成员的正文一条不少"：
+ * 修复前 execute 无 try/catch，这里会直接抛，一百多个好成员的正文全部消失。
+ */
+describe("E2. 渲染兜底：一次渲染失败不得赔进整批正文（缺陷 2 生产接线侧）", () => {
+  it("单个成员脏 agentId 让渲染抛错时，好成员正文仍全部保留，错误可见", async () => {
+    // 自建 harness：让中间那个 start 返回非字符串 id。agentId 从 setAgentId 一路
+    // 透传到 XML 属性（宿主侧不强制转），故 escapeXmlAttribute(对象) 会在渲染期抛——
+    // 即一条成员的脏数据足以让整批渲染炸掉，正是需要兜底的场景。
+    const ctx = new Context() as unknown as Context & Record<string, unknown>;
+    let definition: ToolDefinition | undefined;
+    let call = 0;
+    Object.defineProperty(ctx, "tools", {
+      configurable: true,
+      value: { register: (def: ToolDefinition) => void (definition = def) },
+    });
+    Object.defineProperty(ctx, "subagents", {
+      configurable: true,
+      value: {
+        start: () => {
+          const current = call;
+          call += 1;
+          return Promise.resolve({
+            // 中间那条给一个对象型 id：类型层是 string，运行时是脏数据。
+            id: current === 1 ? ({ bad: true } as unknown as string) : `run-${String(current)}`,
+            localAgent: undefined,
+            result: Promise.resolve({
+              output: [{ type: "text", text: `result of member ${String(current)}` }],
+              stopReason: "completed",
+            }),
+            dispose: () => Promise.resolve(),
+          });
+        },
+      },
+    });
+    plugin.apply(ctx, defaultConfig());
+    if (definition === undefined) throw new Error("not registered");
+    const result = (await definition.execute(validArgs(), makeExec() as never)) as { xml: string };
+
+    // 三条成员一条不少——结构没塌。
+    expect(result.xml.match(/<subagent /g)).toHaveLength(3);
+    // **好成员的正文一条不丢**（这是本次修复的核心诉求）。
+    expect(result.xml).toContain("result of member 0");
+    expect(result.xml).toContain("result of member 2");
+    // 坏的那条降级成占位，而不是让整批消失。
+    expect(result.xml).toContain("member could not be rendered");
+    // 错误可见（不静默吞错），且文档结构完整可解析。
+    expect(result.xml).toMatch(/render failed/i);
+    expect(result.xml.trimEnd().endsWith("</agent_swarm_result>")).toBe(true);
+  });
+  it("正常路径不受兜底影响：summary 仍是干净的计数行，不含降级/失败字样", async () => {
+    const harness = createHarness();
+    const result = (await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string };
+    expect(result.xml).toContain("<summary>completed: 3</summary>");
+    expect(result.xml).not.toMatch(/render degraded/i);
+    expect(result.xml).not.toMatch(/render failed/i);
+  });
+});
 // ───────────────────────── F. 真实 Loader 加载路径 ─────────────────────────
 
 describe("F. 真实 Loader 加载路径", () => {
@@ -1143,5 +1224,94 @@ describe("I. WP-P2-6：策略上限与工具描述联动", () => {
     for (const text of [tool, items]) {
       expect(text).not.toContain("999");
     }
+  });
+});
+
+
+// ───────────────────────── J. per-call 模型路由（白名单权威）─────────────────────────
+
+describe("J. per-call 模型路由（白名单权威）", () => {
+  const ALLOWED = [
+    { provider: "deepseek", model: "deepseek-chat" },
+    { provider: "minimax", model: "MiniMax-M2" },
+  ];
+
+  it('白名单开启 + "provider/model" 精确式：全员 start 收到该 agentOptions', async () => {
+    const harness = createHarness({ modelSelection: { enabled: true, allowedModels: ALLOWED } });
+    await harness.definition.execute(validArgs({ model: "minimax/MiniMax-M2" }), makeExec() as never);
+    expect(harness.startCalls.length).toBeGreaterThan(0);
+    for (const call of harness.startCalls) {
+      expect(call.request.agentOptions).toEqual({ provider: "minimax", model: "MiniMax-M2" });
+    }
+  });
+
+  it("裸 model id 白名单内唯一：同样生效", async () => {
+    const harness = createHarness({ modelSelection: { enabled: true, allowedModels: ALLOWED } });
+    await harness.definition.execute(validArgs({ model: "MiniMax-M2" }), makeExec() as never);
+    expect(harness.startCalls[0]?.request.agentOptions).toEqual({ provider: "minimax", model: "MiniMax-M2" });
+  });
+
+  it("服务未挂载：MODEL_SELECTION_UNAVAILABLE 且零派发", async () => {
+    const harness = createHarness();
+    await expect(
+      harness.definition.execute(validArgs({ model: "minimax/MiniMax-M2" }), makeExec() as never),
+    ).rejects.toMatchObject({ name: "SwarmValidationError", swarmErrorCode: "MODEL_SELECTION_UNAVAILABLE" });
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("服务挂载但 enabled=false：MODEL_SELECTION_UNAVAILABLE 且零派发", async () => {
+    const harness = createHarness({ modelSelection: { enabled: false, allowedModels: ALLOWED } });
+    await expect(
+      harness.definition.execute(validArgs({ model: "minimax/MiniMax-M2" }), makeExec() as never),
+    ).rejects.toMatchObject({ swarmErrorCode: "MODEL_SELECTION_UNAVAILABLE" });
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("路由不在白名单：MODEL_NOT_ALLOWED 且零派发", async () => {
+    const harness = createHarness({ modelSelection: { enabled: true, allowedModels: ALLOWED } });
+    await expect(
+      harness.definition.execute(validArgs({ model: "openai/gpt-5" }), makeExec() as never),
+    ).rejects.toMatchObject({ swarmErrorCode: "MODEL_NOT_ALLOWED" });
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("裸 id 多 provider 命中：MODEL_AMBIGUOUS 且零派发", async () => {
+    const harness = createHarness({
+      modelSelection: {
+        enabled: true,
+        allowedModels: [
+          { provider: "google", model: "gemini-2.5-pro" },
+          { provider: "vertex", model: "gemini-2.5-pro" },
+        ],
+      },
+    });
+    await expect(
+      harness.definition.execute(validArgs({ model: "gemini-2.5-pro" }), makeExec() as never),
+    ).rejects.toMatchObject({ swarmErrorCode: "MODEL_AMBIGUOUS" });
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("per-call model 覆盖 config 固定路由", async () => {
+    const harness = createHarness({
+      modelSelection: { enabled: true, allowedModels: ALLOWED },
+      config: { ...defaultConfig(), agentOptions: { provider: "deepseek", model: "deepseek-chat" } },
+    });
+    await harness.definition.execute(validArgs({ model: "minimax/MiniMax-M2" }), makeExec() as never);
+    expect(harness.startCalls[0]?.request.agentOptions).toEqual({ provider: "minimax", model: "MiniMax-M2" });
+  });
+
+  it("不传 model：沿用 config 固定路由（回归）", async () => {
+    const harness = createHarness({
+      config: { ...defaultConfig(), agentOptions: { provider: "deepseek", model: "deepseek-chat" } },
+    });
+    await harness.definition.execute(validArgs(), makeExec() as never);
+    expect(harness.startCalls[0]?.request.agentOptions).toEqual({ provider: "deepseek", model: "deepseek-chat" });
+  });
+
+  it("不传 model 且无固定路由：不带 agentOptions（继承父 agent，回归）", async () => {
+    const harness = createHarness();
+    await harness.definition.execute(validArgs(), makeExec() as never);
+    expect(harness.startCalls.length).toBeGreaterThan(0);
+    expect("agentOptions" in (harness.startCalls[0]?.request ?? {})).toBe(false);
   });
 });

@@ -33,6 +33,8 @@ export interface SwarmBatch {
   swarmId: string;
   sessionId: string;
   description: string;
+  /** 批次生效路由的展示标签（如 "deepseek/deepseek-chat"）；读不到时缺省，UI 留空不猜。 */
+  routeLabel?: string;
   total: number;
   status: "running" | "completed" | "failed" | "aborted";
   startedAt: number;
@@ -45,6 +47,7 @@ export interface SwarmOpenedFrame {
   swarmId: string;
   sessionId: string;
   description: string;
+  routeLabel?: string;
   total: number;
   at: number;
 }
@@ -54,6 +57,7 @@ export interface SwarmRosterFrame {
   swarmId: string;
   sessionId: string;
   description: string;
+  routeLabel?: string;
   total: number;
   activeCount: number;
   completedCount: number;
@@ -157,6 +161,7 @@ export class SwarmRegistry {
     description: string,
     specs: readonly { index: number; item: string }[],
     now = Date.now(),
+    routeLabel?: string,
   ): string {
     const swarmId = `swarm-${String(now)}-${Math.random().toString(36).slice(2, 8)}`;
     const members = new Map<number, SwarmMemberView>();
@@ -173,6 +178,7 @@ export class SwarmRegistry {
       swarmId,
       sessionId,
       description,
+      ...(routeLabel === undefined ? {} : { routeLabel }),
       total: specs.length,
       status: "running",
       startedAt: now,
@@ -362,6 +368,7 @@ export class SwarmRegistry {
       swarmId: batch.swarmId,
       sessionId: batch.sessionId,
       description: batch.description,
+      ...(batch.routeLabel === undefined ? {} : { routeLabel: batch.routeLabel }),
       total: batch.total,
       activeCount,
       completedCount,
@@ -397,6 +404,7 @@ export class SwarmRegistry {
           swarmId: currentBatch.swarmId,
           sessionId: currentBatch.sessionId,
           description: currentBatch.description,
+          ...(currentBatch.routeLabel === undefined ? {} : { routeLabel: currentBatch.routeLabel }),
           total: currentBatch.total,
           at: currentBatch.startedAt,
         };
@@ -433,6 +441,7 @@ export class SwarmRegistry {
             swarmId: latest.swarmId,
             sessionId: latest.sessionId,
             description: latest.description,
+            ...(latest.routeLabel === undefined ? {} : { routeLabel: latest.routeLabel }),
             total: latest.total,
             at: latest.startedAt,
           };

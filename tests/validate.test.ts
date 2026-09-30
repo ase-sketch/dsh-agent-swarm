@@ -8,8 +8,10 @@ import {
   type SwarmRequestInput,
 } from "../src/types.js";
 import {
+  ALLOWED_ROUTES_DETAILS_CAP,
   DUPLICATE_SNIPPET_MAX_CHARS,
   expandPromptTemplate,
+  resolveSwarmModelRoute,
   validateSwarmInput,
 } from "../src/validate.js";
 
@@ -35,6 +37,64 @@ describe("expandPromptTemplate", () => {
   });
 });
 
+/**
+ * 回归（2026-10-01 审查缺陷 3）：入参自身的空值防护曾形同虚设。
+ *
+ * 原实现只兜住了 `items`（`input.items ?? []`），`input` 自身是 undefined/null 时
+ * 会在读 `.items` 的那一刻抛 TypeError——而本文件的立意恰恰是"绝不让校验函数抛异常"。
+ * 即：立意写进了注释，最外层却恰恰是它。
+ *
+ * 钉住：返回值是**结构化失败**（ok:false + 错误码），而不是异常。
+ */
+describe("入参自身的前置防护（2026-10-01 缺陷 3）", () => {
+  it("undefined / null 返回结构化 INVALID_INPUT，不抛 TypeError", () => {
+    for (const bad of [undefined, null]) {
+      const r = validateSwarmInput(bad as unknown as Parameters<typeof validateSwarmInput>[0]);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.INVALID_INPUT);
+      // 不得报成"条数不够"：入参压根不是对象，调用方要改的是入参本身。
+      expect(r.error.code).not.toBe(SWARM_ERROR_CODES.ITEMS_TOO_FEW);
+    }
+  });
+
+  it("数组入参同样被拒（把 items 直接当整参传入是常见的调用方错误）", () => {
+    const r = validateSwarmInput(["a", "b"] as unknown as Parameters<typeof validateSwarmInput>[0]);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.error.code).toBe(SWARM_ERROR_CODES.INVALID_INPUT);
+  });
+
+  it("原始值 / 函数入参也返回结构化失败而非抛错", () => {
+    for (const bad of [42, "str", true, () => undefined]) {
+      const r = validateSwarmInput(bad as unknown as Parameters<typeof validateSwarmInput>[0]);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error("unreachable");
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.INVALID_INPUT);
+    }
+  });
+
+  it("失败文案与 details 说出实际收到的是什么（供模型自纠）", () => {
+    const r = validateSwarmInput(null as unknown as Parameters<typeof validateSwarmInput>[0]);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.error.message).toMatch(/must be an object/i);
+    expect(r.error.message).toMatch(/null/);
+    expect(r.error.details?.["received"]).toBe("null");
+  });
+
+  it("向后兼容：合法对象入参行为完全不变", () => {
+    const r = validateSwarmInput({ items: ["a", "b"], promptTemplate: "do {{item}}" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.specs.map((s) => s.index)).toEqual([1, 2]);
+    // 空对象仍走原有的 ITEMS_TOO_FEW 路径（新防护只在入参不是对象时才介入）。
+    const empty = validateSwarmInput({});
+    expect(empty.ok).toBe(false);
+    if (empty.ok) throw new Error("unreachable");
+    expect(empty.error.code).toBe(SWARM_ERROR_CODES.ITEMS_TOO_FEW);
+  });
+});
 describe("校验 1：items >= 2", () => {
   it("0 个 item 报 ITEMS_TOO_FEW", () => {
     const r = validateSwarmInput(input({ items: [] }));
@@ -422,6 +482,74 @@ describe("错误文案关键要素（其余错误码）", () => {
       expect(missingElements(r.error.message, ["1", "3"])).toEqual([]);
       // 文案之外还有机器可读的 details：位置与碰撞文本片段同时给到
       expect(r.error.details).toMatchObject({ previousIndex: 1, index: 3, itemSnippet: "a" });
+    }
+  });
+});
+
+
+// ─────────────────── per-call 模型路由匹配（resolveSwarmModelRoute）───────────────────
+
+describe("resolveSwarmModelRoute", () => {
+  const allowed = [
+    { provider: "deepseek", model: "deepseek-chat" },
+    { provider: "minimax", model: "MiniMax-M2" },
+    { provider: "google", model: "gemini-2.5-pro" },
+    { provider: "vertex", model: "gemini-2.5-pro" }, // 与 google 同 model id：歧义测试用
+  ];
+
+  it('"provider/model" 精确式：逐字命中即采用', () => {
+    const r = resolveSwarmModelRoute("minimax/MiniMax-M2", allowed);
+    expect(r).toEqual({ ok: true, route: { provider: "minimax", model: "MiniMax-M2" } });
+  });
+
+  it('精确式按第一个 "/" 切分：model id 自身含 "/" 也能命中', () => {
+    const fw = [{ provider: "fireworks", model: "accounts/fireworks/models/llama-v3" }];
+    const r = resolveSwarmModelRoute("fireworks/accounts/fireworks/models/llama-v3", fw);
+    expect(r).toEqual({ ok: true, route: fw[0] });
+  });
+
+  it("裸 model id：白名单内唯一时采用", () => {
+    const r = resolveSwarmModelRoute("MiniMax-M2", allowed);
+    expect(r).toEqual({ ok: true, route: { provider: "minimax", model: "MiniMax-M2" } });
+  });
+
+  it("裸 model id 多 provider 命中：MODEL_AMBIGUOUS 并列出候选", () => {
+    const r = resolveSwarmModelRoute("gemini-2.5-pro", allowed);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.MODEL_AMBIGUOUS);
+      expect(r.error.details?.candidates).toEqual(["google/gemini-2.5-pro", "vertex/gemini-2.5-pro"]);
+    }
+  });
+
+  it("不在白名单：MODEL_NOT_ALLOWED 并附允许清单", () => {
+    const r = resolveSwarmModelRoute("openai/gpt-5", allowed);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.MODEL_NOT_ALLOWED);
+      expect(r.error.details?.requested).toBe("openai/gpt-5");
+      expect(r.error.details?.allowedCount).toBe(allowed.length);
+    }
+  });
+
+  it("畸形入参（非字符串 / 空串 / 单边空段）：不抛异常，报 MODEL_NOT_ALLOWED", () => {
+    for (const bad of [123, null, undefined, {}, [], "", "   ", "/model", "provider/"]) {
+      const r = resolveSwarmModelRoute(bad, allowed);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe(SWARM_ERROR_CODES.MODEL_NOT_ALLOWED);
+    }
+  });
+
+  it(`允许清单在 details 里截断到 ${String(ALLOWED_ROUTES_DETAILS_CAP)} 条并给总数`, () => {
+    const big = Array.from({ length: ALLOWED_ROUTES_DETAILS_CAP + 10 }, (_, i) => ({
+      provider: `p${String(i)}`,
+      model: `m${String(i)}`,
+    }));
+    const r = resolveSwarmModelRoute("no/such-route", big);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect((r.error.details?.allowedRoutes as unknown[]).length).toBe(ALLOWED_ROUTES_DETAILS_CAP);
+      expect(r.error.details?.allowedCount).toBe(big.length);
     }
   });
 });

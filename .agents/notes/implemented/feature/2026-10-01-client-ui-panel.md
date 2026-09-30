@@ -49,3 +49,12 @@ Kimi Code 官方智能体团队面板对 one-shot 子代理不可见（DSH 会�
   - 现象：`src/index.ts:351` 在重复调用 `apply` 时总是创建新的 `SwarmRegistry`，但 `ctx.get("swarmRemote")` 已存在不再重建，导致既有 Stream 订阅停留在旧 registry，无法接收新 batch 的帧。
   - 修复：`SwarmRemote` 新增 `getRegistry()` / `setRegistry()`；`apply` 重入时通过 `ctx.get("swarmRemote").getRegistry()` 复用既有 registry，保证流不断开且实时同步。
   - 验证：在 `tests/plugin.test.ts` 增加连续两次 `apply` 后旧 stream 仍能收到第二次 apply 触发的批次 frames 的回归测试。
+
+## 0.3.6 面板收纳与路由标签演进（2026-10-01）
+
+- **Problem**：成员一多（实测 9 个已嫌长，上限 128）弹层列表无限向下拉长；且行内看不出本批次走的是哪条模型路由。
+- **Decision**：
+  1. 成员按相位分四组（进行中 / 失败 / 已完成 / 已取消），**各自独立折叠**——进行中与失败默认展开（需要关注），已完成与已取消默认收起（收纳），换批次时重置为默认；
+  2. 列表长度定死（max-height + 细滚轮），并修 flex 子项 `min-height: 0`（缺它滚动会被内容撑破、滚轮失效）；
+  3. 批次路由标签 `routeLabel` 由 host 在 execute 期解析（生效覆盖路由；继承时读父 agent requestHeader/options，与 resolveChildAgentOptions 同口径），经 registry 三类帧透传，面板头部以 `模型: provider/model` 芯片展示；读不到则留空不猜。
+- **Confirmation**：`tests/swarm-registry.test.ts` 新增 routeLabel 帧透传用例（给/不给两条路径）；分组与滚轮为呈现层行为，目测验收待用户重启 DSH。

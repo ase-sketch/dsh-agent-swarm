@@ -133,6 +133,53 @@ const CSS_CONTENT = `
   min-width: 0;
 }
 
+.dsh-swarm-route {
+  font-family: var(--dsw-font-mono, monospace);
+  font-size: 10px;
+  color: var(--dsw-alias-label-tertiary, #64748b);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 1px 6px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-self: flex-start;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-sizing: border-box;
+}
+
+.dsh-swarm-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--dsw-radius-md, 6px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #94a3b8);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+  box-sizing: border-box;
+}
+
+.dsh-swarm-group-toggle:hover {
+  background: var(--dsw-alias-fill-l1, rgba(255, 255, 255, 0.04));
+  color: var(--dsw-alias-label-primary, #f1f5f9);
+}
+
+.dsh-swarm-group-arrow {
+  flex: none;
+  font-size: 9px;
+  transition: transform 0.12s ease;
+}
+
+.dsh-swarm-group-arrow.open {
+  transform: rotate(90deg);
+}
+
 .dsh-swarm-stats {
   display: flex;
   flex-wrap: wrap;
@@ -156,12 +203,30 @@ const CSS_CONTENT = `
   overflow-y: auto;
   overflow-x: hidden;
   flex: 1;
+  /* flex 子项默认 min-height:auto 会撑破滚容器，必须归零滚动才生效 */
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* 列表长度定死：超出即滚轮，绝不把弹层继续往下撑 */
   max-height: 360px;
   min-width: 0;
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dsw-alias-fill-l3, rgba(255, 255, 255, 0.16)) transparent;
+}
+
+.dsh-swarm-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.dsh-swarm-list::-webkit-scrollbar-thumb {
+  background: var(--dsw-alias-fill-l3, rgba(255, 255, 255, 0.16));
+  border-radius: 3px;
+}
+
+.dsh-swarm-list::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .dsh-swarm-row {
@@ -362,6 +427,36 @@ const PHASE_CONFIG: Record<SwarmPhase, { label: string; bg: string; color: strin
   aborted: { label: "取消", bg: "rgba(100, 116, 139, 0.2)", color: "#94a3b8" },
 };
 
+// ───────────────────────── 成员分组（收纳）─────────────────────────
+
+type SwarmGroupKey = "active" | "failed" | "completed" | "aborted";
+
+interface SwarmGroupDef {
+  key: SwarmGroupKey;
+  label: string;
+  match: (phase: SwarmPhase) => boolean;
+}
+
+/** 组序即渲染序：进行中 → 失败 → 已完成 → 已取消。 */
+const SWARM_GROUP_DEFS: readonly SwarmGroupDef[] = [
+  {
+    key: "active",
+    label: "进行中",
+    match: (p) => p === "pending" || p === "starting" || p === "running" || p === "retrying",
+  },
+  { key: "failed", label: "失败", match: (p) => p === "failed" },
+  { key: "completed", label: "已完成", match: (p) => p === "completed" },
+  { key: "aborted", label: "已取消", match: (p) => p === "aborted" },
+];
+
+/** 默认展开态：需要关注的（进行中/失败）展开，已收场的（完成/取消）收起。 */
+const SWARM_GROUP_DEFAULT_OPEN: Record<SwarmGroupKey, boolean> = {
+  active: true,
+  failed: true,
+  completed: false,
+  aborted: false,
+};
+
 function SwarmIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -387,6 +482,11 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
   // 倒计时基准时钟：仅在存在待重试成员时由 RetryTicker 推进
   const [now, setNow] = useState(() => Date.now());
   const tickerRef = useRef<RetryTicker | null>(null);
+  // 分组折叠态：进行中/失败默认展开（需要关注），已完成/已取消默认收起（收纳）。
+  // 每组独立开关——成员多时任何一组都可以单独收起来。
+  const [openGroups, setOpenGroups] = useState<Record<SwarmGroupKey, boolean>>({
+    ...SWARM_GROUP_DEFAULT_OPEN,
+  });
 
   // 样式兜底注入：apply 期已注入过一次，这里按挂载再确认一次（不在渲染期查 DOM）
   useEffect(() => {
@@ -443,6 +543,12 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
   // 从 Model 订阅当前会话数据与流失败态
   const batch = useSwarm((state) => state.bySession[sessionId]);
   const streamFailure = useSwarm((state) => state.streamFailures[sessionId]);
+
+  // 换了批次就重置折叠态：旧批次的展开选择不该泄漏到新批次
+  const swarmId = batch?.swarmId;
+  useEffect(() => {
+    setOpenGroups({ ...SWARM_GROUP_DEFAULT_OPEN });
+  }, [swarmId]);
 
   const hasBatch = Boolean(batch && batch.total > 0);
   const isLive = Boolean(batch && batch.activeCount > 0);
@@ -509,6 +615,11 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
             ) : (
               <div className="dsh-swarm-desc">会话级并发调度监控</div>
             )}
+            {batch?.routeLabel && (
+              <span className="dsh-swarm-route" title={batch.routeLabel}>
+                模型: {batch.routeLabel}
+              </span>
+            )}
           </div>
 
           {streamFailure && (
@@ -531,54 +642,83 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
               </div>
 
               <div className="dsh-swarm-list">
-                {batch.members.map((m: SwarmMemberView) => {
-                  const cfg = PHASE_CONFIG[m.phase] ?? PHASE_CONFIG.pending;
-                  const secondsLeft =
-                    m.retryReadyAt === undefined ? 0 : retrySecondsLeft(m.retryReadyAt, now);
-                  return (
-                    <div key={m.index} className="dsh-swarm-row">
-                      <div className="dsh-swarm-row-main">
-                        <span className="dsh-swarm-row-index">#{m.index}</span>
-                        <span
-                          className="dsh-swarm-phase-badge"
-                          style={{ backgroundColor: cfg.bg, color: cfg.color }}
-                        >
-                          {cfg.label}
-                        </span>
-                        <span className="dsh-swarm-row-item" title={m.item}>
-                          {m.item}
-                        </span>
-                        {m.agentId && (
-                          <span className="dsh-swarm-agent-id" title={m.agentId}>
-                            {m.agentId.slice(0, 10)}
+                {(() => {
+                  const renderRow = (m: SwarmMemberView) => {
+                    const cfg = PHASE_CONFIG[m.phase] ?? PHASE_CONFIG.pending;
+                    const secondsLeft =
+                      m.retryReadyAt === undefined ? 0 : retrySecondsLeft(m.retryReadyAt, now);
+                    return (
+                      <div key={m.index} className="dsh-swarm-row">
+                        <div className="dsh-swarm-row-main">
+                          <span className="dsh-swarm-row-index">#{m.index}</span>
+                          <span
+                            className="dsh-swarm-phase-badge"
+                            style={{ backgroundColor: cfg.bg, color: cfg.color }}
+                          >
+                            {cfg.label}
                           </span>
+                          <span className="dsh-swarm-row-item" title={m.item}>
+                            {m.item}
+                          </span>
+                          {m.agentId && (
+                            <span className="dsh-swarm-agent-id" title={m.agentId}>
+                              {m.agentId.slice(0, 10)}
+                            </span>
+                          )}
+                        </div>
+
+                        {m.phase === "retrying" && (
+                          <div className="dsh-swarm-detail">
+                            第 {m.retryCount} 次限流重试
+                            {secondsLeft > 0 ? (
+                              <span> · 约 {secondsLeft} 秒后发起</span>
+                            ) : null}
+                            {m.detail ? <span> ({m.detail})</span> : null}
+                          </div>
+                        )}
+
+                        {m.phase === "failed" && m.detail && (
+                          <div className="dsh-swarm-detail error" title={m.detail}>
+                            {m.detail}
+                          </div>
+                        )}
+
+                        {m.phase === "aborted" && m.detail && (
+                          <div className="dsh-swarm-detail" title={m.detail}>
+                            {m.detail}
+                          </div>
                         )}
                       </div>
+                    );
+                  };
 
-                      {m.phase === "retrying" && (
-                        <div className="dsh-swarm-detail">
-                          第 {m.retryCount} 次限流重试
-                          {secondsLeft > 0 ? (
-                            <span> · 约 {secondsLeft} 秒后发起</span>
-                          ) : null}
-                          {m.detail ? <span> ({m.detail})</span> : null}
-                        </div>
-                      )}
-
-                      {m.phase === "failed" && m.detail && (
-                        <div className="dsh-swarm-detail error" title={m.detail}>
-                          {m.detail}
-                        </div>
-                      )}
-
-                      {m.phase === "aborted" && m.detail && (
-                        <div className="dsh-swarm-detail" title={m.detail}>
-                          {m.detail}
-                        </div>
-                      )}
-                    </div>
+                  // 收纳规则：四类成员各自独立成组（进行中/失败/已完成/已取消），
+                  // 每组都可单独折叠——成员一多，任何一组都不会把列表无限拉长。
+                  return (
+                    <>
+                      {SWARM_GROUP_DEFS.map((group) => {
+                        const members = batch.members.filter((m: SwarmMemberView) => group.match(m.phase));
+                        if (members.length === 0) return null;
+                        const isOpen = openGroups[group.key];
+                        return (
+                          <div key={group.key}>
+                            <button
+                              type="button"
+                              className="dsh-swarm-group-toggle"
+                              onClick={() =>
+                                setOpenGroups((prev) => ({ ...prev, [group.key]: !prev[group.key] }))
+                              }
+                            >
+                              <span className={`dsh-swarm-group-arrow ${isOpen ? "open" : ""}`}>▶</span>
+                              {group.label} {members.length} 个成员
+                            </button>
+                            {isOpen && members.map(renderRow)}
+                          </div>
+                        );
+                      })}
+                    </>
                   );
-                })}
+                })()}
               </div>
             </>
           ) : (

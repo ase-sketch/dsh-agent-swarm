@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-swarm",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "private": true,
   "type": "module",
   "description": "DSH bundle: batch subagent swarm tool with adaptive rate-limit scheduling (clean-room)",

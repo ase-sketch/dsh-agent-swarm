@@ -35,15 +35,22 @@ import {
   SWARM_MIN_ITEMS,
   type SwarmAttemptContext,
   type SwarmAttemptResult,
+  type SwarmModelRoute,
   type SwarmOutcome,
   type SwarmRateLimitClass,
   type SwarmTaskResult,
   type SwarmTaskSpec,
   type SwarmValidationError,
 } from "./types.js";
-import { validateSwarmInput } from "./validate.js";
+import { resolveSwarmModelRoute, validateSwarmInput } from "./validate.js";
 import { runSwarm } from "./scheduler.js";
-import { renderSwarmResult } from "./result-xml.js";
+import {
+  SWARM_RESULT_TAG,
+  escapeXmlAttribute,
+  escapeXmlText,
+  renderSubagentElement,
+  renderSwarmResult,
+} from "./result-xml.js";
 import { SwarmRegistry } from "./swarm-registry.js";
 import { SwarmRemote } from "./remote.js";
 
@@ -178,6 +185,8 @@ function buildToolDescription(effectiveMax: number): string {
     "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported (delegation depth is capped at 1); call it from your own turn instead.",
     "",
     "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
+    "",
+    "Optional model routing: pass model as \"provider/model\" (or a bare model id that is unique in this deployment's allowed subagent models) to run the whole batch on that route. The route must appear in the deployment's subagent model allowlist — discover candidates with list_subagent_models when that tool is available. Omit model to inherit the calling agent's route (or the plugin's configured fixed route). A rejected model fails the call before any subagent starts.",
   ].join("\n");
 }
 
@@ -332,6 +341,8 @@ async function runOneTask(
   attempt: SwarmAttemptContext,
   parent: SwarmParentAgent,
   label: string,
+  /** 本批次的生效路由覆盖（execute 期一次性解析：per-call model > config 固定路由 > 缺省继承）。 */
+  agentOptions: SwarmAgentOptions | undefined,
   swarmId?: string,
   registry?: SwarmRegistry,
   /** 批次级信号（exec.signal）：只判"批次是否被中断"，不判单个成员的信号。 */
@@ -356,7 +367,7 @@ async function runOneTask(
       prompt: [{ type: "text", text: spec.prompt }],
       label,
       signal,
-      ...(config.agentOptions === undefined ? {} : { agentOptions: config.agentOptions }),
+      ...(agentOptions === undefined ? {} : { agentOptions }),
     });
   } catch (error) {
     const detail = `Subagent could not be started: ${error instanceof Error ? error.message : String(error)}`;
@@ -445,6 +456,11 @@ function buildToolParameters(effectiveMax: number) {
       required: true,
       description: `The independent per-member inputs, at least ${String(SWARM_MIN_ITEMS)} and at most ${String(effectiveMax)} entries. Plan against this number: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} and cannot be raised, so on this deployment the host can only lower the cap, and more than ${String(effectiveMax)} entries is rejected before any subagent starts.`,
     },
+    model: {
+      type: "string",
+      description:
+        "Optional LLM route for the whole batch: \"provider/model\", or a bare model id unique in this deployment's allowed subagent models. Must appear in the subagent model allowlist (see list_subagent_models). Omit to inherit the calling agent's route (or the plugin's fixed route).",
+    },
   } as const;
 }
 
@@ -460,11 +476,12 @@ const TOOL_OUTPUT = {
 
 // ───────────────────────── execute 分段（校验 / 上下文 / 调度装配）─────────────────────────
 
-/** agent_swarm 的入参（与 TOOL_PARAMETERS 的三个属性一一对应）。 */
+/** agent_swarm 的入参（与 TOOL_PARAMETERS 的属性一一对应）。 */
 interface SwarmExecuteArgs {
   description: string;
   prompt_template: string;
   items: string[];
+  model?: string;
 }
 
 /**
@@ -499,6 +516,109 @@ function resolveSwarmSpecs(args: SwarmExecuteArgs, config: SwarmPluginConfig): S
   return specs;
 }
 
+// ───────────────────────── per-call 模型路由（白名单权威）─────────────────────────
+
+/**
+ * 宿主子代理模型选择服务的结构形状。
+ * 真身是 @deepseek-ai/dsh-tool-subagent/model-selection-settings 注册的
+ * `ctx.subagentModelSelection` 服务（设置页「子智能体 → Model selection」的数据源）。
+ * 这里只声明消费面，不为一个类型注解新增依赖（与本文件头部 SwarmParentAgent 同一手法）。
+ */
+interface SubagentModelSelectionReader {
+  current(): { enabled: boolean; allowedModels: SwarmModelRoute[] };
+}
+
+/**
+ * 读取宿主白名单服务；未挂载（或形状不符）返回 undefined。
+ *
+ * 用 ctx.get 而不是 inject 声明：这是**可选**能力——服务缺失时插件其余功能必须照常工作
+ * （只有模型显式传了 model 的那次调用才报 MODEL_SELECTION_UNAVAILABLE），
+ * inject 是硬依赖，会把"可选"变成"没它就起不来"。
+ */
+function readSubagentModelSelection(ctx: Context): SubagentModelSelectionReader | undefined {
+  const candidate = ctx.get("subagentModelSelection") as unknown;
+  if (
+    typeof candidate === "object" &&
+    candidate !== null &&
+    typeof (candidate as { current?: unknown }).current === "function"
+  ) {
+    return candidate as SubagentModelSelectionReader;
+  }
+  return undefined;
+}
+
+/**
+ * 解析本批次的生效路由覆盖。优先级：per-call `model` > config.agentOptions 固定路由 >
+ * 缺省（继承父 agent，由 start() 不传 agentOptions 实现）。
+ *
+ * per-call 路径的权威源是宿主白名单（一事一处：插件不自备第二份允许清单）；
+ * 服务未挂载、未开启、或路由不在名单内，一律在任何子代理启动之前抛结构化错误。
+ * 服务 current() 自身抛错（白名单配置非法：重复路由等）同样归并到
+ * MODEL_SELECTION_UNAVAILABLE——那是"选择机制不可用"，不是"这条路由不被允许"。
+ */
+function resolveBatchAgentOptions(
+  args: SwarmExecuteArgs,
+  config: SwarmPluginConfig,
+  ctx: Context,
+): SwarmAgentOptions | undefined {
+  if (args.model === undefined) return config.agentOptions;
+  // 空白串视同未提供（与 validate.ts 的 normalizeOptionalString 同一口径）；
+  // 非字符串等畸形值不放行、不静默忽略，交给匹配器报 MODEL_NOT_ALLOWED。
+  if (typeof args.model === "string" && args.model.trim() === "") return config.agentOptions;
+
+  const service = readSubagentModelSelection(ctx);
+  if (service === undefined) {
+    throw swarmValidationError({
+      code: SWARM_ERROR_CODES.MODEL_SELECTION_UNAVAILABLE,
+      message:
+        "Per-batch model routing requires the host's subagent model selection, which is not available in this composition. Enable it in Settings → 子智能体 → Model selection, or omit the model parameter.",
+    });
+  }
+  let selection: { enabled: boolean; allowedModels: SwarmModelRoute[] };
+  try {
+    selection = service.current();
+  } catch (error) {
+    throw swarmValidationError({
+      code: SWARM_ERROR_CODES.MODEL_SELECTION_UNAVAILABLE,
+      message: `The host's subagent model selection could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+  if (!selection.enabled) {
+    throw swarmValidationError({
+      code: SWARM_ERROR_CODES.MODEL_SELECTION_UNAVAILABLE,
+      message:
+        "Per-batch model routing is disabled: the host's subagent model selection is off. Enable it in Settings → 子智能体 → Model selection (and maintain the allowlist there), or omit the model parameter.",
+    });
+  }
+  const resolution = resolveSwarmModelRoute(args.model, selection.allowedModels);
+  if (!resolution.ok) {
+    throw swarmValidationError(resolution.error);
+  }
+  return { provider: resolution.route.provider, model: resolution.route.model };
+}
+
+/**
+ * 批次路由的展示标签（面板用）。
+ * 有覆盖就显示覆盖值；继承时尽力读父 agent 当前请求路由
+ * （requestHeader 优先于创建期 options，与 resolveChildAgentOptions 的继承口径一致）；
+ * 都读不到返回 undefined，面板对应位置留空而不是猜。
+ */
+function describeBatchRoute(
+  agentOptions: SwarmAgentOptions | undefined,
+  parent: SwarmParentAgent,
+): string | undefined {
+  if (agentOptions?.provider !== undefined && agentOptions.model !== undefined) {
+    return `${agentOptions.provider}/${agentOptions.model}`;
+  }
+  const header = (
+    parent as { session?: { requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } }
+  ).session?.requestHeader?.()?.config;
+  const options = (parent as { options?: { provider?: string; model?: string } }).options;
+  const provider = header?.provider ?? options?.provider;
+  const model = header?.model ?? options?.model;
+  return provider !== undefined && model !== undefined ? `${provider}/${model}` : undefined;
+}
+
 /** ② 父 Agent（必填项，缺失即抛——官方包同样写法）与会话标识（用于会话面板隔离）。 */
 function resolveSwarmContext(exec: ToolRunContext): { parent: SwarmParentAgent; sessionId: string } {
   const parent = exec.agent;
@@ -523,6 +643,10 @@ interface SwarmBatchRunInput {
   parent: SwarmParentAgent;
   sessionId: string;
   description: string;
+  /** 本批次的生效路由覆盖（execute 期已解析完毕）。 */
+  agentOptions: SwarmAgentOptions | undefined;
+  /** 面板展示的批次路由标签；读不到时为 undefined（面板留空不猜）。 */
+  routeLabel: string | undefined;
   registry: SwarmRegistry;
   /** 批次级信号（exec.signal）：用户中断级联，同时是成员终态归属的判据（见 settleOutcomeAfter）。 */
   signal: AbortSignal;
@@ -535,8 +659,8 @@ interface SwarmBatchRunInput {
  * 否则会话面板会永远停在 running（成员相位还留在 pending）。
  */
 async function runSwarmBatch(batch: SwarmBatchRunInput): Promise<readonly SwarmTaskResult[]> {
-  const { ctx, config, specs, parent, sessionId, description, registry, signal } = batch;
-  const swarmId = registry.beginBatch(sessionId, description, specs);
+  const { ctx, config, specs, parent, sessionId, description, agentOptions, routeLabel, registry, signal } = batch;
+  const swarmId = registry.beginBatch(sessionId, description, specs, Date.now(), routeLabel);
 
   try {
     // executor 内派发子代理；批次信号 = exec.signal（用户中断级联）。
@@ -573,6 +697,7 @@ async function runSwarmBatch(batch: SwarmBatchRunInput): Promise<readonly SwarmT
               attempt,
               parent,
               `${String(spec.index)}/${String(specs.length)}: ${String(spec.item)}`,
+              agentOptions,
               swarmId,
               registry,
               signal,
@@ -594,6 +719,41 @@ async function runSwarmBatch(batch: SwarmBatchRunInput): Promise<readonly SwarmT
     )) as readonly SwarmTaskResult[];
   } finally {
     registry.endBatch(swarmId);
+  }
+}
+
+/**
+ * 渲染的兜底：先按降级模式渲染（编号错位不抛错），再兜住**任何**其它渲染期异常。
+ *
+ * 为什么要有第二层 try/catch（degradeOnIndexMismatch 只挡编号错位一类）：
+ * 渲染是这条链路的最后一环，它抛错的代价是**整批**结果消失——包括上百个已经跑完、
+ * 已经付费、正文完好的成员。那是本仓最贵的失败模式，且与"不静默吞错"并不冲突：
+ * 兜底不是把错误吃掉，而是把错误**变成模型看得见的结果内容**——
+ * 逐成员按 item / outcome / 正文降级渲染，并把渲染失败的原文写进 <summary>。
+ *
+ * 只有二次降级也失败（连单成员渲染都做不出来）时才把错误抛出：那时连"保住结果"
+ * 都已不可能，抛错反而是更诚实的信号。
+ */
+function renderSwarmResultSafely(results: readonly SwarmTaskResult[]): string {
+  try {
+    return renderSwarmResult(results, { omitNotStarted: false, degradeOnIndexMismatch: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const header = [
+      `<${SWARM_RESULT_TAG}>`,
+      `<summary>render failed: ${escapeXmlText(message)}</summary>`,
+    ].join("\n");
+    const body = results
+      .map((result) => {
+        // 单成员同样可能抛（脏数据极端形态），故逐条兜住，坏的那条只出占位而不中断整批。
+        try {
+          return renderSubagentElement(result);
+        } catch {
+          return `<subagent item="${escapeXmlAttribute(String(result.spec?.item ?? ""))}" outcome="${escapeXmlAttribute(String(result.outcome))}">member could not be rendered</subagent>`;
+        }
+      })
+      .join("\n");
+    return [header, body, `</${SWARM_RESULT_TAG}>`].filter((line) => line !== "").join("\n");
   }
 }
 
@@ -626,10 +786,13 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
       // ① 校验 + 展开 + 宿主策略上限：全部在任何子代理启动之前完成。
       const specs = resolveSwarmSpecs(args, config);
 
-      // ② 父 Agent 与会话标识：缺父 Agent 即抛（此刻尚未开批次，无需收批次）。
+      // ② 生效路由：per-call model 过宿主白名单；拒绝同样发生在任何子代理启动之前。
+      const agentOptions = resolveBatchAgentOptions(args, config, ctx);
+
+      // ③ 父 Agent 与会话标识：缺父 Agent 即抛（此刻尚未开批次，无需收批次）。
       const { parent, sessionId } = resolveSwarmContext(exec);
 
-      // ③ 调度：executor 内派发子代理；批次信号 = exec.signal（用户中断级联）。
+      // ④ 调度：executor 内派发子代理；批次信号 = exec.signal（用户中断级联）。
       const results = await runSwarmBatch({
         ctx,
         config,
@@ -637,13 +800,21 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
         parent,
         sessionId,
         description: args.description,
+        agentOptions,
+        routeLabel: describeBatchRoute(agentOptions, parent),
         registry,
         signal: exec.signal,
       });
 
-      // ④ 收齐全部结果后一次性渲染：个别成员失败不拖垮整个工具调用，
+      // ⑤ 收齐全部结果后一次性渲染：个别成员失败不拖垮整个工具调用，
       //    失败与成功在 XML 里如实分列（spike Q7.4 末条）。
-      return { xml: renderSwarmResult(results, { omitNotStarted: false }) };
+      //
+      //    degradeOnIndexMismatch：编号错位时**不**抛错把整批赔进去，改为按实际顺序降级渲染，
+      //    错位说明写进 <summary>（可见、不静默）。2026-10-01 审查实证：修复前此处无兜底，
+      //    一次错位就让包括已跑完成员正文在内的**全部**结果一起消失。
+      return {
+        xml: renderSwarmResultSafely(results),
+      };
     },
   });
 

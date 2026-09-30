@@ -57,3 +57,81 @@ P2 批次开工前复核 A 组四条"启用前必修"，其中 **「容量恢复
 
 **因此启用前置条件由三条收敛为两条**：① M3 实机确认 `llm/retry` 的 `failure.code`；
 ② 修掉并发闸门与容量恢复的互锁、以及宿主回调抛错导致调度停摆这两个缺口（P2 批次的 WP-P2-1 处理）。
+
+## 2026-10-01 死锁防护缺口实证：≥2 个成员同时持续限流 ⇒ 无限重排队、批次 Promise 永不 resolve
+
+> 归属：本节并入本笔记（决策演进 → 更新归属笔记，不新建重复笔记）。
+> 定位：**M3 启用限流能力时的门禁项**，不是现网 bug（整条限流分支当前仍是死代码，见上文「Problem」）。
+
+### Problem
+
+`src/scheduler.ts:574` 的判死条件是 `#isOnlyUnfinishedTask(state) && attempt.state.retryCount >= 1`，
+其注释里那句「不会引入无限重排队——……而『只剩它一个』意味着后续每次限流都满足条件，最迟下一次就判死」
+只在**单成员持续限流**时成立。判定式里 `retryCount >= 1` 只是个下限，`#requeueRateLimited`（同文件 636 行起）
+不设重试次数上限，于是**每成员的重排队次数无界**。当同时有 ≥2 个成员在限流时：
+对成员 A 而言成员 B 同样是「未完成」，`#isOnlyUnfinishedTask`（627 行）返回 false → 判死分支不成立 →
+走 else 的 `#requeueRateLimited` 无限重来。没有任何成员会走到判死，批次的 `Promise` 永不 settle，
+`onAbandoned` 永不触发，面板与宿主持久等待一个不会到来的结果。
+
+fake-timer 实测（2026-10-01 代码审查）：
+
+| 场景 | settled | 限流重试次数 | onAbandoned |
+| --- | --- | --- | --- |
+| 2 个成员持续限流，推进 1 小时虚拟时间 | false | 22 次 | 0 次 |
+| 3 个成员持续限流 | false | 33 次 | 0 次 |
+
+现有「死锁防护」测试分组（`tests/scheduler.test.ts:742`）为什么没拦住：
+三条用例都先用 `h.complete(...)` 让其它成员跑完，制造出「只剩一个未完成」，
+于是 `#isOnlyUnfinishedTask` 在限流发生时恒为 true；`it("还有别的未完成任务时限流只重排队，不判 failed")`
+（809 行）看似覆盖多人场景，但它恰恰断言**此时不判死**，并靠 `drain(h, p)` 收尾——
+被测路径与「多个成员同时卡在限流里」不同。**多人同时限流这条路径当前零覆盖。**
+
+### Decision
+
+判死条件改为**双重条件**（任一成立即判 failed + 触发 `onAbandoned`）：
+
+1. 原单成员条件：`#isOnlyUnfinishedTask(state) && retryCount >= 1`（保留现有放宽语义与偏离说明）；
+2. per-task 重试上限：`retryCount >= maxRateLimitRetries`。
+
+并新增配置项 `SwarmSchedulerConfig.maxRateLimitRetries?: number`（`src/types.ts` 的 `SwarmSchedulerConfig`）：
+
+- `undefined` = 保持旧的无上限行为，向后兼容；**不在 `DEFAULT_SWARM_SCHEDULER_CONFIG` 里填值**
+  （与 `maxConcurrency` / `timeoutMs` 同一约定：默认表不放「改变行为」的值；判死门槛是行为，不是默认值）；
+- 构造期校验：必须是 ≥ 1 的整数，非法值即抛错（沿用调度器既有配置校验的 fail-fast 口径）；
+- 生产装配 `src/index.ts` **保持不接线**：该字段留空即旧行为，限流能力启用时再由宿主显式透传。
+
+### Alternatives considered
+
+- **全员都在限流就判死（把「唯一未完成」换成「全部未完成」）**：否决。
+  限流是 provider 侧的**全局**信号（429 常整批返回），同批其它成员几乎必然随后一起限流；
+  用全体状态当判死门槛，等于把「暂时都不健康」翻译成「全部判死」，
+  会**连坐拖死整批健康成员**——一个可恢复的抖动被固化成整批终态失败，比卡死更难排查、影响面更大。
+- **只改「唯一未完成」为「全部未完成」，不加 per-task 上限**：同上否决，理由相同；
+  且它在「只有 1 个成员限流、其余健康」的常见场景下判死行为不变，实际只新增了「全体限流→全体判死」这一条更坏的路径。
+- **保留现状，只在本文件登记该缺口**：否决。已由 fake-timer 实测证明可卡死（settled=false、重试 22/33 次、
+  `onAbandoned` 0 次）。限流能力一旦在 M3 接线，这就是「批次永不返回」级别的事故；
+  仅登记不设门禁，等于把已实证的卡死留在 M3 的路上。
+- **给 `DEFAULT_SWARM_SCHEDULER_CONFIG` 填一个默认上限（如 3）**：否决。
+  这会在**当前**就把判死行为从「无上限」改成「有上限」，等于在没有 M3 实机数据的情况下
+  顺带改了调度语义；而分寸（几次算多）需要实机 `llm/retry` 的 429 分布才能定，现在定就是猜。保持 `undefined` 默认无上限，把取值留给启用时的实机校准。
+
+### Consequences
+
+- 收益：判死不再依赖「恰好只剩一个未完成」这一脆弱前提，per-task 重试上限独立封住无界重排队；
+  两个条件是 OR 关系，**原单成员路径的现有行为与偏离说明完全不变**。
+- 影响面：`SwarmSchedulerConfig` 新增一个可选字段 + `#handleAttemptOutcome` 的判死式加一个分支；
+  默认路径（`maxRateLimitRetries` 未设）运行时行为与现在逐字节一致。
+- 代价：`retryBaseMs × retryFactorⁿ` 的退避在没有上限时会指数增长，启用限流后单成员最长重排队时长不可预期；
+  启用时必须由宿主给出上限，否则仍是旧行为。
+- 与既有条目的关系：不改变上文「容量恢复无上界 → 判定为不改」的结论，也不改变「整条分支当前不触发」的事实；
+  本节只是把启用前置条件从两条补到**三条**（第三条 = 修判死条件 + 上限配置）。
+
+### Confirmation
+
+- 即时校验：改完后 `maxRateLimitRetries` 未设时，全部既有调度器用例（含 `tests/scheduler.test.ts` 死锁防护分组）
+  应原样通过——这是向后兼容的判定依据。
+- 启用前必补的回归用例（当前**零覆盖**，须新增）：
+  ① 2 个成员同时持续限流 + `maxRateLimitRetries: N` → 达到上限后两个成员都判 failed、`onAbandoned` 各触发一次、批次 settle；
+  ② 同一场景 + `maxRateLimitRetries` 未设 → 断言维持旧行为（不静默改语义）；
+  ③ 构造期校验：`maxRateLimitRetries` 传 0 / 负数 / 非整数 → 抛错。
+- 启用时的验收条件（在上文两条之外新增第三条）：③ 实机校准 `maxRateLimitRetries` 取值并在 `src/index.ts` 接线。

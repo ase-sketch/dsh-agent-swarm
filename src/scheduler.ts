@@ -11,7 +11,13 @@
  *   收缩       每次限流容量 -1，非强制收缩有 capacityShrinkDebounceMs 防抖，下限 1
  *   恢复       距最近一次限流满 capacityRecoveryIntervalMs 后容量 +1
  *   重罚/轻罚  首请求未发出就限流 → 全局间隔翻倍；已发出（ready）→ 只推 retryBaseMs
- *   死锁防护   只剩一个未完成任务且它持续限流 → 直接判 failed，不再无限重排队
+ *   死锁防护   判死条件是**双重（or）**，两条各自独立成立即判 failed、不再无限重排队：
+ *             ① 单成员尾部：只剩它一个未完成 且 它已退避重试过（retryCount>=1）仍限流；
+ *             ② per-task 上限：它自己的 retryCount 已达 config.maxRateLimitRetries。
+ *             ② 与"是否唯一未完成"**无关**——缺了它，≥2 个成员同时持续限流时 ① 恒不成立，
+ *             而退避分支没有上限，批次会被无限重排队、批次 Promise 永不 resolve
+ *             （2026-10-01 审查实测：2 成员 / 3 成员各推进 1 小时虚拟时间，settled 恒 false）。
+ *             maxRateLimitRetries 未设（undefined）时 ② 不成立，等价于该字段引入前的行为。
  *   中断       AbortSignal → 在跑标 aborted、清空队列
  *
  * 本实现相对上游行为描述的**有意偏离**（均为可测的收紧，不是功能变更）：
@@ -62,6 +68,16 @@ const ABORTED_BEFORE_START = "The swarm was interrupted before this member was s
 const TIMED_OUT = "Subagent timed out.";
 const ABANDONED_BY_RATE_LIMIT =
   "Subagent was still rate limited while it was the only unfinished member; the swarm gave up on it.";
+
+/**
+ * 判死条件的第二条（per-task 重试上限）专用文案。
+ *
+ * 为什么与 ABANDONED_BY_RATE_LIMIT 分开而不是复用：两条判死路径的原因不同——
+ * 前者是"批次尾部只剩它，腾不出别人来"；后者是"它自己重试次数到顶了"（哪怕旁边还有别的成员在跑）。
+ * 共用一句会让"为什么被放弃"在成员多于一个时彻底说不清，排查时只能靠猜。
+ */
+const ABANDONED_BY_RETRY_LIMIT = (limit: number): string =>
+  `Subagent stayed rate limited after ${String(limit)} retries; the swarm gave up on it.`;
 
 /**
  * 宿主回调抛错告警前缀。并进受影响成员的结果文案，保证"没被吞掉"这件事在任何 outcome
@@ -180,6 +196,17 @@ export class SwarmScheduler {
       const maxConcurrency = this.#config.maxConcurrency;
       if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
         throw new Error(`maxConcurrency must be an integer >= 1 when set, got ${String(maxConcurrency)}.`);
+      }
+    }
+    // maxRateLimitRetries 同理：undefined = 无上限（向后兼容），给定就必须是 >= 1 的整数。
+    // 0 / NaN / 小数 / 负数分别会变成"第一次限流就判死"/"比较恒假"/"语义不明"/"第一次就判死"，
+    // 即把这条判死条件变成静默失效或语义漂移——与 maxConcurrency 同样在构造期挡掉。
+    if (this.#config.maxRateLimitRetries !== undefined) {
+      const maxRateLimitRetries = this.#config.maxRateLimitRetries;
+      if (!Number.isInteger(maxRateLimitRetries) || maxRateLimitRetries < 1) {
+        throw new Error(
+          `maxRateLimitRetries must be an integer >= 1 when set, got ${String(maxRateLimitRetries)}.`,
+        );
       }
     }
     this.#deps = deps;
@@ -569,24 +596,12 @@ export class SwarmScheduler {
     if (!this.#releaseAttempt(attempt)) return;
     if (this.#finished) return;
 
+    const deathError = outcome.type === "settled" ? undefined : this.#rateLimitDeathCause(attempt.state);
     if (outcome.type === "settled") {
       this.#results[attempt.state.index] = outcome.result;
-    } else if (this.#isOnlyUnfinishedTask(attempt.state) && attempt.state.retryCount >= 1) {
-      // 死锁防护：只剩它一个还在限流，且**已经退避重试过至少一次**仍限流 →
-      // 再等也等不到"别人完成腾容量"，直接判 failed。
-      //
-      // 相对上游的**有意偏离**（收紧→放宽，给一次重试机会）：
-      // 机制文档 02-并发调度与限流退避.md §8.1 的条件只有 isOnlyUnfinishedTask，
-      // 即上游在**首次**限流时就判 failed。理由与代价：
-      //   上游代价 = 批次尾部任何一次瞬时限流都会直接判死，该成员永远没有第二次机会，
-      //              限流本身高度瞬时（见 spike Q6：子代理内部还在自行重试 5 次），
-      //              首次即弃会把可恢复的抖动变成终态失败；
-      //   本实现 = 先按 retryBaseMs 退避重试一次；只有**持续**限流（retryCount>=1
-      //              仍限流）才放弃，死锁防护的本意（不无限等）依然成立，且不会引入
-      //              无限重排队——因为这条分支的判定在每次限流后重跑，不通过就 requeue，
-      //              而"只剩它一个"意味着后续每次限流都满足条件，最迟下一次就判死。
-      // 校准：retryCount 语义见同文件 #requeueRateLimited（每次 requeue 递增）。
-      const error = ABANDONED_BY_RATE_LIMIT;
+    } else if (deathError !== undefined) {
+      // 死锁防护：两条判死条件任一成立即判 failed（详见 #rateLimitDeathCause）。
+      const error = deathError;
       const result: SwarmTaskResult = {
         spec: attempt.state.spec,
         outcome: "failed",
@@ -629,6 +644,36 @@ export class SwarmScheduler {
       if (i !== state.index && this.#results[i] === undefined) return false;
     }
     return true;
+  }
+
+  /**
+   * 限流判死判定：**双重（or）**，任一条件成立就返回该成员的失败文案，否则返回 undefined。
+   *
+   * ① 单成员尾部（原有条件，保留）：只剩它一个未完成 且 已退避重试过（retryCount>=1）仍限流。
+   *   它覆盖"排在我后面的都没了、也腾不出别人来"的批次尾部场景；
+   *   相对上游机制文档 §8.1 的**有意放宽**（上游首次限流即判死）理由不变：
+   *   限流高度瞬时，首次即弃会把可恢复的抖动变成终态失败，故先给 retryBaseMs 退避一次。
+   *
+   * ② per-task 重试上限（新增，与"是否唯一未完成"无关）：retryCount >= maxRateLimitRetries。
+   *   **为什么必须有它**：① 在 ≥2 个成员同时持续限流时恒为 false（每个成员都还"有别人没完成"），
+   *   而重排队分支没有次数上限 → 无限重排队，批次 Promise 永不 resolve。
+   *   2026-10-01 实测：2 成员 / 3 成员同时持续限流、各推进 1 小时虚拟时间，settled 恒 false，
+   *   onAbandoned 0 次。② 让这条路必然落定，且按成员各自计数——一个成员限流到顶，
+   *   不会连坐拖死同批仍在健康跑完的其它成员。
+   *
+   * 两条各自独立成立即判死，且文案可区分（调用方据此能说出"为什么被放弃"）。
+   * 校准：retryCount 语义见 #requeueRateLimited——每次 requeue 递增 1，故
+   * "已重排队 N 次后仍在第 N+1 次尝试里限流"时 retryCount === N。
+   */
+  #rateLimitDeathCause(state: TaskState): string | undefined {
+    if (this.#isOnlyUnfinishedTask(state) && state.retryCount >= 1) {
+      return ABANDONED_BY_RATE_LIMIT;
+    }
+    const limit = this.#config.maxRateLimitRetries;
+    if (limit !== undefined && state.retryCount >= limit) {
+      return ABANDONED_BY_RETRY_LIMIT(limit);
+    }
+    return undefined;
   }
 
   // ───────────────────────── 限流重排队 ─────────────────────────

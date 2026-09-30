@@ -822,6 +822,122 @@ describe("死锁防护", () => {
     await drain(h, p);
   });
 
+  /**
+   * 回归（2026-10-01 审查缺陷 1）：≥2 个成员**同时**持续限流时批次曾永久卡死。
+   *
+   * 锁定的不变量：判死条件是**双重（or）**，其中"per-task 重试上限"与"是否唯一未完成"无关。
+   * 原实现只有单成员尾部判死，于是每个成员都觉得"还有别人没完成"→ 恒不判死 →
+   * 退避分支又没有次数上限 → 无限重排队、批次 Promise 永不 resolve。
+   * 修复前实测：2 成员 / 3 成员各推进 1 小时虚拟时间，settled 恒 false、onAbandoned 0 次。
+   *
+   * 断言三件事，缺一不可：
+   *   ① 批次**最终落定**（推进 1 小时虚拟时间后 settled 变 true）——这正是修复前失败的那一条；
+   *   ② 触顶成员 outcome=failed 且文案指出"重试次数到顶"（可与批次尾部判死区分）；
+   *   ③ onAbandoned 真的被调用（判死不是只改结果、忘了通知宿主）。
+   * 用假 executor + advanceTimersByTimeAsync 推进虚拟时间，不真等。
+   */
+  it("回归：2 个成员同时持续限流 → 到重试上限即判死，批次不再永久卡死", async () => {
+    const abandoned: { index: number; outcome: string; error: string }[] = [];
+    const h = harness({ onAbandoned: (e) => abandoned.push({ index: e.spec.index, outcome: e.outcome, error: e.error }) });
+    // maxConcurrency=2 让两个成员同时在跑——正是"谁都不是唯一未完成"的场景。
+    const p = runSwarm(specsOf(2), h.deps, { initialLaunchLimit: 2, maxConcurrency: 2, maxRateLimitRetries: 2 });
+    await flush(0);
+    expect(h.started()).toEqual([1, 2]);
+
+    let settled = false;
+    void p.then(() => { settled = true; });
+
+    // 推进 1 小时虚拟时间：期间每次重试都限流，成员各自累计 retryCount。
+    // 修复前这里跑完仍是 settled=false（无限重排队）。
+    for (let i = 0; i < 240 && !settled; i += 1) {
+      for (const run of [...h.runs]) run.reject(rateLimitError());
+      await flush(15_000);
+    }
+
+    const results = await p;
+    expect(settled).toBe(true);
+    expect(results.map((r) => r.outcome)).toEqual(["failed", "failed"]);
+    for (const r of results) {
+      // 两条判死路径的文案都以 "rate limited" 收口，故这里断言共同前缀。
+      expect(r.error).toMatch(/rate limit/i);
+    }
+    // 且**至少有一个**走的是新增的"per-task 重试上限"那条（文案里带 retried 次数）。
+    // 为什么不是两个都走那条：先触顶的那个由上限判死，剩下那个随之变成"唯一未完成"，
+    // 下一次限流由原有的批次尾部条件判死——两条路径都真实生效，顺序不同而已。
+    expect(results.some((r) => /retries/i.test(r.error ?? ""))).toBe(true);
+    expect(abandoned).toHaveLength(2);
+    expect(abandoned.map((e) => e.index).sort()).toEqual([1, 2]);
+    expect(abandoned.every((e) => e.outcome === "failed")).toBe(true);
+  });
+
+  /**
+   * 回归（同上缺陷的反面对照）：上限是 **per-task** 的，不连坐。
+   *
+   * 钉住的是"一个成员限流到顶 ≠ 整批陪葬"：成员 1 持续限流，成员 2 正常完成。
+   * 若实现写成"批次级上限"（比如用一个共享计数器判死全部未完成成员），
+   * 这个用例会失败——因为成员 2 会被无理由放弃。
+   */
+  it("回归：per-task 上限不连坐——一个成员限流到顶，同批健康成员照常完成", async () => {
+    const abandoned: number[] = [];
+    const h = harness({ onAbandoned: (e) => abandoned.push(e.spec.index) });
+    const p = runSwarm(specsOf(2), h.deps, { initialLaunchLimit: 2, maxConcurrency: 2, maxRateLimitRetries: 1 });
+    await flush(0);
+
+    h.complete(2, { result: "healthy-done" });
+    await flush(0);
+
+    // 成员 1 一直限流：首次限流不判死（retryCount 0 < 上限 1），重试后仍限流即判死。
+    let settled = false;
+    void p.then(() => { settled = true; });
+    for (let i = 0; i < 60 && !settled; i += 1) {
+      h.rateLimit(1);
+      await flush(3_000);
+    }
+
+    const results = await p;
+    expect(settled).toBe(true);
+    expect(results[0]?.outcome).toBe("failed");
+    expect(results[1]?.outcome).toBe("completed");
+    expect(results[1]?.result).toBe("healthy-done");
+    expect(abandoned).toEqual([1]);
+  });
+
+  /**
+   * 向后兼容守卫：maxRateLimitRetries **未设**（undefined）时行为与该字段引入前一致——
+   * 即只有批次尾部那条判死条件生效，成员之间同时限流仍会一直重排队。
+   *
+   * 这条看似在断言一个"坏行为"，实则是把"未接线 ≠ 默认有上限"钉死：
+   * 若有人日后给 DEFAULT_SWARM_SCHEDULER_CONFIG 填了默认值，
+   * "宿主未接线"就会被静默变成"有上限"，现网行为被无声改变而不自知。
+   */
+  it("向后兼容：maxRateLimitRetries 未设时，多成员同时限流仍不因上限判死", async () => {
+    const h = harness();
+    const p = runSwarm(specsOf(2), h.deps, { initialLaunchLimit: 2, maxConcurrency: 2 });
+    await flush(0);
+
+    for (let i = 0; i < 8; i += 1) {
+      for (const run of [...h.runs]) run.reject(rateLimitError());
+      await flush(6_000);
+    }
+    // 未设上限：两个成员都还在重排队，谁都没被判死。
+    expect(h.attemptsOf(1)).toBeGreaterThan(1);
+    expect(h.attemptsOf(2)).toBeGreaterThan(1);
+
+    // 收尾：让两者都成功，批次正常落定（该用例只关心判死条件，不关心卡死）。
+    for (const run of [...h.runs]) run.resolve({ result: "late-ok" });
+    await drain(h, p);
+  });
+
+  it("maxRateLimitRetries 给定则必须是 >= 1 的整数，否则构造期抛错", () => {
+    const h = harness();
+    // 0 意味着"第一次限流就判死"（与"先退避一次再放弃"的设计相反）；
+    // NaN / 小数会让 `retryCount >= limit` 比较恒假或语义不明——都是静默失效，故构造期挡掉。
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(() => new SwarmScheduler(specsOf(2), h.deps, { maxRateLimitRetries: bad })).toThrow(/maxRateLimitRetries/);
+    }
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, {})).not.toThrow();
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, { maxRateLimitRetries: 1 })).not.toThrow();
+  });
   it("死锁防护只对限流生效；普通失败本来就判 failed", async () => {
     const h = harness();
     const p = runSwarm(specsOf(2), h.deps);
