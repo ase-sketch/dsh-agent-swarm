@@ -4,6 +4,7 @@ import { SwarmScheduler, runSwarm } from "../src/scheduler.js";
 import type {
   SwarmAttemptContext,
   SwarmAttemptResult,
+  SwarmRateLimitClass,
   SwarmSchedulerConfig,
   SwarmSchedulerDeps,
   SwarmTaskSpec,
@@ -45,11 +46,20 @@ interface HarnessOptions extends Partial<SwarmSchedulerDeps> {
    * 用于构造「首个请求尚未发出就被限流」的重罚场景。
    */
   autoReady?: boolean;
+  /**
+   * 限流档位判定的返回值（默认 `"first-request-blocked"`）。
+   *
+   * 为什么必须有这个旋钮：重罚/轻罚的判据是
+   * `!attempt.ready && classify() === "first-request-blocked"`，把档位钉死成一个值，
+   * 判据的后半截就永远进不了对照实验——差异会被误读成"ready 与否"造成的，
+   * 而看不出 classify 的返回值同样是判据的一部分（见「重罚 / 轻罚」用例组）。
+   */
+  rateLimitClass?: SwarmRateLimitClass;
 }
 
 /** 手动驾驶的执行器：时钟/定时器/执行函数全部注入，测试完全掌控节奏。 */
 function harness(over: HarnessOptions = {}) {
-  const { autoReady = true, ...depsOver } = over;
+  const { autoReady = true, rateLimitClass = "first-request-blocked", ...depsOver } = over;
   const runs: RunControl[] = [];
 
   const deps: SwarmSchedulerDeps = {
@@ -61,7 +71,8 @@ function harness(over: HarnessOptions = {}) {
       clearTimeout(handle as Parameters<typeof clearTimeout>[0]);
     },
     isRateLimitError: (error: unknown) => error instanceof Error && error.name === "RateLimitError",
-    classify: () => "first-request-blocked",
+    // 档位可由 rateLimitClass 配置；deps 整体覆盖（...depsOver）仍然优先。
+    classify: () => rateLimitClass,
     executor: {
       run: (spec, ctx) => {
         let resolve!: (r: SwarmAttemptResult) => void;
@@ -127,6 +138,22 @@ function harness(over: HarnessOptions = {}) {
 const flush = async (ms = 0): Promise<void> => {
   await vi.advanceTimersByTimeAsync(ms);
 };
+
+/**
+ * 不反复结算的驱动：把时钟按 `stepMs` 逐段推进，**不**自动结算任何在跑任务。
+ *
+ * 与 drain() 的分工（两者都保留）：drain 每轮无条件 resolve 所有在跑任务，settle 与
+ * 放量的相对顺序被拉平，"先放量还是先 settle"这类竞态在它手里不可能暴露；本函数把每段
+ * 的控制权交还测试，由测试在精确时刻结算精确成员。
+ *
+ * 顺带一提，"不结算"这一点本身就是断言对象：满并发时若唤醒定时器被丢掉，只要没有
+ * settle，批次就再也不前进（见「容量收缩与恢复」里的保活回归用例）。
+ */
+async function advanceClock(totalMs: number, stepMs = 250): Promise<void> {
+  for (let elapsed = 0; elapsed < totalMs; elapsed += stepMs) {
+    await flush(Math.min(stepMs, totalMs - elapsed));
+  }
+}
 
 /**
  * 稳健收尾：反复结算所有已启动的尝试并推进时钟，直到批次 Promise 落定。
@@ -327,6 +354,50 @@ describe("限流退避序列", () => {
   });
 });
 
+// ───────────────────────── 放量与 settle 交织（精确驱动） ─────────────────────────
+
+describe("放量与 settle 交织", () => {
+  it("放量由定时器按节流到点触发，settle 只负责腾容量，两者顺序不可互换", async () => {
+    // 目的：用不反复结算的驱动（advanceClock）把 settle 钉在精确时刻，
+    // 证明"放量"与"settle"是两条独立触发路径——drain 那种每轮全结算的写法
+    // 会把两者揉在一起，看不出任何一条路径是否真的生效。
+    const h = harness();
+    const scheduler = new SwarmScheduler(specsOf(4), h.deps, { initialLaunchLimit: 2, maxConcurrency: 2 });
+    const p = scheduler.run();
+    await flush(0);
+    expect(h.started()).toEqual([1, 2]);
+
+    h.rateLimit(1); // t=1e6：容量降到 1，2 号占满
+    await flush(0);
+    expect(scheduler.snapshot().rateLimitCapacity).toBe(1);
+
+    // 先推进 1000ms（远早于退避就绪的 t=1e6+3000），再 settle 2 号：
+    // 腾出容量不等于能立刻放量——退避未到期就不许提前重试。
+    await advanceClock(1000);
+    h.complete(2);
+    await flush(0);
+    expect(h.attemptsOf(1)).toBe(1);
+
+    // 退避到点（t = 1e6+3000）由定时器唤醒 1 号，而不是"settle 顺带放量"。
+    await advanceClock(2000);
+    expect(h.attemptsOf(1)).toBe(2);
+    h.complete(1, { result: "retry-done" });
+
+    // 1 号 settle 后容量空闲，但全局节流还有一个 globalRetryIntervalMs：
+    // 3 号必须等到节流到点才放量，且放的是**新成员**而不是 1 号的第三次尝试。
+    await flush(0);
+    expect(h.attemptsOf(3)).toBe(0);
+    await advanceClock(3000);
+    expect(h.started()).toEqual([1, 2, 1, 3]);
+
+    h.complete(3);
+    await advanceClock(3000);
+    h.complete(4);
+    const results = await p;
+    expect(results.map((r) => r.outcome)).toEqual(["completed", "completed", "completed", "completed"]);
+  });
+});
+
 // ───────────────────────── 容量收缩 / 恢复 ─────────────────────────
 
 describe("容量收缩与恢复", () => {
@@ -417,11 +488,16 @@ describe("容量收缩与恢复", () => {
     await drain(h, p);
   });
 
-  it("回归：满载（active 达到容量）时容量恢复被并发闸门挡住，不靠清空队列也能测", async () => {
+  it("回归：满载（active 达到容量）时容量恢复照常推进，但放量仍被并发闸门挡住", async () => {
     // 把 F3 造成的行为变化钉成显式契约，避免以后有人误把它当成回归改回去：
     // 1 号首次限流 → 退避重排队（不再判死）；
     // 到 180s 容量恢复到 2 并真的重启 1 号；
-    // 此后 active 恒为 1（maxConcurrency=1），恢复闸门关闭，容量停在 2。
+    // 此后 active 恒为 1（maxConcurrency=1）→ **不启动任何新成员**。
+    //
+    // 订正（原用例在此断言"容量停在 2"，理由是"恢复被并发闸门挡住"）：那个断言实际钉住的
+    // 是"唤醒定时器被丢掉"这一缺陷——容量恢复只在 #scheduleRateLimitLaunch 的一轮里发生，
+    // 旧实现满并发时不再武装定时器，恢复链条随之冻结。保活修复后恢复**照常**继续
+    // （容量 2 → 3），被闸门挡住的是**放量**（attemptsOf(1) 停在 2）——这才是本条要钉的契约。
     const h = harness();
     const scheduler = new SwarmScheduler(specsOf(10), h.deps, SLOW);
     const p = scheduler.run();
@@ -435,7 +511,8 @@ describe("容量收缩与恢复", () => {
     expect(h.attemptsOf(1)).toBe(2); // 恢复瞬间真的重试了，不是判死
 
     await flush(180_000);
-    expect(scheduler.snapshot().rateLimitCapacity).toBe(2); // 满载，恢复被挡住
+    expect(scheduler.snapshot().rateLimitCapacity).toBe(3); // 恢复照常（保活修复后不再冻结）
+    expect(h.attemptsOf(1)).toBe(2); // 但 maxConcurrency=1 压住放量：没有新成员被启动
 
     await drain(h, p);
   });
@@ -456,6 +533,52 @@ describe("容量收缩与恢复", () => {
     // 推进到第一个恢复点：容量必须真的 +1（说明唤醒定时器被正确装上了）。
     await flush(180_000);
     expect(scheduler.snapshot().rateLimitCapacity).toBe(2);
+
+    await drain(h, p);
+  });
+
+  it("回归：满并发时不得把唤醒丢掉——没有任何 settle，也必须始终留着未来唤醒", async () => {
+    // 触发条件是三个条件的交集：① 限流模式；② 放量被 maxConcurrency 卡死；
+    // ③ 全局节流与退避就绪时间都已是过去时。此时"下一个可放量时刻"算出来是过去时刻，
+    // 旧实现直接 return 且不装定时器，于是 pending 还在、批次没结束、却没有任何唤醒——
+    // 只能指望某个在跑成员恰好 settle（实测：推进 4.5e6ms 后仍 active=1/pending=7）。
+    // 本用例全程不 settle 任何成员（advanceClock 不结算，drain 只在最后收尾），
+    // 因此它断言的就是"定时器本身还在"以及"那个定时器真的会触发状态变化"。
+    const h = harness();
+    const scheduler = new SwarmScheduler(specsOf(8), h.deps, SLOW);
+    const p = scheduler.run();
+    await flush(0);
+    h.rateLimit(1);
+    await flush(0);
+    expect(h.attemptsOf(1)).toBe(1);
+
+    // 第一个恢复点：容量 1 → 2，1 号被重试并再次占满 maxConcurrency=1。
+    await advanceClock(180_000);
+    expect(scheduler.snapshot().rateLimitCapacity).toBe(2);
+    expect(h.attemptsOf(1)).toBe(2);
+
+    // 关键状态：有 pending、批次未结束、没有 settle 可指望。
+    const snap = scheduler.snapshot();
+    expect(snap.finished).toBe(false);
+    expect(snap.pendingCount).toBe(7);
+    expect(snap.activeCount).toBe(1);
+    expect(vi.getTimerCount()).toBeGreaterThan(0); // 修复前为 0：唤醒被丢掉
+
+    // 再过一个恢复窗口：容量必须真的再 +1，证明留下的是"有效唤醒"而不是空转的定时器。
+    await advanceClock(180_000);
+    expect(scheduler.snapshot().rateLimitCapacity).toBe(3);
+    // 但并发闸门照样压住放量：没有启动任何新成员（1 号仍是唯一在跑的）。
+    expect(h.started()).toEqual([1, 1]);
+
+    // 与题面实测口径对齐：继续推进到 4.5e6 虚拟毫秒（≈25 个恢复窗口），全程仍然零 settle。
+    // 修复前这里就是"推进 4.5e6ms 后仍 active=1/pending=7 且没有任何定时器"；
+    // 修复后容量持续推进、唤醒定时器始终在，批次只是被并发闸门合法地压住。
+    // （容量不设上界是既有判定，故此处只断言"还在涨"，不钉具体数值。）
+    await advanceClock(4_500_000, 18_000);
+    expect(scheduler.snapshot().rateLimitCapacity).toBeGreaterThan(2);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    expect(scheduler.snapshot().activeCount).toBe(1);
+    expect(scheduler.snapshot().pendingCount).toBe(7);
 
     await drain(h, p);
   });
@@ -515,6 +638,103 @@ describe("首个请求未发出的重罚 vs 运行中被限流的轻罚", () => 
 
     await drain(h, p);
   });
+
+  it("classify 判为 in-flight-limited（轻罚）：ready 前被限流也只用 3000ms", async () => {
+    // 与上一条「ready 前被限流 → 翻倍 6000ms」构成对照实验：输入只差 classify 的返回值，
+    // 于是"翻倍与否由档位判据（ready && classify）共同决定"被真正钉住，
+    // 而不是只验证了 ready 这一半——这正是题面里"轻罚/重罚判据从未被区分过"的补漏。
+    const h = harness({ autoReady: false, rateLimitClass: "in-flight-limited" });
+    const scheduler = new SwarmScheduler(specsOf(6), h.deps, SLOW);
+    const p = scheduler.run();
+    await flush(0);
+    expect(h.runs[0]?.ready).toBe(false);
+
+    h.rateLimit(1);
+    await flush(0);
+    const snap = scheduler.snapshot();
+    expect(snap.globalRetryIntervalMs).toBe(3000); // 轻罚：不翻倍
+    expect(snap.nextRateLimitLaunchAt).toBe(Date.now() + 3000);
+
+    await drain(h, p);
+  });
+});
+
+// ───────────────────────── 宿主回调抛错 ─────────────────────────
+
+describe("宿主回调抛错不得让调度停摆", () => {
+  /**
+   * 判据：这些回调是在 `.then(onOk, onErr)` 的 continuation 里被**同步**调用的，抛错会同时造成
+   * （a）未处理 rejection、（b）紧随其后的 #schedule() 被跳过 → 不再武装任何定时器 → 批次永不收尾。
+   * 契约因此是两条：抛错必须被**收下**（调度继续），且不得**静默**（并进该成员的结果文案）。
+   */
+  it("onSuspended 抛错：成员照样重试、批次照样收尾，告警并进该成员结果文案", async () => {
+    const h = harness({
+      onSuspended: () => {
+        throw new Error("suspended callback exploded");
+      },
+    });
+    const p = runSwarm(specsOf(3), h.deps, SLOW);
+    await flush(0);
+
+    h.rateLimit(1);
+    await flush(0);
+    await flush(3000); // 退避就绪 → 重试
+    expect(h.attemptsOf(1)).toBe(2); // 回调抛错不影响重排队
+
+    h.complete(1, { result: "recovered" });
+    await flush(3000); // 2 号放量
+    h.complete(2);
+    await flush(3000); // 3 号放量
+    h.complete(3);
+
+    const results = await p; // 修复前：这里会永远挂住（#schedule 被跳过）
+    expect(results.map((r) => r.outcome)).toEqual(["completed", "completed", "completed"]);
+    expect(results[0]?.result).toContain("host callback failed: suspended callback exploded");
+  });
+
+  it("onSuspended 抛错 + 该成员最终失败：告警并进 error 文案", async () => {
+    const h = harness({
+      onSuspended: () => {
+        throw new Error("cb boom");
+      },
+    });
+    const p = runSwarm(specsOf(2), h.deps, SLOW);
+    await flush(0);
+    h.rateLimit(1);
+    await flush(0);
+    await flush(3000); // 退避就绪 → 重试
+
+    h.fail(1, new Error("provider exploded")); // 重试这一次彻底失败
+    await flush(3000); // 2 号放量
+    h.complete(2);
+
+    const results = await p;
+    expect(results[0]?.outcome).toBe("failed");
+    expect(results[0]?.error).toBe("provider exploded; host callback failed: cb boom (from onSuspended)");
+    expect(results[1]?.outcome).toBe("completed");
+  });
+
+  it("classify 抛错：按契约里的安全默认（轻罚）继续，告警并进结果文案", async () => {
+    const h = harness({
+      autoReady: false,
+      classify: () => {
+        throw new Error("classify exploded");
+      },
+    });
+    const scheduler = new SwarmScheduler(specsOf(2), h.deps, SLOW);
+    const p = scheduler.run();
+    await flush(0);
+    h.rateLimit(1);
+    await flush(0);
+
+    const snap = scheduler.snapshot();
+    expect(snap.globalRetryIntervalMs).toBe(3000); // 轻罚；若按重罚会翻倍成 6000
+    expect(snap.nextRateLimitLaunchAt).toBe(Date.now() + 3000);
+
+    await drain(h, p);
+    const results = await p;
+    expect(results[0]?.result).toContain("host callback failed: classify exploded");
+  });
 });
 
 // ───────────────────────── 死锁防护 ─────────────────────────
@@ -569,10 +789,20 @@ describe("死锁防护", () => {
     expect(abandoned).toHaveLength(0);
     expect(h.attemptsOf(1)).toBe(2);
 
+    // 标题声称的"退避后重试仍可成功"必须**真的**被验证到重试那一次上，而不是靠
+    // "批次最后 completed 了"倒推：这里显式钉住重试尝试的编号与它拿到的 previousAgentId
+    // （契约要求执行函数优先复用上次 agentId 做"重试原 agent"）。
+    const retry = h.runs.filter((r) => r.spec.index === 1)[1];
+    expect(retry?.attempt).toBe(2);
+    expect(retry?.ctx.previousAgentId).toBe("agent-1");
+
     // 第二次尝试成功 → 该成员正常完成，没有任何成员被放弃。
-    h.complete(1);
+    // 用带标记的结果文本证明 completed 来自**重试的那一次**（旧尝试早已 reject，再 resolve 是空操作）。
+    h.complete(1, { result: "retry-succeeded" });
     const results = await p;
     expect(results[0]?.outcome).toBe("completed");
+    expect(results[0]?.result).toBe("retry-succeeded");
+    expect(results[0]?.agentId).toBe("agent-1");
     expect(abandoned).toHaveLength(0);
   });
 
@@ -803,6 +1033,31 @@ describe("配置校验与自定义", () => {
     expect(() => new SwarmScheduler(specsOf(2), h.deps, { initialLaunchLimit: 0 })).toThrow(/initialLaunchLimit/);
     expect(() => new SwarmScheduler(specsOf(2), h.deps, { retryFactor: 0.5 })).toThrow(/retryFactor/);
     expect(() => new SwarmScheduler(specsOf(2), h.deps, { retryBaseMs: -1 })).toThrow(/retryBaseMs/);
+  });
+
+  it("maxConcurrency 给定则必须是 >= 1 的整数，否则构造期抛错", () => {
+    const h = harness();
+    // 0 尤其危险：active(0) >= 0 恒真 → 静默不返回（与"只有非法 config 才会抛"的契约矛盾）。
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(() => new SwarmScheduler(specsOf(2), h.deps, { maxConcurrency: bad })).toThrow(/maxConcurrency/);
+    }
+    // 不传（无上限）与合法的 1 都必须照常构造。
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, {})).not.toThrow();
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, { maxConcurrency: 1 })).not.toThrow();
+  });
+
+  it("run() 重复调用返回同一个 Promise：不覆盖 #resolve，也不重复调度", async () => {
+    const h = harness();
+    const scheduler = new SwarmScheduler(specsOf(2), h.deps);
+    const first = scheduler.run();
+    const second = scheduler.run();
+    expect(second).toBe(first); // 修复前是另一个 Promise：首个批次会永挂
+    expect(h.started()).toEqual([1, 2]); // 也没有被调度两遍
+
+    for (const i of [1, 2]) h.complete(i);
+    const results = await first;
+    expect(results.map((r) => r.outcome)).toEqual(["completed", "completed"]);
+    expect(await second).toEqual(results);
   });
 
   it("自定义节奏参数生效", async () => {
