@@ -87,6 +87,11 @@
 8. **新增元素级校验（第六道硬校验，2026-10-01 审查后补）**：上游用 schema（`array(string().trim().min(1))`）
    在入口拒绝空 item；本仓在 `validate` 内复刻该约束并返回结构化错误（`ITEM_EMPTY` / `ITEM_NOT_STRING`），
    这比让 `TypeError` 冒出去更可诊断，也能把"第几条错了"直接回给模型。
+9. **`<summary>` 新增 `unknown: N` 桶**（2026-10-01 P2 批次引入）：上游把汇总写成
+   `if completed / else if failed / else aborted`，于是任何非前两类的成员都被算成 aborted。
+   本仓改为穷尽匹配——未知 outcome 单列 `unknown`，不再冒充 aborted（正常三值路径的汇总文本不变）；
+   且 `renderSwarmSummary` 的 `default` 分支以 `const unhandled: never` 做**编译期**守卫，
+   将来给 `SwarmOutcome` 扩值时编译会失败，逼作者显式决定该值归哪一桶。
 
 ## 6. 交付现状与已知未覆盖项
 

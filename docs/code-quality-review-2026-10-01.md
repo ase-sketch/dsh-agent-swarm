@@ -367,3 +367,15 @@
 - P2 第一波我把 **7 个子项打成一个 WP**（客户端），跨 6 文件、+834 行（主体是测试），**超过既定 500 行红线**。功能与证据没问题，但"可审阅单元"被撑大，属我的打包失误；第二波已改为"一个 WP 一个可说明的行为"，并继续按 WP 分笔提交。
 - 至此对本报告的**外部订正累计 6 处**（4 条由独立验证者证伪、2 条由执行子代理证伪），均由父代理回读源码/二进制复验后才改动本文档。
 
+### P2 第二波（同日，三笔提交；每笔文件集独立）
+
+| 分组 | 条目 | 提交 |
+|---|---|---|
+| 协议面 | `framesFor` 对**已结束批次**补发 `closed` 帧（修复前 `lastEndedAt` 初值使判定恒假 → 以 closed 为结束信号的客户端会一直等）；`TYPERT_REMOTE.result.typeSymbol` 由 `SwarmRosterFrame` 改为 `SwarmFrame` 联合体，并写明强类型 codec 应按 `type` 判别式校验三分支 | `2b67fd5` |
+| 纯函数 | `renderSwarmSummary` 改**穷尽匹配**：未知 outcome 不再静默计入 aborted，单列 `unknown: N`；`default` 分支以 `const unhandled: never` 做**编译期**守卫（实测给 `SwarmOutcome` 加值即 TS2322）；`DUPLICATE_PROMPTS` 的 details 补 `itemSnippet/promptSnippet/*Chars`（前缀 120 码元，details 总量 < 500 字符）；128 上限用例改全序列比对；5 条错误码补"关键要素"文案断言 | `da63470` |
+| 模型面契约 | 新增 `effectiveMaxItems(config)` 作为**唯一**算上限处；工具描述与参数描述按**生效上限**生成（此前写死常量 128：宿主把 `maxItems` 调低时，模型会按 128 规划然后被第 11 条拒掉），并保留"协议硬上限 128 不可绕过、宿主只能调低"的说明段 | `59188c7` |
+
+**本轮新增的有意偏离**：`<summary>` 多了一个 `unknown: N` 桶（正常路径不可达；作用是"不把未知 outcome 谎报成 aborted"）——已登记 `THIRD-PARTY-NOTICES.md` §5 第 9 条。
+
+**本轮回归证据**：全量 `pnpm test` 由 172 → **217** 条（7 文件），`pnpm typecheck` exit 0；每笔都有红→绿（重构类用定向变异或 21 场景 XML 快照逐字节一致作证）。
+
