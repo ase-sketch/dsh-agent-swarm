@@ -154,12 +154,19 @@ const TOOL_DESCRIPTION = [
  * 重试层被吃掉，父层拿不到稳定信号）。因此"检测 429"在一期写不出来。
  *
  * 一期策略：**不猜**。结果级一律不判限流（返回 false → 终态 failed），
- * 避免把普通错误误当限流把整批拖进无限重排队。调度器的"时间与存活率"反压
- * （容量收缩/恢复/退避）仍然照常工作，只是不由错误码触发。
+ * 避免把普通错误误当限流把整批拖进无限重排队。
+ *
+ * ⚠️ 交付态订正（2026-10-01 审查）：恒返回 false 意味着调度器的整条限流分支
+ * （退避、容量收缩与恢复、`retrying` 相位、面板退避 UI）**当前完全不触发**。
+ * 此处原写「容量收缩/恢复/退避仍然照常工作，只是不由错误码触发」——该表述与代码事实
+ * 相反（这些机制的唯一入口就是本判定），已删除。能力状态与启用前置条件见
+ * docs/spec.md「交付状态」与 .agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md。
  *
  * **M3 待办（spike R1）**：改用子会话 `llm/retry` 事件，在 failure.code === "RATE_LIMIT"
  * 时于**子代理级**触发退避，而不是在结果级判定。本函数与 {@link classifyRateLimitPhaseOne}
  * 就是那个注入点——调度器通过 SwarmSchedulerDeps 接收二者，实装时替换即可，无需改调度器。
+ * 启用前必须先补该子系统的三处缺口（容量无上界、限流模式无退出路径、并发闸门与容量恢复互锁），
+ * 否则宿主的 maxConcurrency 一旦被装配即可能让批次停摆。
  */
 function isRateLimitErrorPhaseOne(_error: unknown): boolean {
   return false;

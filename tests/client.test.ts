@@ -1,4 +1,4 @@
-import * as fs from "node:fs/promises";
+import * as esbuild from "esbuild";
 
 import { describe, it, expect, vi } from "vitest";
 import { ClientSwarmModel } from "../src/client/model.js";
@@ -44,7 +44,6 @@ describe("ClientSwarmService", () => {
   it("subscribes to remote stream with reference counting", async () => {
     const model = new ClientSwarmModel();
     const disposeFn = vi.fn();
-    let streamYield: (val: any) => void;
 
     const mockStream = {
       async *[Symbol.asyncIterator]() {
@@ -110,9 +109,35 @@ describe("client bundle integration", () => {
     };
     (globalThis as any).window = mockWindow;
 
-    const bundleContent = await fs.readFile("dist/client.js", "utf-8");
+    // 参数与 scripts/build-client.mjs 保持同步（入口 / external / format / target /
+    // banner / footer）。改动 build 脚本时必须同步改这里，否则测试验的就不是发布物。
+    // 用 write:false 在内存里打包，避免读盘上可能过期的 dist/client.js——
+    // "读旧产物"会让绿灯覆盖面与真实交付物错位。
+    const result = await esbuild.build({
+      entryPoints: ["src/client/index.ts"],
+      bundle: true,
+      format: "cjs",
+      target: "es2022",
+      external: ["react", "react/jsx-runtime", "@deepseek-ai/*", "cordis", "@deepseek-ai/cordis"],
+      banner: {
+        js: `window.__ModuleLoader__.load({
+  id: "dsh-agent-swarm",
+  factory: (require) => {
+    var module = { exports: {} };
+    var exports = module.exports;
+    Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });`,
+      },
+      footer: {
+        js: `    return module.exports;
+  }
+});`,
+      },
+      write: false,
+    });
+    const output = result.outputFiles[0];
+    if (output === undefined) throw new Error("esbuild produced no output file");
     // eslint-disable-next-line no-eval
-    eval(bundleContent);
+    eval(output.text);
 
     expect(registration).toBeDefined();
     expect(registration.id).toBe("dsh-agent-swarm");

@@ -564,7 +564,22 @@ describe("D. 派发红线", () => {
     // aborted 成员如实落在 XML 里：判为 failed 且 stop_reason 记为 aborted。
     // 一期不做"取消 vs 失败"的 outcome 细分（调度器只认 completed/failed/aborted
     // 三档，而取消在结果级与失败同形），所以断言失败档 + stop_reason 即可。
-    expect(result.xml).toContain('<subagent item="a.md" state="started" outcome="failed">aborted</subagent>');
+    // 刻意不用整串 toContain：属性集合会随功能扩展变化（agent_id 正是本轮新增的，
+    // 以后还可能加 mode/耗时等），整串比较会把"属性多了/少了"这种无语义差异变成回归噪音。
+    // 改为先按正则定位成员元素，再逐项断言真正关心的语义：身份、相位、结局、正文、agent_id。
+    // 说明：失败路径不产出 stop_reason 属性（scheduler 的 #failedResult 只带
+    // spec/outcome/state/agentId/error），aborted 这个 stopReason 只体现在失败正文里，
+    // 因此这里不对 stop_reason 做断言。
+    const abortedElement = /<subagent\b[^>]*>aborted<\/subagent>/.exec(result.xml)?.[0];
+    expect(abortedElement).toBeDefined();
+    const element = abortedElement as string;
+    expect(element).toContain('item="a.md"');
+    expect(element).toContain('state="started"');
+    expect(element).toContain('outcome="failed"');
+    // 开标签与闭标签之间的正文必须是 aborted 原文
+    expect(/<subagent\b[^>]*>([\s\S]*)<\/subagent>/.exec(element)?.[1]).toBe("aborted");
+    // agent_id 为本轮新增属性；实测值 run-0（harness 桩按 start 调用序返回 run-<n>）
+    expect(element).toContain('agent_id="run-0"');
   });
 });
 
@@ -636,10 +651,9 @@ describe("F. 真实 Loader 加载路径", () => {
    * 走 cordis-plugin-loader 的真实加载路径：Entry.create → _init → import
    * → unwrapExports → registry.plugin → apply。
    *
-   * 唯一被替换的是**模块装载**这一步：Loader 默认用原生 import()，而原生 Node
-   * 无法直接 import .ts（插件源码是 TypeScript，由 DSH 宿主侧构建产物提供）。
-   * 这里把 loader.internal.import 指向本测试已经 import 过的模块，
-   * 其后的解包、注册、激活、卸载全部是 Loader 的真实实现。
+   * 唯一被替换的是**模块装载**这一步：Loader 的 seam 换成直接 import 本仓的
+   * **真实构建产物** dist/index.js（生产上 DSH 加载的就是它），并把它的具名导出
+   * 交回 Loader；解包（unwrapExports）、注册、激活、卸载全部是 Loader 的真实实现。
    */
   it("cordis-plugin-loader 真实加载插件，激活后工具可用、卸载后消失", async () => {
     const root = new Context();
@@ -653,20 +667,24 @@ describe("F. 真实 Loader 加载路径", () => {
       resolve: (id: string) => { fiber?: { inertia?: Promise<unknown> } };
       await: () => Promise<void>;
     };
-    // 用真实 seam 替换模块装载：返回本仓插件的具名导出。
+    // 用真实 seam 替换模块装载：加载**真实构建产物** dist/index.js，
+    // 把它的具名导出原样交回 Loader（经 unwrapExports 处理），
+    // 不再像以前那样手写一个只含 4 个具名导出的伪命名空间——那会绕过
+    // unwrapExports，让 AGENTS.md 红线「绝不写 export default」无人守护。
     //
-    // 关键：apply 必须是**全新的函数引用**。Cordis 的插件注册表以 apply 函数本身
-    // 作为注册表键（registry.resolve → plugin.apply），而本文件前面的用例已经
-    // 多次用过 plugin.apply 这个引用；复用它会让 Loader 命中既有 runtime，
-    // 新的 fiber 随即被并入旧 runtime，dispose 链随之失效。
-    // 真实运行时每个 entry 是一次全新 import，拿到的是全新模块实例与其全新
-    // apply —— 下面这层薄包装正是还原该语义（转发调用，行为完全一致）。
+    // 关键：apply 仍需是**全新的函数引用**。Cordis 的插件注册表以 apply 函数本身
+    // 作为注册表键（registry.resolve → plugin.apply）；而 ESM 模块缓存让
+    // import("../dist/index.js") 每次都返回**同一个**命名空间对象（同一份 apply
+    // 引用）。真实运行时每个 entry 是一次全新 import，拿到全新模块实例与其全新
+    // apply；同进程内我们无法复刻"全新模块实例"，于是保留这层最小薄包装
+    // 转发调用来造出全新 apply 引用——export 本身取自真实 dist/index.js。
+    const dist = (await import("../dist/index.js")) as typeof plugin;
     (loader as { internal: unknown }).internal = {
       import: async () => ({
-        name: plugin.name,
-        inject: plugin.inject,
-        Config: plugin.Config,
-        apply: (ctx: Context, config: Parameters<typeof plugin.apply>[1]) => plugin.apply(ctx, config),
+        name: dist.name,
+        inject: dist.inject,
+        Config: dist.Config,
+        apply: (ctx: Context, config: Parameters<typeof dist.apply>[1]) => dist.apply(ctx, config),
       }),
     };
 
@@ -715,5 +733,16 @@ describe("F. 真实 Loader 加载路径", () => {
     expect(loaded.default).toBeUndefined();
     // inject 必须恰好是两个服务键，且不含任何审批元数据
     expect(loaded.inject).toEqual(["tools", "subagents"]);
+  });
+
+  it("真实构建产物 dist/index.js 同样只用具名导出，绝不 export default（红线）", async () => {
+    // 直接守 AGENTS.md 红线：生产实际加载的 dist/index.js 若出现 default 导出，
+    // Loader 会走 unwrapExports 分支掩盖真实缺陷。这里对构建产物断言。
+    const dist = (await import("../dist/index.js")) as Record<string, unknown>;
+    expect("default" in dist).toBe(false);
+    expect(dist.name).toBe("agent-swarm");
+    expect(typeof dist.apply).toBe("function");
+    expect(typeof dist.Config).toBe("function");
+    expect(dist.inject).toEqual(["tools", "subagents"]);
   });
 });

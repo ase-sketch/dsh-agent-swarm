@@ -50,6 +50,10 @@ export const SWARM_ERROR_CODES = {
   ITEMS_TOO_FEW: "ITEMS_TOO_FEW",
   /** 展开后成员总数超过 128。 */
   TOO_MANY_SUBAGENTS: "TOO_MANY_SUBAGENTS",
+  /** 某个 item 元素 trim 后为空串：每条 item 必须含至少 1 个非空白字符。 */
+  ITEM_EMPTY: "ITEM_EMPTY",
+  /** 某个 item 元素不是字符串：不做隐式强转，避免 123/null 被静默当成 item 派发。 */
+  ITEM_NOT_STRING: "ITEM_NOT_STRING",
   /** 提供了 items 却没有 prompt_template。 */
   PROMPT_TEMPLATE_REQUIRED: "PROMPT_TEMPLATE_REQUIRED",
   /** prompt_template 不含 `{{item}}` 占位符。 */

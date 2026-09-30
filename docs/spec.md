@@ -16,12 +16,29 @@
 1. `agent_swarm` 工具：`description` + `prompt_template`（含 `{{item}}`）+ `items[]` 展开为 N 个子代理任务
 2. 五条硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同
 3. 并发调度器：首波 5 并发、之后每 700ms 放 1 个、限流指数退避（3000ms×2ⁿ）、容量收缩防抖 2000ms、每 180s 恢复 +1（下限 1）、最后任务持续限流判 failed（死锁防护）、首个请求未发出的限流重罚
+   —— **交付态修正（2026-10-01）**：本条前半（首波/放量/超时/中断/结果落位）已交付；**限流相关的后半（退避、容量收缩恢复、死锁防护、重罚）在交付态无触发路径**，详见下「交付状态」。
 4. 每任务超时（默认 2h 可配，**自建** `AbortSignal.any([父signal, AbortSignal.timeout])`——start() 无 timeout 字段）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
 5. 结果汇总：`<agent_swarm_result>` XML，**body 转义**、编号一致（规避 Kimi 已核实缺陷 D13/D14）
 6. 插件 config：并发/节奏/超时参数；**自动批准无需声明**（spike Q8：无 approvalRule 机制，不调 ctx.approval 即不弹窗）；子代理沙箱档位经 `parent: exec.agent` 自动继承
 7. 测试三层：纯函数单测 + mock Context 契约测试 + 真实 Loader 加载测试
 
 二期（本仓 backlog，另行 spike）：resume_agent_ids（continuable 续跑）、fork、模式状态机（enter/exit 提示词注入 + 轮末自动退出）、model/subagent_type 选择、团队面板整合（若自研面板后仍需要）。
+其中 `resume_agent_ids` 的前置条件（结果块需回传 `agent_id`）已于 2026-10-01 修复落地。
+
+## 交付状态（2026-10-01 审查后回写）
+
+审查报告：`docs/code-quality-review-2026-10-01.md`。以下是与原规格不一致的交付事实，逐条回写：
+
+- **一期限流退避未交付（未收敛）**：`src/index.ts` 的 `isRateLimitErrorPhaseOne` 恒返回 false，
+  而它是调度器唯一的限流判定入口（`src/scheduler.ts` 中"限流结局"的唯一产出点）→ 退避、容量收缩/恢复、
+  `retrying` 相位、面板退避 UI 全部不触发。**启用前置条件**（二者都满足才动手）：
+  ① M3 实机确认子会话 `llm/retry` 事件的 `failure.code` 取值；
+  ② 先修掉该子系统内的既有缺口（容量无上界、无退出限流模式的路径、并发闸门与容量恢复的互锁），
+  这些缺口在死代码里不影响现网，但一旦启用即生效。
+- **`resume_agent_ids`（二期）的取值来源已补齐**：结果块此前丢弃 `agent_id` 属性，已修复；二期续跑不再被这一条卡住。
+- **测试链改为先构建**：`pnpm test` 现在前置 `pnpm run build`，client 侧测试在内存里打包，host 侧 Loader 测试加载 `dist/index.js`
+  （此前各测各的：client 测盘上旧产物、host 测源码命名空间、`dist/index.js` 无人验证）。
+- **clean-room 文案修正**：三条与上游逐字相同的文案/常量已改写为本仓自拟（见 `THIRD-PARTY-NOTICES.md`）。
 
 ## 非目标
 

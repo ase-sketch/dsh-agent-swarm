@@ -293,3 +293,103 @@ describe("]]> 与非法控制字符（F4）", () => {
     expect(parsed.members[1]?.attrs["item"]).toBe("c\"d");
   });
 });
+
+// ───────────────────────── 属性值字符引用（P1-3）与 agent_id（P1-5） ─────────────────────────
+
+describe("属性值字符引用：XML 1.0 §3.3.3 属性值规范化", () => {
+  // 依据：XML 1.0 §3.3.3 Attribute-Value Normalization。
+  // 属性值里**字面**的 #xD / #xA / #x9 一律被替换成空格（0x20）；写成字符引用
+  // &#xD; / &#xA; / &#x9; 时，规范化只把引用还原成真字符、不做替换。
+  // 所以这三种字符在属性里不能裸写：裸写不报错，只让读取端静默读到被改写的值——
+  // 这正是原先四字符转义（& " < >）看不见的缺口，后来者不要为省事退回裸字符。
+
+  it("\r / \n / \t 一律写成字符引用，输出里不留裸控制字符", () => {
+    const escaped = escapeXmlAttribute("a\r\nb\tc");
+    expect(escaped).toBe("a&#xD;&#xA;b&#x9;c");
+    expect(/[\r\n\t]/.test(escaped)).toBe(false);
+  });
+
+  it("字符引用在 & 转义之后插入，不会被二次转义成 &amp;#xD;", () => {
+    expect(escapeXmlAttribute("&\r")).toBe("&amp;&#xD;");
+    expect(escapeXmlAttribute("\n&")).toBe("&#xA;&amp;");
+    // 反例守卫：顺序颠倒的话 &\r 会得到字面量 "&amp;#xD;"（读到的是文本而不是回车）
+    expect(escapeXmlAttribute("&\r")).not.toBe("&amp;#xD;");
+  });
+
+  it("属性往返无损（含 CR/LF/TAB 与既有四字符混排）", () => {
+    for (const raw of ["a\r\nb\tc", "&\r", "\n&", "x&#xA;y", 'q"<&>w\tz', "&#xD;", "\r\n\r\n", "\t"]) {
+      expect(unescapeXmlAttribute(escapeXmlAttribute(raw))).toBe(raw);
+    }
+  });
+
+  it("原文里字面的 &#xD; 不会被二次还原（与 unescapeXmlText 的 &gt; 同一类顺序陷阱）", () => {
+    const literal = "&#xD;";
+    expect(escapeXmlAttribute(literal)).toBe("&amp;#xD;");
+    expect(unescapeXmlAttribute(escapeXmlAttribute(literal))).toBe(literal);
+  });
+
+  it("模拟 §3.3.3 规范化：把字面空白控制符换成空格后，属性值不变", () => {
+    const item = "src/a\r\n\tb.ts";
+    const xml = renderSwarmResult([res(1, item), res(2, "plain")]);
+    const rawAttribute = /item="([^"]*)"/.exec(xml)?.[1] as string;
+    // 输出里已无字面 \r \n \t，因此"规范化"退化成恒等变换
+    expect(rawAttribute.replace(/[\r\n\t]/g, " ")).toBe(rawAttribute);
+    expect(unescapeXmlAttribute(rawAttribute)).toBe(item);
+  });
+
+  it("item 含换行/制表时成员仍是一行一条（属性值不撑破行结构）", () => {
+    const item = "src/a\r\n\tb.ts";
+    // body 固定为不含换行的文本：这样行数只可能被属性里的换行撑破，隔离出被测变量
+    const xml = renderSwarmResult([res(1, item, { result: "ok" }), res(2, "plain", { result: "ok" })]);
+    expect(xml.split("\n")).toHaveLength(5);
+    expect(xml).toContain('item="src/a&#xD;&#xA;&#x9;b.ts"');
+    expect(parseResult(xml).members[0]?.attrs["item"]).toBe(item);
+  });
+});
+
+describe("agent_id 属性（P1-5：二期 resume_agent_ids 的取值来源）", () => {
+  it("有 agentId → 输出 agent_id（排在最前）且值经属性转义", () => {
+    const xml = renderSwarmResult([res(1, "a", { agentId: 'id"&<>' }), res(2, "b")]);
+    expect(xml).toContain('<subagent agent_id="id&quot;&amp;&lt;&gt;" item="a"');
+    expect(parseResult(xml).members[0]?.attrs["agent_id"]).toBe('id"&<>');
+  });
+
+  it("agentId 含换行/制表时同样走字符引用，读回来仍是原文", () => {
+    const xml = renderSwarmResult([res(1, "a", { agentId: "run\r\n1" }), res(2, "b")]);
+    expect(xml).toContain('agent_id="run&#xD;&#xA;1"');
+    expect(parseResult(xml).members[0]?.attrs["agent_id"]).toBe("run\r\n1");
+  });
+
+  it("无 agentId → 完全不出现 agent_id（不输出空属性）", () => {
+    const xml = renderSwarmResult([res(1, "a"), res(2, "b")]);
+    expect(xml).not.toContain("agent_id");
+  });
+
+  it("属性顺序：agent_id → item → state → outcome → stop_reason", () => {
+    const xml = renderSwarmResult([
+      res(1, "a", { agentId: "run-7", outcome: "failed", error: "e", stopReason: "max_tokens" }),
+    ]);
+    expect(xml).toContain(
+      '<subagent agent_id="run-7" item="a" state="started" outcome="failed" stop_reason="max_tokens">',
+    );
+  });
+
+  it("not_started 成员带 agentId 时同样输出（有值即输出，与相位无关）", () => {
+    const xml = renderSwarmResult([
+      res(1, "a", { agentId: "run-1" }),
+      res(2, "b", {
+        agentId: "run-2",
+        state: "not_started",
+        outcome: "aborted",
+        result: undefined,
+        error: "interrupted",
+      }),
+    ]);
+    expect(parseResult(xml).members.map((m) => m.attrs["agent_id"])).toEqual(["run-1", "run-2"]);
+  });
+
+  it("agent_id 的转义与 item 走同一条路径（含控制符时同样剥离）", () => {
+    const xml = renderSwarmResult([res(1, "a", { agentId: "a\u0000b" }), res(2, "b")]);
+    expect(parseResult(xml).members[0]?.attrs["agent_id"]).toBe("ab");
+  });
+});

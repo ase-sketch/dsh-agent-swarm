@@ -79,7 +79,85 @@ describe("校验 2：总数 <= 128", () => {
   });
 });
 
-describe("校验 3：有 items 必有 prompt_template", () => {
+describe("校验 3：item 元素必须是非空字符串", () => {
+  function inputWithItems(items: readonly unknown[]): SwarmRequestInput {
+    return { ...input({}), items: items as readonly string[] };
+  }
+
+  it("空串 item 报 ITEM_EMPTY，details 带 1 起始位置与实际值", () => {
+    const r = validateSwarmInput(input({ items: ["", "b"] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_EMPTY);
+      expect(r.error.details).toMatchObject({ index: 1, received: "" });
+    }
+  });
+
+  it("纯空白 item（空格/制表/换行）报 ITEM_EMPTY，定位到它所在的位置", () => {
+    for (const blank of [" ", "\t", "\n", " \t\r\n "]) {
+      const r = validateSwarmInput(input({ items: ["ok", blank] }));
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_EMPTY);
+        expect(r.error.details).toMatchObject({ index: 2, received: blank });
+      }
+    }
+  });
+
+  it("两个全空白 item 报 ITEM_EMPTY，而不是误导性的 DUPLICATE_PROMPTS", () => {
+    const r = validateSwarmInput(input({ items: ["   ", "\t"] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_EMPTY);
+      expect(r.error.code).not.toBe(SWARM_ERROR_CODES.DUPLICATE_PROMPTS);
+      expect(r.error.details).toMatchObject({ index: 1 });
+    }
+  });
+
+  it("失败文案指出第几条并带上实际收到的值", () => {
+    const r = validateSwarmInput(input({ items: ["a", " \t "] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.message).toContain("2");
+      expect(r.error.message).toContain(JSON.stringify(" \t "));
+    }
+  });
+
+  const nonStringCases: Array<[unknown, string]> = [
+    [123, "number 123"],
+    [null, "null"],
+    [undefined, "undefined"],
+    [{}, "an object"],
+    [[1, 2], "an array"],
+    [true, "boolean true"],
+  ];
+
+  it.each(nonStringCases)(
+    "非 string 元素（received: %s）报 ITEM_NOT_STRING 而不是抛 TypeError",
+    (value: unknown, received: string) => {
+      const rawItems = [value, "b"];
+      expect(() => validateSwarmInput(inputWithItems(rawItems))).not.toThrow();
+      const r = validateSwarmInput(inputWithItems(rawItems));
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_NOT_STRING);
+        expect(r.error.details).toMatchObject({ index: 1, received });
+        expect(r.error.message).toContain(received);
+      }
+    },
+  );
+
+  it("非 string 元素位于末位时定位同样准确", () => {
+    const r = validateSwarmInput(inputWithItems(["a", 42]));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_NOT_STRING);
+      expect(r.error.details).toMatchObject({ index: 2, received: "number 42" });
+    }
+  });
+});
+
+describe("校验 4：有 items 必有 prompt_template", () => {
   it("缺 prompt_template 报 PROMPT_TEMPLATE_REQUIRED", () => {
     const r = validateSwarmInput({ items: ["a", "b"] });
     expect(r.ok).toBe(false);
@@ -95,7 +173,7 @@ describe("校验 3：有 items 必有 prompt_template", () => {
   });
 });
 
-describe("校验 4：template 必含 {{item}}", () => {
+describe("校验 5：template 必含 {{item}}", () => {
   it("不含占位符报 PLACEHOLDER_MISSING", () => {
     const r = validateSwarmInput({ items: ["a", "b"], promptTemplate: "do the thing" });
     expect(r.ok).toBe(false);
@@ -114,7 +192,7 @@ describe("校验 4：template 必含 {{item}}", () => {
   });
 });
 
-describe("校验 5：展开后 prompt 互不相同", () => {
+describe("校验 6：展开后 prompt 互不相同", () => {
   it("重复 item 展开出相同 prompt → DUPLICATE_PROMPTS", () => {
     const r = validateSwarmInput(input({ items: ["same", "same"] }));
     expect(r.ok).toBe(false);
@@ -155,5 +233,31 @@ describe("成功路径", () => {
       { kind: "spawn", index: 1, item: "src/a.ts", prompt: "review src/a.ts" },
       { kind: "spawn", index: 2, item: "src/b.ts", prompt: "review src/b.ts" },
     ]);
+  });
+});
+
+// ───────────── clean-room 错误文案（P1-8 路线 A：本仓自拟，不复用上游措辞） ─────────────
+
+describe("clean-room 错误文案", () => {
+  // 只断言本仓新文案的关键要素；上游逐字文案刻意不出现在本仓任何文件里。
+
+  it("缺 prompt_template 的文案点名字段，并说明这是 items 带来的要求", () => {
+    const r = validateSwarmInput({ items: ["a", "b"] });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.PROMPT_TEMPLATE_REQUIRED);
+      expect(r.error.message.startsWith("Missing prompt_template")).toBe(true);
+      expect(r.error.message).toContain("items");
+    }
+  });
+
+  it("缺占位符的文案带字面量 {{item}}，便于模型自纠", () => {
+    const r = validateSwarmInput({ items: ["a", "b"], promptTemplate: "do the thing" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.PROMPT_TEMPLATE_PLACEHOLDER_MISSING);
+      expect(r.error.message).toContain(SWARM_PROMPT_PLACEHOLDER);
+      expect(r.error.details).toMatchObject({ placeholder: SWARM_PROMPT_PLACEHOLDER });
+    }
   });
 });

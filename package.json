@@ -11,7 +11,7 @@
   "icon": "./icon.svg",
   "main": "dist/index.js",
   "scripts": {
-    "test": "vitest run",
+    "test": "pnpm run build && vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && node scripts/build-client.mjs",
     "prepublishOnly": "pnpm run build"

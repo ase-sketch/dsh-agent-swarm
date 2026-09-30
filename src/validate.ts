@@ -2,14 +2,16 @@
  * dsh-agent-swarm — 入参校验与模板展开（纯函数，零 DSH 依赖）
  *
  * 设计依据：extracted/kimi-code-swarm-analysis/01-机制文档/03-工具入参与校验规则.md §5。
- * clean-room 重写：只依据机制文档描述的行为，未复制上游源码；错误文案为本仓自拟。
+ * clean-room 重写：只依据机制文档描述的行为，未复制上游源码；本文件每条错误文案
+ * 都是本仓独立拟写的（与上游文案无逐字等同、无长串连续同词）。
  *
- * 五条硬校验（一期，无 resume 运行时分支）：
+ * 六条硬校验（一期，无 resume 运行时分支）：
  *   1. items >= 2
  *   2. 展开后成员总数 <= 128
- *   3. 提供了 items 就必须提供 prompt_template
- *   4. prompt_template 必须含 `{{item}}` 占位符
- *   5. 展开后的 prompt 必须互不相同
+ *   3. 每个 item 元素必须是非空字符串（trim 后仍 >= 1 个字符）
+ *   4. 提供了 items 就必须提供 prompt_template
+ *   5. prompt_template 必须含 `{{item}}` 占位符
+ *   6. 展开后的 prompt 必须互不相同
  */
 
 import {
@@ -46,6 +48,24 @@ function normalizeOptionalString(value: string | undefined): string | undefined 
   return trimmed === "" ? undefined : trimmed;
 }
 
+/**
+ * 把非法 item 元素渲染成一段可安全放进 message / details 的描述。
+ *
+ * 刻意不依赖对象自身的 toString / valueOf：入参来自模型，真实可能传入
+ * `Object.create(null)` 这类没有原型的对象，直接拼接或 `String(value)` 会抛错——
+ * 那又变成"校验函数自己抛 TypeError"，正是本次要消灭的行为。
+ * 因此对象与函数只报类型；其余原始类型用 String() 显式转换（对 symbol 也安全）。
+ */
+function describeInvalidItem(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  const kind = typeof value;
+  if (kind === "object") return "an object";
+  if (kind === "function") return "a function";
+  return `${kind} ${String(value)}`;
+}
+
 function fail(
   code: SwarmValidationError["code"],
   message: string,
@@ -60,8 +80,10 @@ function fail(
  * 编号语义：`index` 从 1 开始、按 specs 顺序连续递增（全链一致的唯一编号基）。
  */
 export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationResult {
-  const items = (input.items ?? []).map((item) => item.trim());
-  const itemCount = items.length;
+  // 类型层是 string[]，但真实入参由模型给出、运行时可能是 123/null/对象；
+  // 所以这里按 unknown 收，逐个判型，绝不在元素上直接点 .trim()（那会抛 TypeError）。
+  const rawItems: readonly unknown[] = input.items ?? [];
+  const itemCount = rawItems.length;
 
   // ── 校验 1：数量下限（一期无 resume，故没有豁免路径）──
   if (itemCount < SWARM_MIN_ITEMS) {
@@ -81,25 +103,54 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
     );
   }
 
-  // ── 校验 3/4：模板 ──
+  // ── 校验 3：每个 item 元素必须是非空字符串 ──
+  // 上游契约是 array(string().trim().min(1))：元素级非法必须在派发前拦下，
+  // 否则 item 为 "" 时会真的派一个空实体的子代理；两个全空白 item 还会先撞出
+  // 误导性的 DUPLICATE_PROMPTS。本段排在数量校验之后，是为了让"数组整体规模不对"
+  // 优先报出——规模错时先修规模，一轮就能收敛。
+  const items: string[] = [];
+  for (let i = 0; i < rawItems.length; i += 1) {
+    const raw = rawItems[i];
+    const position = i + 1;
+    if (typeof raw !== "string") {
+      const received = describeInvalidItem(raw);
+      return fail(
+        SWARM_ERROR_CODES.ITEM_NOT_STRING,
+        `Item at position ${String(position)} is not a string (received ${received}); items may only contain strings.`,
+        { index: position, received },
+      );
+    }
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+      return fail(
+        SWARM_ERROR_CODES.ITEM_EMPTY,
+        `Item at position ${String(position)} holds no non-whitespace character (received ${JSON.stringify(raw)}); each item needs at least one.`,
+        { index: position, received: raw },
+      );
+    }
+    items.push(trimmed);
+  }
+
+  // ── 校验 4/5：模板 ──
+  // 到这里 items 必然非空：校验 1 已保证 itemCount >= 2，故不再重复判断 items.length。
   const promptTemplate = normalizeOptionalString(input.promptTemplate);
-  if (items.length > 0 && promptTemplate === undefined) {
+  if (promptTemplate === undefined) {
     return fail(
       SWARM_ERROR_CODES.PROMPT_TEMPLATE_REQUIRED,
-      "prompt_template is required when items are provided.",
+      "Missing prompt_template: this call supplied items but no template string to expand.",
     );
   }
-  if (promptTemplate !== undefined && !promptTemplate.includes(SWARM_PROMPT_PLACEHOLDER)) {
+  if (!promptTemplate.includes(SWARM_PROMPT_PLACEHOLDER)) {
     return fail(
       SWARM_ERROR_CODES.PROMPT_TEMPLATE_PLACEHOLDER_MISSING,
-      `prompt_template must include the ${SWARM_PROMPT_PLACEHOLDER} placeholder.`,
+      `prompt_template carries no literal ${SWARM_PROMPT_PLACEHOLDER} marker, so there is nothing to substitute per member.`,
       { placeholder: SWARM_PROMPT_PLACEHOLDER },
     );
   }
 
-  // ── 展开 + 校验 5：prompt 去重 ──
-  // 模板在通过校验 3 后必然存在（items.length > 0 且未报错）。
-  const template = promptTemplate as string;
+  // ── 展开 + 校验 6：prompt 去重 ──
+  // 模板此时已被收窄为 string（校验 4 排除了 undefined），无需断言。
+  const template = promptTemplate;
   const seenPrompts = new Map<string, number>();
   const specs: SwarmTaskSpec[] = [];
 

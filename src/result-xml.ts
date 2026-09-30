@@ -49,18 +49,30 @@ function escapeCdataEnd(value: string): string {
 }
 
 /**
- * 属性值转义（四个字符，顺序敏感：`&` 必须最先）。
+ * 属性值转义（四个字符 + 三个字符引用，顺序敏感：`&` 必须最先、字符引用必须最后）。
  *
  * 属性区比文本节点更严：`>` 已被逐个转义成 `&gt;`，所以 `]]>` 这个三连根本不会
  * 以裸形存在——不需要再调 escapeCdataEnd（加了也是空操作，反而让人误以为必要）。
  * 控制符剥离对两者同样必需。
+ *
+ * 为什么 `\r`/`\n`/`\t` 必须写成字符引用（依据 XML 1.0 §3.3.3 属性值规范化）：
+ * 属性值里**字面**出现的这三位，任何合规解析器都会无条件替换成空格（0x20）；
+ * 而写成 `&#xD;`/`&#xA;`/`&#x9;` 时，规范化只把引用还原成真字符，不做替换。
+ * 也就是说裸写不会报错、只会让 `item="a\nb"` 被读取端看成 `"a b"`——静默失真
+ * 比抛错更难发现（本仓原来的四个字符转义正是这个缺口）。
+ *
+ * 顺序不可调换：字符引用文本自带 `&`，必须在 `&` → `&amp;` **之后**插入，
+ * 否则新插入的 `&#xA;` 会被二次转义成 `&amp;#xA;`（读出来是字面量，不是换行）。
  */
 export function escapeXmlAttribute(value: string): string {
   return stripInvalidXmlChars(value)
     .replaceAll("&", "&amp;")
     .replaceAll('"', "&quot;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll("\r", "&#xD;")
+    .replaceAll("\n", "&#xA;")
+    .replaceAll("\t", "&#x9;");
 }
 
 /**
@@ -79,9 +91,21 @@ export function escapeXmlText(value: string): string {
   return escapeCdataEnd(stripInvalidXmlChars(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;"));
 }
 
-/** 属性反转义，与 {@link escapeXmlAttribute} 互逆（逆序替换）。 */
+/**
+ * 属性反转义，与 {@link escapeXmlAttribute} 互逆（**逆序**替换：字符引用最先、`&amp;` 最后）。
+ *
+ * 字符引用必须排在 `&amp;` 之前还原：原文里字面的 `&#xA;` 转义后是 `&amp;#xA;`，
+ * 若先还原 `&amp;` 就会得到 `&#xA;`，再被字符引用规则二次还原成真换行——往返就坏了
+ * （与 {@link unescapeXmlText} 里 `&gt;` 必须早于 `&amp;` 是同一类顺序陷阱）。
+ *
+ * 只负责还原本文件写出的那一组实体：不认识的通用数字字符引用（如 `&#65;`）
+ * 原样保留，交给真正的解析器处理。
+ */
 export function unescapeXmlAttribute(value: string): string {
   return value
+    .replaceAll("&#xD;", "\r")
+    .replaceAll("&#xA;", "\n")
+    .replaceAll("&#x9;", "\t")
     .replaceAll("&lt;", "<")
     .replaceAll("&gt;", ">")
     .replaceAll("&quot;", '"')
@@ -146,9 +170,22 @@ function assertIndexAlignment(results: readonly SwarmTaskResult[]): void {
   }
 }
 
-/** 渲染单个 `<subagent>` 元素。属性顺序固定：item → state → outcome → stop_reason。 */
+/**
+ * 渲染单个 `<subagent>` 元素。
+ *
+ * 属性顺序固定：agent_id → item → state → outcome → stop_reason。
+ * agent_id 排在最前与上游标准输出一致（`<subagent agent_id="xxx" item="…" state="…" …>`）；
+ * 二期若加入 resume 型成员，届时还需在最前面补 `mode` 属性（本期 kind 只有 spawn）。
+ *
+ * agent_id / state / stop_reason 都是可选属性：undefined 时**整体省略**，不输出空属性。
+ * agent_id 是二期 resume_agent_ids 的唯一取值来源，因此它同样走属性转义这一条路径。
+ */
 export function renderSubagentElement(result: SwarmTaskResult): string {
-  const attrs: string[] = [`item="${escapeXmlAttribute(result.spec.item)}"`];
+  const attrs: string[] = [];
+  if (result.agentId !== undefined) {
+    attrs.push(`agent_id="${escapeXmlAttribute(result.agentId)}"`);
+  }
+  attrs.push(`item="${escapeXmlAttribute(result.spec.item)}"`);
   if (result.state !== undefined) attrs.push(`state="${escapeXmlAttribute(result.state)}"`);
   attrs.push(`outcome="${escapeXmlAttribute(result.outcome)}"`);
   if (result.stopReason !== undefined) {
