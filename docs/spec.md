@@ -48,7 +48,7 @@
 
 ## 验收
 
-- M1：`pnpm test` 全绿（五条校验分支、模板展开、XML 转义往返、调度节奏 fake-timers）
+- M1：`pnpm test` 全绿（六道校验分支、模板展开、XML 转义往返、调度节奏 fake-timers）
 - M2：契约测试 + 真实 Loader 测试全绿；`dsh --profile web --dump-config` 可见插件
 - M3：用户重启 DSH 后真实会话调 `agent_swarm` 跑 3 个小任务：批量执行、XML 结果汇总正确（成员状态以 XML 为准）
 - M3 顺带实机验证 spike 风险项：R1 限流事件 `llm/retry` 的 failure.code 取值、R3 并发活跃度、R4 沙箱继承、R5 子代理审批行为

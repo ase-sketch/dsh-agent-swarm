@@ -3,7 +3,7 @@
  *
  * 两层：
  *   A. mock Context 契约测试：捕获 ctx.tools.register 的入参、stub ctx.subagents.start，
- *      断言 inject 键、defineTool 形态、五条校验的结构化失败、start/dispose 配对、
+ *      断言 inject 键、defineTool 形态、六道校验的结构化失败、start/dispose 配对、
  *      signal 级联、失败聚合与 XML 如实呈现。
  *   B. 真实 Loader 加载测试：用 @deepseek-ai/cordis + cordis-plugin-loader 走真实
  *      插件加载路径，断言插件确实被激活（apply 被调用、工具注册成功、卸载即注销）。
@@ -202,11 +202,11 @@ describe("B. defineTool 注册形态", () => {
     expect(parameters.properties.items).toMatchObject({ type: "array" });
   });
 
-  it("工具描述是英文自拟文本，覆盖用途/五条校验/分工/禁止嵌套", () => {
+  it("工具描述是英文自拟文本，覆盖用途/六道校验/分工/禁止嵌套", () => {
     const { definition } = createHarness();
     const description = definition.description;
     expect(description).toMatch(/subagents/i);
-    // 五条硬校验
+    // 六道硬校验
     expect(description).toMatch(/at least 2 entries/);
     expect(description).toMatch(/at most 128 entries/);
     expect(description).toMatch(/prompt_template/);
@@ -254,7 +254,7 @@ describe("B. defineTool 注册形态", () => {
 
 // ───────────────────────── C. 校验失败的结构化错误 ─────────────────────────
 
-describe("C. 五条硬校验在启动任何子代理之前完成", () => {
+describe("C. 六道硬校验在启动任何子代理之前完成", () => {
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ["items 少于 2", { items: ["only-one"] }, "ITEMS_TOO_FEW"],
     ["items 超过 128", { items: Array.from({ length: 129 }, (_, i) => `item-${String(i)}`) }, "TOO_MANY_SUBAGENTS"],

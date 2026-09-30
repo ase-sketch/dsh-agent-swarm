@@ -8,7 +8,7 @@ DSH host 插件：把"批量子代理任务"包装成一个模型可调用的 `a
 ```
 src/
   types.ts               纯类型：任务规格、结果、调度器配置、错误码、默认调度参数
-  validate.ts            纯函数：五条硬校验 + 模板展开（{{item}}）+ prompt 去重
+  validate.ts            纯函数：六道硬校验 + 模板展开（{{item}}）+ prompt 去重
   result-xml.ts          纯函数：<agent_swarm_result> 渲染（属性/body 转义、编号一致）
   scheduler.ts           纯逻辑调度器：首波/放量/退避/容量收缩恢复；执行函数、限流判定、时钟全部注入
   swarm-registry.ts      纯逻辑状态机：成员七态生命周期 + 100ms 合帧 roster 广播（面板的数据源）

@@ -122,7 +122,7 @@ export interface SwarmPluginConfig {
 
 /**
  * 工具描述：英文、面向模型、全部自拟（clean-room，未复制任何上游原文）。
- * 覆盖四块：用途 / 五条硬校验 / 与单个 subagent 工具的分工 / 禁止嵌套（maxDepth=1）。
+ * 覆盖四块：用途 / 六道硬校验 / 与单个 subagent 工具的分工 / 禁止嵌套（maxDepth=1）。
  */
 const TOOL_DESCRIPTION = [
   "Dispatch a batch of independent, same-shaped tasks as multiple parallel subagents, and receive every member's result in one aggregated XML report.",
@@ -416,7 +416,7 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
       args: { description: string; prompt_template: string; items: string[] },
       exec: ToolRunContext,
     ): Promise<{ xml: string }> {
-      // ① 校验 + 展开：五条硬校验在任何子代理启动前完成。
+      // ① 校验 + 展开：六道硬校验在任何子代理启动前完成。
       const validation = validateSwarmInput({
         description: args.description,
         promptTemplate: args.prompt_template,
@@ -430,7 +430,7 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
       const specs = validation.specs;
 
       // ①b 宿主策略上限：M1 的 128 硬校验不可绕过，config.maxItems 只能把它调低。
-      // 这里在**启动任何子代理之前**拒绝，与五条硬校验同一层（同样结构化报错）。
+      // 这里在**启动任何子代理之前**拒绝，与六道硬校验同一层（同样结构化报错）。
       const effectiveMax = Math.min(config.maxItems, SWARM_MAX_SUBAGENTS);
       if (specs.length > effectiveMax) {
         throw swarmValidationError({
