@@ -1,5 +1,5 @@
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { runSwarm } from "../src/scheduler.js";
 import { renderSwarmResult } from "../src/result-xml.js";
 import {
@@ -629,5 +629,73 @@ describe("framesFor：资源边界与并发批次", () => {
     const busyRosters = frames.filter((f) => f.type === "roster" && f.swarmId === busy);
     expect(quietRosters).toHaveLength(1); // 只有连接时那一帧
     expect(busyRosters.length).toBeGreaterThan(1);
+  });
+});
+
+// ───────────────────────── 独立审查回归（第三轮）─────────────────────────
+
+describe("独立审查回归：推流与批次状态", () => {
+  it("消费方持有某一帧期间发生的变化不会丢失（版本在构造帧之前取快照）", async () => {
+    const reg = new SwarmRegistry();
+    const swarmId = reg.beginBatch("sess-H", "hold", [{ index: 1, item: "a" }]);
+    const ac = new AbortController();
+    const iterator = reg.framesFor("sess-H", ac.signal, 1)[Symbol.asyncIterator]();
+
+    expect((await iterator.next()).value).toMatchObject({ type: "opened" });
+    const firstRoster = (await iterator.next()).value as SwarmFrame;
+    expect(firstRoster).toMatchObject({ type: "roster", completedCount: 0 });
+
+    // 消费方还"拿着"第一帧（尚未要下一帧）时，批次跑完并收尾
+    reg.markSettled(swarmId, 1, "completed");
+    reg.endBatch(swarmId);
+
+    // 修复前：恢复后才读版本 → 变化被记成已发送，只会再收到 closed，面板永远停在 pending
+    const rest: SwarmFrame[] = [];
+    while (true) {
+      const next = await iterator.next();
+      rest.push(next.value as SwarmFrame);
+      if ((next.value as SwarmFrame).type === "closed") break;
+    }
+    ac.abort();
+    expect(rest.map((f) => f.type)).toEqual(["roster", "closed"]);
+    expect(rest[0]).toMatchObject({ completedCount: 1 });
+  });
+
+  it("其它会话的变化根本不会触发本会话的比对（守护按会话唤醒，而不只是帧数）", async () => {
+    const reg = new SwarmRegistry();
+    reg.beginBatch("sess-W", "watched", [{ index: 1, item: "a" }]);
+    const spy = vi.spyOn(reg, "visibleBatches");
+    const stream = collectFrames(reg, "sess-W");
+    await tick();
+    const diffsAfterConnect = spy.mock.calls.length;
+    const other = reg.beginBatch("sess-X", "other", [{ index: 1, item: "b" }]);
+    for (let i = 0; i < 6; i += 1) {
+      reg.setAgentId(other, 1, `agent-${String(i)}`);
+      await tick(3);
+    }
+    await tick();
+    await stream.stop();
+    expect(spy.mock.calls.length).toBe(diffsAfterConnect);
+  });
+
+  it("description 同样截成显示摘要（它随每个 opened / roster 帧下发）", () => {
+    const reg = new SwarmRegistry();
+    const swarmId = reg.beginBatch("sess-L", "d".repeat(MEMBER_VIEW_ITEM_MAX_CHARS * 5), [{ index: 1, item: "a" }]);
+    expect(reg.getBatch(swarmId)?.description.length).toBe(MEMBER_VIEW_ITEM_MAX_CHARS + 1);
+  });
+
+  it("收尾之后才落定的成员会重算批次状态（中断时 run.result 异步收场晚于 endBatch）", () => {
+    const reg = new SwarmRegistry();
+    const swarmId = reg.beginBatch("sess-S", "late", [
+      { index: 1, item: "a" },
+      { index: 2, item: "b" },
+    ]);
+    reg.markReady(swarmId, 1);
+    reg.markReady(swarmId, 2);
+    reg.endBatch(swarmId); // 中断瞬间两个成员都还在 running（结局尚未回执）→ 只能推导为 failed
+    expect(reg.getBatch(swarmId)?.status).toBe("failed");
+    reg.markSettled(swarmId, 1, "aborted"); // 晚到的中断结局
+    reg.markSettled(swarmId, 2, "aborted");
+    expect(reg.getBatch(swarmId)?.status).toBe("aborted");
   });
 });

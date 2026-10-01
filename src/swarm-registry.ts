@@ -271,7 +271,8 @@ export class SwarmRegistry {
     const batch: SwarmBatch = {
       swarmId,
       sessionId,
-      description,
+      // description 同样来自模型、长度不可信，且随每个 opened / roster 帧下发：与 item 同样截成显示摘要。
+      description: clip(description, MEMBER_VIEW_ITEM_MAX_CHARS),
       ...(routeLabel === undefined ? {} : { routeLabel }),
       total: specs.length,
       status: "running",
@@ -392,6 +393,9 @@ export class SwarmRegistry {
     if (detail !== undefined) {
       found.member.detail = clip(detail, MEMBER_VIEW_DETAIL_MAX_CHARS);
     }
+    // 批次已收尾后才落定的成员（中断时成员的 run.result 异步收场，晚于宿主 finally 里的 endBatch）：
+    // 重算批次状态，否则 status 会停在 endBatch 那一刻按残留相位推导出的 failed，与成员和 XML 不符。
+    if (found.batch.endedAt !== undefined) found.batch.status = deriveBatchStatus(found.batch);
     this.touch(found.batch);
   }
 
@@ -416,23 +420,7 @@ export class SwarmRegistry {
     //   ② 宿主接线漏挂了 onAbandoned 回调（或被中断时进程刚好结束），终态通知从未送达。
     // 这两种都是"批次没跑成"，推导成 failed 才如实；把它们改写成 aborted 等于把
     // "宿主没收到通知"伪装成"用户主动取消"，正是本次修复要消灭的那类静默失真。
-    let hasFailed = false;
-    let hasAborted = false;
-    let allCompleted = true;
-    for (const m of batch.members.values()) {
-      if (m.phase === "failed") hasFailed = true;
-      if (m.phase === "aborted") hasAborted = true;
-      if (m.phase !== "completed") allCompleted = false;
-    }
-
-    if (allCompleted) {
-      batch.status = "completed";
-    } else if (hasAborted && !hasFailed) {
-      batch.status = "aborted";
-    } else {
-      batch.status = "failed";
-    }
-
+    batch.status = deriveBatchStatus(batch);
     this.touch(batch);
   }
 
@@ -568,27 +556,44 @@ export class SwarmRegistry {
     const newest = visible[visible.length - 1];
     for (const batch of visible) {
       const seen = cursor.announced.get(batch.swarmId);
+      // 版本与结束态必须在**构造帧之前**取快照：消费方可能在持有某一帧时（例如等待传输写出）
+      // 让出执行权，期间发生的变化会推进 batch.version；若在 yield 恢复之后才读版本，
+      // 这次变化会被误记为"已发送"——它确实唤醒了 waiter，但下一轮比对版本相等，于是永远不再重发。
+      const version = batch.version;
+      const ended = batch.endedAt !== undefined;
       if (seen === undefined) {
+        const entry: AnnouncedBatch = { version, closed: ended };
+        cursor.announced.set(batch.swarmId, entry);
         yield openedFrameOf(batch);
         yield this.toRosterFrame(batch, Date.now(), visibleIds);
-        const entry: AnnouncedBatch = { version: batch.version, closed: false };
-        cursor.announced.set(batch.swarmId, entry);
-        if (batch.endedAt !== undefined) {
-          yield closedFrameOf(batch);
-          entry.closed = true;
-        }
+        if (ended) yield closedFrameOf(batch);
         continue;
       }
-      if (seen.version !== batch.version || (membershipChanged && batch === newest)) {
+      if (seen.version !== version || (membershipChanged && batch === newest)) {
+        seen.version = version;
         yield this.toRosterFrame(batch, Date.now(), visibleIds);
-        seen.version = batch.version;
       }
-      if (batch.endedAt !== undefined && !seen.closed) {
-        yield closedFrameOf(batch);
+      if (ended && !seen.closed) {
         seen.closed = true;
+        yield closedFrameOf(batch);
       }
     }
   }
+}
+
+/** 由成员相位推导批次终态：全 completed → completed；有 aborted 且无 failed → aborted；其余 → failed。 */
+function deriveBatchStatus(batch: SwarmBatch): SwarmBatch["status"] {
+  let hasFailed = false;
+  let hasAborted = false;
+  let allCompleted = true;
+  for (const m of batch.members.values()) {
+    if (m.phase === "failed") hasFailed = true;
+    if (m.phase === "aborted") hasAborted = true;
+    if (m.phase !== "completed") allCompleted = false;
+  }
+  if (allCompleted) return "completed";
+  if (hasAborted && !hasFailed) return "aborted";
+  return "failed";
 }
 
 function openedFrameOf(batch: SwarmBatch): SwarmOpenedFrame {
