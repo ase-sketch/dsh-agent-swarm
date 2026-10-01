@@ -207,6 +207,18 @@ function settleOnAbort(
   });
 }
 
+/**
+ * 运行期加载真实构建产物 dist/index.js。
+ *
+ * 刻意用运行期 URL 而不是字面量 `import("../dist/index.js")`：字面量会让 `tsc --noEmit`
+ * 静态解析 dist 的 .d.ts——干净检出（还没构建）时 typecheck 直接报 TS2307，
+ * 改了 src 未重建时又拿**过期**的 dist 类型去和 src 比对。这里要测的是运行期产物本身，
+ * 类型由调用处显式断言。
+ */
+function importDistEntry(): Promise<unknown> {
+  return import(new URL("../dist/index.js", import.meta.url).href) as Promise<unknown>;
+}
+
 /** 最小可用的执行上下文。 */
 function makeExec(signal = new AbortController().signal): Record<string, unknown> {
   return { callId: "call-1", name: "agent_swarm", signal, agent: FAKE_AGENT };
@@ -859,7 +871,7 @@ describe("F. 真实 Loader 加载路径", () => {
     // 引用）。真实运行时每个 entry 是一次全新 import，拿到全新模块实例与其全新
     // apply；同进程内我们无法复刻"全新模块实例"，于是保留这层最小薄包装
     // 转发调用来造出全新 apply 引用——export 本身取自真实 dist/index.js。
-    const dist = (await import("../dist/index.js")) as typeof plugin;
+    const dist = (await importDistEntry()) as typeof plugin;
     (loader as { internal: unknown }).internal = {
       import: async () => ({
         name: dist.name,
@@ -919,7 +931,7 @@ describe("F. 真实 Loader 加载路径", () => {
   it("真实构建产物 dist/index.js 同样只用具名导出，绝不 export default（红线）", async () => {
     // 直接守 AGENTS.md 红线：生产实际加载的 dist/index.js 若出现 default 导出，
     // Loader 会走 unwrapExports 分支掩盖真实缺陷。这里对构建产物断言。
-    const dist = (await import("../dist/index.js")) as Record<string, unknown>;
+    const dist = (await importDistEntry()) as Record<string, unknown>;
     expect("default" in dist).toBe(false);
     expect(dist.name).toBe("agent-swarm");
     expect(typeof dist.apply).toBe("function");
