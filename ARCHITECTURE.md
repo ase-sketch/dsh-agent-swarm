@@ -27,7 +27,7 @@ src/
     index.ts               client 入口 apply(ctx)：**父 fiber** 只做 $mount Remote（提供 remote.swarm 命名空间），
                        随后用 ctx.plugin 载入**子 fiber**（inject 声明 remote.swarm）注册槽位与字典
                        —— 提供与消费必须分属两个 fiber，理由见决策笔记 2026-10-01-client-namespace-inject-isolation.md
-    model.ts               会话/成员视图的内存模型（useSwarm 的订阅源）
+    model.ts               会话视图（可见批次列表）的内存模型（useSwarm 的订阅源）+ 帧合并纯函数
     service.ts             按会话引用计数订阅 swarm/roster 流
     SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式；成员按相位四组独立折叠、批次路由标签）
 scripts/build-client.mjs   esbuild 预构建：src/client/index.ts → dist/client.js（__ModuleLoader__ 包）
@@ -64,9 +64,15 @@ client 半的模块之间**只有类型引用**（`import type`）：模型实�
 
 ## host/client 双半数据流（面板）
 
-调度器相位变化 → 写入 `swarm-registry`（成员七态 + 批次路由标签）→ registry 100ms 合帧广播三类帧（opened / roster / closed）
+调度器相位变化 → 写入 `swarm-registry`（成员七态 + 批次路由标签；item/detail 只存显示摘要）
+→ registry **只唤醒发生变化的那个会话**的流，100ms 合帧后**只发版本变化了的批次**（opened / roster / closed 三类帧）
 → `remote.ts` 以 stream 下发 → client 的 `service.ts` 按会话引用计数订阅并写入 `model.ts`
 → `SwarmHeaderAction.tsx` 渲染标题栏徽标与弹层。
+
+**可见批次**：同一会话里一个批次保持可见，直到它结束之后又有新批次开始——同一条消息里并发的几次调用
+作为一组同时可见（弹层顶部可切换），下一次调用开始时整组换下。roster 帧携带 `visibleSwarmIds`，
+client 据此合并与清理（`model.ts` 的 `mergeRosterFrame`）。registry 的会话数与每会话批次数有上限，
+只淘汰已结束的批次。
 
 **权威口径：工具返回的 XML 是成员状态的唯一权威，面板只是过程可见性。** 两者不一致时以 XML 为准
 （2026-10-01 审查发现中断路径上 registry 与 XML 结论相反，已修复，见 `.agents/notes/implemented/bug-fix/`）。

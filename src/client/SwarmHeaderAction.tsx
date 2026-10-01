@@ -3,7 +3,7 @@
  */
 
 import { useState, useEffect, useRef, useMemo } from "react";
-import type { SwarmMemberView, SwarmPhase } from "../swarm-registry.js";
+import type { SwarmMemberView, SwarmPhase, SwarmRosterFrame } from "../swarm-registry.js";
 import type { SwarmClientState } from "./model.js";
 
 const CSS_TAG_ID = "dsh-agent-swarm/style.css";
@@ -178,6 +178,38 @@ const CSS_CONTENT = `
 
 .dsh-swarm-group-arrow.open {
   transform: rotate(90deg);
+}
+
+.dsh-swarm-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.06));
+  flex: none;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.dsh-swarm-tab {
+  flex: none;
+  max-width: 180px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #94a3b8);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dsh-swarm-tab.active {
+  background: var(--dsw-alias-fill-l2, rgba(255, 255, 255, 0.08));
+  color: var(--dsw-alias-label-primary, #f1f5f9);
 }
 
 .dsh-swarm-stats {
@@ -417,6 +449,36 @@ export class RetryTicker {
   }
 }
 
+// ───────────────────────── 多批次（同一会话并发的几次调用）─────────────────────────
+
+/** 选中的批次；未选或选中的已不可见时回到最新批次。 */
+export function selectBatch(
+  batches: readonly SwarmRosterFrame[],
+  selectedSwarmId: string | undefined,
+): SwarmRosterFrame | undefined {
+  return batches.find((batch) => batch.swarmId === selectedSwarmId) ?? batches[batches.length - 1];
+}
+
+/**
+ * 标题栏徽标：对**全部可见批次**聚合。
+ * 有成员在跑时显示 `在跑/总数` 并点亮；全部收场后显示 `已完成/总数`。
+ */
+export function summarizeBatches(batches: readonly SwarmRosterFrame[]): { badgeText: string; isLive: boolean } {
+  let total = 0;
+  let active = 0;
+  let completed = 0;
+  for (const batch of batches) {
+    total += batch.total;
+    active += batch.activeCount;
+    completed += batch.completedCount;
+  }
+  if (total === 0) return { badgeText: "0", isLive: false };
+  if (active > 0) return { badgeText: `${String(active)}/${String(total)}`, isLive: true };
+  return { badgeText: `${String(completed)}/${String(total)}`, isLive: false };
+}
+
+const EMPTY_BATCHES: readonly SwarmRosterFrame[] = [];
+
 const PHASE_CONFIG: Record<SwarmPhase, { label: string; bg: string; color: string }> = {
   pending: { label: "等待中", bg: "rgba(148, 163, 184, 0.15)", color: "#94a3b8" },
   starting: { label: "启动中", bg: "rgba(56, 189, 248, 0.15)", color: "#38bdf8" },
@@ -540,9 +602,18 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
     };
   }, [open]);
 
-  // 从 Model 订阅当前会话数据与流失败态
-  const batch = useSwarm((state) => state.bySession[sessionId]);
+  // 从 Model 订阅当前会话的可见批次与流失败态
+  const view = useSwarm((state) => state.bySession[sessionId]);
   const streamFailure = useSwarm((state) => state.streamFailures[sessionId]);
+  const batches = view?.batches ?? EMPTY_BATCHES;
+
+  // 多个可见批次时可切换查看；有新批次出现（最新批次变了）就回到最新。
+  const [selectedSwarmId, setSelectedSwarmId] = useState<string | undefined>(undefined);
+  const latestSwarmId = batches[batches.length - 1]?.swarmId;
+  useEffect(() => {
+    setSelectedSwarmId(undefined);
+  }, [latestSwarmId]);
+  const batch = selectBatch(batches, selectedSwarmId);
 
   // 换了批次就重置折叠态：旧批次的展开选择不该泄漏到新批次
   const swarmId = batch?.swarmId;
@@ -551,7 +622,7 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
   }, [swarmId]);
 
   const hasBatch = Boolean(batch && batch.total > 0);
-  const isLive = Boolean(batch && batch.activeCount > 0);
+  const { badgeText, isLive } = useMemo(() => summarizeBatches(batches), [batches]);
 
   // 最近一次限流重试的发起时刻；没有待重试成员时为 null
   const retryDeadline = useMemo(() => earliestRetryAt(batch?.members), [batch]);
@@ -569,11 +640,6 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
     return () => ticker.stop();
   }, [retryDeadline]);
 
-  const badgeText = useMemo(() => {
-    if (!batch || batch.total === 0) return "0";
-    if (batch.activeCount > 0) return `${batch.activeCount}/${batch.total}`;
-    return `${batch.completedCount}/${batch.total}`;
-  }, [batch]);
 
   return (
     <div className="dsh-swarm-root" ref={rootRef}>
@@ -622,6 +688,28 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
             )}
           </div>
 
+          {batches.length > 1 && (
+            <div className="dsh-swarm-tabs" role="tablist">
+              {batches.map((candidate, position) => {
+                const selected = candidate.swarmId === batch?.swarmId;
+                return (
+                  <button
+                    key={candidate.swarmId}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    className={`dsh-swarm-tab ${selected ? "active" : ""}`}
+                    title={candidate.description}
+                    onClick={() => setSelectedSwarmId(candidate.swarmId)}
+                  >
+                    #{position + 1} {candidate.description}
+                    {candidate.activeCount > 0 ? ` · ${String(candidate.activeCount)}/${String(candidate.total)}` : ""}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           {streamFailure && (
             <div className="dsh-swarm-stream-error" title={streamFailure.message}>
               流连接中断：{streamFailure.message}
@@ -657,7 +745,10 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
                           >
                             {cfg.label}
                           </span>
-                          <span className="dsh-swarm-row-item" title={m.item}>
+                          <span
+                            className="dsh-swarm-row-item"
+                            title={m.itemChars === undefined ? m.item : `${m.item}（原文 ${String(m.itemChars)} 字符）`}
+                          >
                             {m.item}
                           </span>
                           {m.agentId && (

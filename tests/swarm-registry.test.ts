@@ -2,7 +2,12 @@
 import { describe, it, expect } from "vitest";
 import { runSwarm } from "../src/scheduler.js";
 import { renderSwarmResult } from "../src/result-xml.js";
-import { SwarmRegistry } from "../src/swarm-registry.js";
+import {
+  MEMBER_VIEW_DETAIL_MAX_CHARS,
+  MEMBER_VIEW_ITEM_MAX_CHARS,
+  SwarmRegistry,
+  type SwarmFrame,
+} from "../src/swarm-registry.js";
 import type {
   SwarmAttemptResult,
   SwarmSchedulerDeps,
@@ -100,16 +105,73 @@ describe("SwarmRegistry state machine", () => {
     expect(batch?.status).toBe("aborted");
   });
 
-  it("respects maxRetainedBatches per session", () => {
+  it("respects maxRetainedBatches per session（淘汰最旧的已结束批次）", () => {
     const reg = new SwarmRegistry({ maxRetainedBatches: 2 });
     const id1 = reg.beginBatch("sess-a", "Batch 1", [{ index: 1, item: "a" }]);
+    reg.endBatch(id1);
     const id2 = reg.beginBatch("sess-a", "Batch 2", [{ index: 1, item: "b" }]);
+    reg.endBatch(id2);
     const id3 = reg.beginBatch("sess-a", "Batch 3", [{ index: 1, item: "c" }]);
 
     expect(reg.getBatch(id1)).toBeUndefined();
     expect(reg.getBatch(id2)).toBeDefined();
     expect(reg.getBatch(id3)).toBeDefined();
     expect(reg.getLatestBatch("sess-a")?.swarmId).toBe(id3);
+  });
+
+  it("运行中的批次永不被淘汰（软上限）：否则它之后的相位更新会静默落空、面板停在中途", () => {
+    const reg = new SwarmRegistry({ maxRetainedBatches: 2 });
+    const running = reg.beginBatch("sess-a", "still running", [{ index: 1, item: "a" }]);
+    const ended = reg.beginBatch("sess-a", "ended", [{ index: 1, item: "b" }]);
+    reg.endBatch(ended);
+    const newest = reg.beginBatch("sess-a", "newest", [{ index: 1, item: "c" }]);
+    // 超出上限时跳过运行中的 running，淘汰已结束的 ended
+    expect(reg.getBatch(running)).toBeDefined();
+    expect(reg.getBatch(ended)).toBeUndefined();
+    expect(reg.getBatch(newest)).toBeDefined();
+    // 全是运行中的批次时允许暂时超出上限
+    const another = reg.beginBatch("sess-a", "another", [{ index: 1, item: "d" }]);
+    expect([running, newest, another].every((id) => reg.getBatch(id) !== undefined)).toBe(true);
+    // 运行中批次的更新照常生效
+    reg.markSettled(running, 1, "completed");
+    expect(reg.getBatch(running)?.members.get(1)?.phase).toBe("completed");
+  });
+
+  it("会话数上限：按最近活跃淘汰空闲会话，有运行中批次的会话不淘汰（此前会话表只增不减）", () => {
+    const reg = new SwarmRegistry({ maxRetainedSessions: 2 });
+    const busy = reg.beginBatch("sess-busy", "running", [{ index: 1, item: "a" }]);
+    const idle = reg.beginBatch("sess-idle", "done", [{ index: 1, item: "b" }]);
+    reg.endBatch(idle);
+    reg.beginBatch("sess-new", "new", [{ index: 1, item: "c" }]);
+    // 超出 2 个会话：最久未活跃的 sess-busy 有运行中批次 → 跳过；淘汰空闲的 sess-idle
+    expect(reg.getBatch(busy)).toBeDefined();
+    expect(reg.getBatch(idle)).toBeUndefined();
+    expect(reg.getLatestBatch("sess-idle")).toBeUndefined();
+    expect(reg.getLatestBatch("sess-new")).toBeDefined();
+  });
+
+  it("成员视图只保留显示摘要：长 item / detail 截断，原长另给（XML 不受影响，它不读 registry）", () => {
+    const reg = new SwarmRegistry();
+    const longItem = "x".repeat(MEMBER_VIEW_ITEM_MAX_CHARS + 50);
+    const swarmId = reg.beginBatch("sess-t", "trunc", [
+      { index: 1, item: longItem },
+      { index: 2, item: "short" },
+    ]);
+    const member = reg.getBatch(swarmId)?.members.get(1);
+    expect(member?.item).toBe(`${"x".repeat(MEMBER_VIEW_ITEM_MAX_CHARS)}…`);
+    expect(member?.itemChars).toBe(MEMBER_VIEW_ITEM_MAX_CHARS + 50);
+    expect(reg.getBatch(swarmId)?.members.get(2)).not.toHaveProperty("itemChars");
+
+    reg.markSettled(swarmId, 1, "failed", "e".repeat(MEMBER_VIEW_DETAIL_MAX_CHARS * 3));
+    expect(reg.getBatch(swarmId)?.members.get(1)?.detail?.length).toBe(MEMBER_VIEW_DETAIL_MAX_CHARS + 1);
+  });
+
+  it("roster 帧里的成员是快照：之后的相位变化不会改写已经发出的帧", () => {
+    const reg = new SwarmRegistry();
+    const swarmId = reg.beginBatch("sess-snap", "snap", [{ index: 1, item: "a" }]);
+    const frame = reg.toRosterFrame(reg.getBatch(swarmId)!);
+    reg.markSettled(swarmId, 1, "completed");
+    expect(frame.members[0]?.phase).toBe("pending");
   });
 });
 
@@ -461,5 +523,111 @@ describe("routeLabel（批次路由标签）", () => {
     const without = reg.beginBatch("sess-r", "Plain batch", [{ index: 1, item: "b" }], 1002);
     const batchWithout = reg.getBatch(without);
     expect(reg.toRosterFrame(batchWithout!, 1003).routeLabel).toBeUndefined();
+  });
+});
+
+// ───────────────────────── 推流：按会话唤醒 / 只发增量 / 并发批次可见 ─────────────────────────
+
+/** 后台收集某会话的帧，直到 stop()；返回已收到的帧。 */
+function collectFrames(reg: SwarmRegistry, sessionId: string, flushMs = 1) {
+  const ac = new AbortController();
+  const frames: SwarmFrame[] = [];
+  const done = (async () => {
+    try {
+      for await (const frame of reg.framesFor(sessionId, ac.signal, flushMs)) frames.push(frame);
+    } catch (err) {
+      if (!ac.signal.aborted) throw err;
+    }
+  })();
+  return {
+    frames,
+    async stop(): Promise<SwarmFrame[]> {
+      ac.abort();
+      await done;
+      return frames;
+    },
+  };
+}
+
+const tick = (ms = 15) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("framesFor：资源边界与并发批次", () => {
+  it("只有本会话的变化才唤醒本会话的流（此前任一会话变化都会唤醒全部订阅者）", async () => {
+    const reg = new SwarmRegistry();
+    const mine = reg.beginBatch("sess-A", "mine", [{ index: 1, item: "a" }]);
+    const stream = collectFrames(reg, "sess-A");
+    await tick();
+    const initial = stream.frames.length;
+    expect(initial).toBe(2); // opened + roster
+
+    const other = reg.beginBatch("sess-B", "other", [
+      { index: 1, item: "p" },
+      { index: 2, item: "q" },
+    ]);
+    for (let i = 0; i < 10; i += 1) {
+      reg.markStarting(other, 1 + (i % 2));
+      await tick(2);
+    }
+    await tick();
+    expect(stream.frames.length).toBe(initial);
+
+    reg.markSettled(mine, 1, "completed");
+    await tick();
+    const frames = await stream.stop();
+    expect(frames.length).toBe(initial + 1);
+    expect(frames[frames.length - 1]).toMatchObject({ type: "roster", swarmId: mine, completedCount: 1 });
+  });
+
+  it("并发批次：同一会话里重叠运行的批次同时可见，roster 帧携带 visibleSwarmIds", async () => {
+    const reg = new SwarmRegistry();
+    const first = reg.beginBatch("sess-C", "first", [{ index: 1, item: "a" }]);
+    const second = reg.beginBatch("sess-C", "second", [{ index: 1, item: "b" }]);
+    expect(reg.visibleBatches("sess-C").map((b) => b.swarmId)).toEqual([first, second]);
+
+    const stream = collectFrames(reg, "sess-C");
+    await tick();
+    // 两个批次都有 opened + roster；先开的不会因为后开的出现而从面板消失（此前只推最新一个）
+    const openedIds = stream.frames.filter((f) => f.type === "opened").map((f) => f.swarmId);
+    expect(openedIds).toEqual([first, second]);
+    const roster = stream.frames.find((f) => f.type === "roster" && f.swarmId === first);
+    expect(roster).toMatchObject({ visibleSwarmIds: [first, second] });
+
+    // first 先结束：second 还在跑，first 仍可见（与 second 重叠）
+    reg.markSettled(first, 1, "completed");
+    reg.endBatch(first);
+    await tick();
+    expect(reg.visibleBatches("sess-C").map((b) => b.swarmId)).toEqual([first, second]);
+    expect(stream.frames.filter((f) => f.type === "closed").map((f) => f.swarmId)).toEqual([first]);
+
+    // 两者都结束后，新一次调用开新批次：旧的一组整体被取代
+    reg.endBatch(second);
+    const third = reg.beginBatch("sess-C", "third", [{ index: 1, item: "c" }]);
+    await tick();
+    const frames = await stream.stop();
+    expect(reg.visibleBatches("sess-C").map((b) => b.swarmId)).toEqual([third]);
+    const lastRoster = [...frames].reverse().find((f) => f.type === "roster");
+    expect(lastRoster).toMatchObject({ swarmId: third, visibleSwarmIds: [third] });
+    // 每个批次的 closed 恰好一次
+    for (const id of [first, second]) {
+      expect(frames.filter((f) => f.type === "closed" && f.swarmId === id)).toHaveLength(1);
+    }
+  });
+
+  it("只重发版本变化了的批次：另一个并发批次的更新不会让本批次的 roster 重发", async () => {
+    const reg = new SwarmRegistry();
+    const quiet = reg.beginBatch("sess-D", "quiet", [{ index: 1, item: "a" }]);
+    const busy = reg.beginBatch("sess-D", "busy", [{ index: 1, item: "b" }]);
+    const stream = collectFrames(reg, "sess-D");
+    await tick();
+    for (let i = 0; i < 5; i += 1) {
+      reg.setAgentId(busy, 1, `agent-${String(i)}`);
+      await tick(3);
+    }
+    await tick();
+    const frames = await stream.stop();
+    const quietRosters = frames.filter((f) => f.type === "roster" && f.swarmId === quiet);
+    const busyRosters = frames.filter((f) => f.type === "roster" && f.swarmId === busy);
+    expect(quietRosters).toHaveLength(1); // 只有连接时那一帧
+    expect(busyRosters.length).toBeGreaterThan(1);
   });
 });
