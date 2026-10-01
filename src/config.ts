@@ -19,14 +19,14 @@ import {
 export const Config = Schema.object({
   /** 子代理 provider 名（不硬编码调用方，默认官方 spawn 进程内 provider）。 */
   provider: Schema.string().default("spawn"),
-  /** 首波并发（照上游实测默认 5）。 */
-  firstWave: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.initialLaunchLimit),
+  /** 首波并发（照上游实测默认 5）；至少 1——0 会让调度器构造期拒绝，等于每次调用都失败。 */
+  firstWave: Schema.natural().min(1).default(DEFAULT_SWARM_SCHEDULER_CONFIG.initialLaunchLimit),
   /** 首波之后每个任务的放量间隔（默认 700ms）。 */
   releaseIntervalMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.initialLaunchIntervalMs),
   /** 限流退避基数（默认 3000ms × retryFactor^n）。 */
   backoffInitialMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.retryBaseMs),
-  /** 限流退避指数因子（默认 2）。 */
-  retryFactor: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.retryFactor),
+  /** 限流退避指数因子（默认 2）；>= 1 的实数（调度器支持 1.5 这类小数，此前 natural() 会把它拒掉）。 */
+  retryFactor: Schema.number().min(1).default(DEFAULT_SWARM_SCHEDULER_CONFIG.retryFactor),
   /** 容量收缩防抖间隔（默认 2000ms）。 */
   shrinkDebounceMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.capacityShrinkDebounceMs),
   /** 容量恢复检查间隔（默认 180s 恢复 +1）。 */

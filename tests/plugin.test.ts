@@ -255,6 +255,30 @@ describe("A. 插件声明形态", () => {
     expect("timeoutMs" in DEFAULT_SWARM_SCHEDULER_CONFIG).toBe(false);
     expect(DEFAULT_SWARM_SCHEDULER_CONFIG.timeoutMs).toBeUndefined();
   });
+
+  it("Config 在加载期拒绝调度器必拒的值（firstWave/retryFactor < 1），并接受小数因子", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    // 此前 natural() 放行 0：之后每次 agent_swarm 调用都在调度器构造期失败（且发生在批次登记之后）。
+    expect(() => resolve({ firstWave: 0 })).toThrow(/firstWave/);
+    expect(() => resolve({ retryFactor: 0 })).toThrow(/retryFactor/);
+    expect(() => resolve({ retryFactor: 0.5 })).toThrow(/retryFactor/);
+    // 调度器支持 >= 1 的实数因子；此前 natural() 会把 1.5 拒掉。
+    expect(resolve({ retryFactor: 1.5 }).retryFactor).toBe(1.5);
+  });
+
+  it("绕过 schema 传入非法调度配置时，apply 在任何副作用之前 fail-fast", () => {
+    const ctx = new Context() as unknown as Context & Record<string, unknown>;
+    let registered = false;
+    Object.defineProperty(ctx, "tools", {
+      configurable: true,
+      value: { register: () => ((registered = true), () => undefined) },
+    });
+    Object.defineProperty(ctx, "subagents", { configurable: true, value: { start: () => Promise.reject() } });
+    expect(() => plugin.apply(ctx, { ...defaultConfig(), firstWave: 0 })).toThrow(/initialLaunchLimit/);
+    // 没有注册工具，也没有挂 swarmRemote 服务：失败不留下任何半装配状态。
+    expect(registered).toBe(false);
+    expect(ctx.get("swarmRemote")).toBeUndefined();
+  });
 });
 
 // ───────────────────────── B. defineTool 形态 ─────────────────────────

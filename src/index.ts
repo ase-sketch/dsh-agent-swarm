@@ -17,7 +17,8 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
-import type { SwarmPluginConfig } from "./config.js";
+import { toSchedulerConfig, type SwarmPluginConfig } from "./config.js";
+import { validateSchedulerConfig } from "./scheduler.js";
 import { planSwarmBatch, type SwarmExecuteArgs } from "./batch-plan.js";
 import { runSwarmBatch } from "./batch-run.js";
 import { renderSwarmResultSafely } from "./result-xml.js";
@@ -61,8 +62,13 @@ function acquireRegistry(ctx: Context): SwarmRegistry {
  * 插件入口。有副作用的事只有两件：挂 SwarmRemote 服务（见 acquireRegistry）、注册工具。
  * 两者都可逆：前者随 fiber 卸载由 cordis 注销；后者由返回的 disposer 注销
  * （Cordis 把 apply 返回的函数登记为该 fiber 的 effect，卸载时自动调用）。
+ *
+ * 调度器配置在**任何副作用之前**先校验一遍（fail-fast）：Config schema 已挡住大部分非法值，
+ * 这里兜住绕过 schema 直接传入的配置——否则非法配置要等到每一次工具调用才在调度器构造期抛错，
+ * 而那时批次已经登记，面板会留下一个从未跑过的空批次。
  */
 export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
+  validateSchedulerConfig(toSchedulerConfig(config));
   const registry = acquireRegistry(ctx);
 
   // 描述在 apply 期按**生效上限**生成，不是模块级常量：宿主把 config.maxItems 调低后，
