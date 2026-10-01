@@ -17,6 +17,7 @@
  */
 
 import type { SwarmErrorCode, SwarmValidationError } from "./types.js";
+import { sliceJsonTextSafely } from "./text-clip.js";
 
 /** 抛出的错误对象带回的机器可读字段（日志与测试按 code 判定用）。 */
 export interface SwarmErrorFields {
@@ -49,7 +50,8 @@ export function formatSwarmErrorMessage(error: SwarmValidationError): string {
     return head;
   }
   if (json.length > ERROR_DETAILS_MAX_CHARS) {
-    json = `${json.slice(0, ERROR_DETAILS_MAX_CHARS)}…(truncated, ${String(json.length)} chars total)`;
+    // 截断点不劈开代理对、不切碎转义序列（见 text-clip.ts）。
+    json = `${sliceJsonTextSafely(json, ERROR_DETAILS_MAX_CHARS)}…(truncated, ${String(json.length)} chars total)`;
   }
   return `${head}\nDetails: ${json}`;
 }

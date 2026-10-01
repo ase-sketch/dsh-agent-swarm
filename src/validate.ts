@@ -28,6 +28,7 @@ import {
   type SwarmTaskSpec,
   type SwarmValidationError,
 } from "./types.js";
+import { clipText } from "./text-clip.js";
 
 export interface SwarmValidationSuccess {
   ok: true;
@@ -91,8 +92,8 @@ export const DUPLICATE_SNIPPET_MAX_CHARS = 120;
  * 任何重写都会让它在细节上与原文对不上号；长度信息由调用方另行给出（*Chars 字段）。
  */
 function snippetOf(value: string): string {
-  if (value.length <= DUPLICATE_SNIPPET_MAX_CHARS) return value;
-  return `${value.slice(0, DUPLICATE_SNIPPET_MAX_CHARS)}…`;
+  // 不劈开代理对（见 text-clip.ts）：截断点落在 emoji 中间会留下乱码 ``。
+  return clipText(value, DUPLICATE_SNIPPET_MAX_CHARS);
 }
 
 function fail(

@@ -27,6 +27,7 @@ import type {
   SwarmTaskSpec,
 } from "./types.js";
 import { runSwarm } from "./scheduler.js";
+import { clipText } from "./text-clip.js";
 import type { SwarmRegistry } from "./swarm-registry.js";
 import type { RateLimitWatchRouter } from "./rate-limit-signal.js";
 import { toSchedulerConfig, type SwarmAgentOptions, type SwarmPluginConfig } from "./config.js";
@@ -176,9 +177,8 @@ export const MEMBER_LABEL_ITEM_MAX_CHARS = 80;
  */
 export function memberLabel(spec: SwarmTaskSpec, total: number): string {
   const oneLine = String(spec.item).replace(/\s+/g, " ").trim();
-  const item =
-    oneLine.length > MEMBER_LABEL_ITEM_MAX_CHARS ? `${oneLine.slice(0, MEMBER_LABEL_ITEM_MAX_CHARS)}…` : oneLine;
-  return `${String(spec.index)}/${String(total)}: ${item}`;
+  // 不劈开代理对（见 text-clip.ts）：label 会持久化进父会话日志，残留的孤立代理会一直显示成乱码。
+  return `${String(spec.index)}/${String(total)}: ${clipText(oneLine, MEMBER_LABEL_ITEM_MAX_CHARS)}`;
 }
 
 /**

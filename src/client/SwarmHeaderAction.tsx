@@ -764,7 +764,8 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm, t }: SwarmH
                           </span>
                           {m.agentId && (
                             <span className="dsh-swarm-agent-id" title={m.agentId}>
-                              {m.agentId.slice(0, 10)}
+                              {/* 按码点取前 10 个，不劈开代理对（client 不引 host 模块的值，故就地处理） */}
+                              {Array.from(m.agentId).slice(0, 10).join("")}
                             </span>
                           )}
                         </div>

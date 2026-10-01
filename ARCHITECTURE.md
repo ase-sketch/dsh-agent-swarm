@@ -16,6 +16,7 @@ src/
   tool-spec.ts           纯函数：面向模型的工具名/描述/参数映射/输出契约 + 生效上限（描述与校验同一口径）
   swarm-error.ts         纯函数：结构化校验错误 → 可抛出 Error 的唯一出口（code + details 渲染进模型可见的 message）
   rate-limit-signal.ts   纯逻辑：按子会话 id 收集 llm/retry 与 turn/end，判定子代理是否被限流拖死（限流接线，默认关闭）
+  text-clip.ts           纯函数：全仓唯一的文本截断出口——不劈开 UTF-16 代理对、不切碎 JSON 转义序列
   remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符
   ── 宿主集成层（依赖 DSH 运行时或其类型）──
   config.ts              插件 Config schema（schemastery）+ 解析后配置形状 + 插件配置→调度器配置的唯一映射
@@ -51,7 +52,8 @@ host 半：`index.ts` 是唯一装配点 → `batch-plan.ts`、`batch-run.ts`、
 `batch-run.ts` → `scheduler.ts`、`config.ts`（以及 `batch-plan.ts` / `swarm-registry.ts` / `rate-limit-signal.ts` 的**类型**）；
 `index.ts` → `rate-limit-signal.ts`（构造路由器）；
 `remote.ts` → `swarm-registry.ts`；纯逻辑层内部只依赖 `types.ts`
-（`scheduler.ts`、`validate.ts`、`result-xml.ts` **互不依赖**；`tool-spec.ts`、`swarm-error.ts` 同样只依赖 `types.ts`）。
+（`scheduler.ts`、`validate.ts`、`result-xml.ts` **互不依赖**；`tool-spec.ts`、`swarm-error.ts` 同样只依赖 `types.ts`；
+`text-clip.ts` 无任何依赖，被 `validate.ts` / `swarm-error.ts` / `swarm-registry.ts` / `batch-run.ts` 共用）。
 
 **方向别读错**：`scheduler.ts` 不依赖 `validate.ts` / `result-xml.ts`——它们在一次工具调用里先后被调用（那是**数据流**，见下节），不是模块依赖。
 纯逻辑层**绝不**反向依赖宿主集成层。
@@ -59,7 +61,7 @@ host 半：`index.ts` 是唯一装配点 → `batch-plan.ts`、`batch-run.ts`、
 client 半：`client/index.ts` → `client/model.ts`、`client/service.ts`、`SwarmHeaderAction.tsx`、`../remote-descriptor.ts`（其中 `remote-descriptor` 是值引用）。
 client 半的模块之间**只有类型引用**（`import type`）：模型实例经槽位 `inject` 注入到组件与服务，不存在运行时模块耦合。
 
-纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / tool-spec / swarm-error / rate-limit-signal / remote-descriptor）
+纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / tool-spec / swarm-error / rate-limit-signal / text-clip / remote-descriptor）
 **零 DSH 运行时依赖**，可脱离宿主单测；`remote.ts` 依赖 `@deepseek-ai/dsh-typert-protocol`，是 host 半里唯一的协议层依赖；
 `config.ts` 依赖 `@deepseek-ai/schemastery`，`index.ts` 依赖 `@deepseek-ai/dsh-tools`（defineTool）。
 

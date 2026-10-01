@@ -6,6 +6,7 @@ import {
   toThrownSwarmError,
 } from "../src/swarm-error.js";
 import { SWARM_ERROR_CODES } from "../src/types.js";
+import { endsInsideJsonEscape, hasLoneSurrogate } from "./helpers/surrogates.js";
 
 /**
  * 结构化错误 → 模型可见文本。
@@ -39,6 +40,19 @@ describe("formatSwarmErrorMessage", () => {
     const detailsLine = text.split("\n")[1] ?? "";
     expect(detailsLine.length).toBeLessThan(ERROR_DETAILS_MAX_CHARS + 80);
     expect(detailsLine).toMatch(/…\(truncated, \d+ chars total\)$/);
+  });
+
+  it("details 截断点落在 emoji 或转义序列中间时，退到完整字符 / 完整转义之前（评审第 1 条）", () => {
+    for (let pad = 0; pad < 12; pad += 1) {
+      const text = formatSwarmErrorMessage({
+        code: SWARM_ERROR_CODES.DUPLICATE_PROMPTS,
+        message: "dup",
+        details: { blob: `${"x".repeat(ERROR_DETAILS_MAX_CHARS - 12 + pad)}🚀"\u001b\\🚀` },
+      });
+      const kept = (text.split("\nDetails: ")[1] ?? "").split("…(truncated")[0] ?? "";
+      expect(hasLoneSurrogate(kept)).toBe(false);
+      expect(endsInsideJsonEscape(kept)).toBe(false); // 不以悬空反斜杠或残缺的 \u 结尾
+    }
   });
 
   it("details 不可序列化时退回只给 [CODE] message，报错本身不变成另一个异常", () => {

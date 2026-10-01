@@ -24,6 +24,7 @@ import {
 } from "../src/types.js";
 import type { SwarmBatch, SwarmPhase, SwarmRegistry } from "../src/swarm-registry.js";
 import { RateLimitWatchRouter } from "../src/rate-limit-signal.js";
+import { hasLoneSurrogate } from "./helpers/surrogates.js";
 
 // ───────────────────────── mock Context ─────────────────────────
 
@@ -585,6 +586,16 @@ describe("D. 派发红线", () => {
     expect(first.request.prompt).toEqual([
       { type: "text", text: `Review ${longItem} and report findings.` },
     ]);
+  });
+
+  it("label 截断不劈开代理对（label 持久化进父会话日志，孤立代理会一直显示成乱码）", async () => {
+    // 第 80/81 个码元是一个 emoji 的代理对 → 旧实现截在两者之间
+    const item = `${"x".repeat(79)}🚀tail`;
+    const harness = createHarness();
+    await harness.definition.execute(validArgs({ items: [item, "other"] }), makeExec() as never);
+    const label = String((harness.startCalls[0] as StartCall).request.label);
+    expect(hasLoneSurrogate(label)).toBe(false);
+    expect(label).toBe(`1/2: ${"x".repeat(79)}…`);
   });
 
   it("每个 start 成功都配对一次 dispose", async () => {

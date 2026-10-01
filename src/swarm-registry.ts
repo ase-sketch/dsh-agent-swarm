@@ -17,6 +17,8 @@
  * roster 帧携带当前可见集合（visibleSwarmIds），客户端据此清理已不可见的批次。
  */
 
+import { clipText } from "./text-clip.js";
+
 export type SwarmPhase =
   | "pending"
   | "starting"
@@ -105,9 +107,7 @@ export const MEMBER_VIEW_ITEM_MAX_CHARS = 200;
 /** 成员视图里 detail 摘要的最大码元数。 */
 export const MEMBER_VIEW_DETAIL_MAX_CHARS = 500;
 
-function clip(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}…`;
-}
+
 
 // ───────────────────────── 唤醒与合帧原语 ─────────────────────────
 //
@@ -257,7 +257,7 @@ export class SwarmRegistry {
     const swarmId = `swarm-${String(now)}-${Math.random().toString(36).slice(2, 8)}`;
     const members = new Map<number, SwarmMemberView>();
     for (const spec of specs) {
-      const item = clip(spec.item, MEMBER_VIEW_ITEM_MAX_CHARS);
+      const item = clipText(spec.item, MEMBER_VIEW_ITEM_MAX_CHARS);
       members.set(spec.index, {
         index: spec.index,
         item,
@@ -272,7 +272,7 @@ export class SwarmRegistry {
       swarmId,
       sessionId,
       // description 同样来自模型、长度不可信，且随每个 opened / roster 帧下发：与 item 同样截成显示摘要。
-      description: clip(description, MEMBER_VIEW_ITEM_MAX_CHARS),
+      description: clipText(description, MEMBER_VIEW_ITEM_MAX_CHARS),
       ...(routeLabel === undefined ? {} : { routeLabel }),
       total: specs.length,
       status: "running",
@@ -365,7 +365,7 @@ export class SwarmRegistry {
     found.member.retryCount = retryCount;
     found.member.retryReadyAt = retryReadyAt;
     if (detail !== undefined) {
-      found.member.detail = clip(detail, MEMBER_VIEW_DETAIL_MAX_CHARS);
+      found.member.detail = clipText(detail, MEMBER_VIEW_DETAIL_MAX_CHARS);
     }
     this.touch(found.batch);
   }
@@ -391,7 +391,7 @@ export class SwarmRegistry {
     found.member.phase = outcome;
     found.member.settledAt = now;
     if (detail !== undefined) {
-      found.member.detail = clip(detail, MEMBER_VIEW_DETAIL_MAX_CHARS);
+      found.member.detail = clipText(detail, MEMBER_VIEW_DETAIL_MAX_CHARS);
     }
     // 批次已收尾后才落定的成员（中断时成员的 run.result 异步收场，晚于宿主 finally 里的 endBatch）：
     // 重算批次状态，否则 status 会停在 endBatch 那一刻按残留相位推导出的 failed，与成员和 XML 不符。

@@ -1,5 +1,6 @@
 
 import { describe, it, expect, vi } from "vitest";
+import { hasLoneSurrogate } from "./helpers/surrogates.js";
 import { runSwarm } from "../src/scheduler.js";
 import { renderSwarmResult } from "../src/result-xml.js";
 import {
@@ -676,6 +677,16 @@ describe("独立审查回归：推流与批次状态", () => {
     await tick();
     await stream.stop();
     expect(spy.mock.calls.length).toBe(diffsAfterConnect);
+  });
+
+  it("视图截断不劈开代理对：item / description 在 emoji 处截断不残留孤立代理（评审第 1 条）", () => {
+    const reg = new SwarmRegistry();
+    const text = `${"a".repeat(MEMBER_VIEW_ITEM_MAX_CHARS - 1)}🚀rest`;
+    const swarmId = reg.beginBatch("sess-U", text, [{ index: 1, item: text }]);
+    const batch = reg.getBatch(swarmId);
+    expect(hasLoneSurrogate(batch?.description ?? "")).toBe(false);
+    expect(hasLoneSurrogate(batch?.members.get(1)?.item ?? "")).toBe(false);
+    expect(batch?.members.get(1)?.item).toBe(`${"a".repeat(MEMBER_VIEW_ITEM_MAX_CHARS - 1)}…`);
   });
 
   it("description 同样截成显示摘要（它随每个 opened / roster 帧下发）", () => {
