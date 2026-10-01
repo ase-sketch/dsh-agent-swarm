@@ -5,17 +5,21 @@
 
 ## 1. 是否包含第三方源码
 
-**本仓未复制任何第三方源代码。** 所有 `src/**` 文件均为依据下述文档的**行为描述**重写。
+**本仓未复制任何 Kimi 上游源代码。** 所有 `src/**` 文件中与 swarm 功能相关的实现，均依据下述文档的**行为描述**重写。
+
+唯一的例外不来自 Kimi，而是宿主平台：`src/swarm-registry.ts` 中的 `OutputWaiter` / `sleepWithSignal`
+与 DSH 官方包 `@deepseek-ai/dsh-api-job-controller`（MIT）的推流骨架结构逐行对应。来源与许可原文见 **§8**。
+（2026-10-01 第三轮订正：此前本节写的是「未复制任何第三方源代码」，与该文件自述的"照抄 DSH 官方实现"相矛盾。）
 
 - 未打开 `extracted/kimi-code-swarm-analysis/02-v2源码/`（对实现者封存）
 - 未打开 `extracted/kimi-code-swarm-analysis/05-UI与API层/`
 - 未打开 `extracted/kimi-code-swarm-analysis/03-v1源码/`（任务书允许，但本次实现未需要）
 - 未复制 `05-提示词全文.md` 的任何提示词原文；面向模型的工具描述文本为**本仓自拟**
-  （见 `src/index.ts` 的 `TOOL_DESCRIPTION`，英文、clean-room 重写，非任何上游原文）
+  （见 `src/tool-spec.ts` 的 `buildToolDescription` / `buildToolParameters`，英文、clean-room 重写，非任何上游原文）
 
 **可复核的核对方法（2026-10-01 审查后补）**：上述"未复制"不该只靠自证，可按下列方法复核——
 
-1. 工具描述：与白名单文档全文比对，无连续 6 词以上重合（`src/index.ts` 的 `TOOL_DESCRIPTION`）；
+1. 工具描述：与白名单文档全文比对，无连续 6 词以上重合（`src/tool-spec.ts` 的 `buildToolDescription`）；
 2. 错误文案与常量：2026-10-01 审查曾发现**三条与上游逐字相同**的文本
    （`src/validate.ts` 两条、`src/scheduler.ts` 一条），已于 v0.3.3 全部改写为本仓自拟，
    现全仓 grep 三条原文为 **0 命中**，与上游最长连续重合 2 词（`rate limit`）；
@@ -142,3 +146,41 @@
    并新增守护 AGENTS.md 红线「绝不写 export default」的用例（此前该红线实际无人守护）；
 6. **中断语义一致**：批次中断后 registry 与 XML 同为 aborted（此前未启动成员会永久停在 pending、批次被推导成 failed）；
 7. **限流能力状态回写**：`docs/spec.md` 新增「交付状态」，明确限流退避在交付态无触发路径及其启用前置条件。
+
+## 8. DSH 宿主平台（MIT）来源
+
+本节登记的是**宿主平台 DeepSeek Harness** 的开源代码，与 Kimi 上游无关，不涉及 clean-room 边界。
+DSH 官方包以 MIT 许可在 npm 公开发布，引用版本均为 `0.2.0-rc.2`。
+
+| 本仓位置 | 来源 | 关系 |
+|---|---|---|
+| `src/swarm-registry.ts` 的 `OutputWaiter`、`sleepWithSignal` | `@deepseek-ai/dsh-api-job-controller` `lib/index.js`（`OutputWaiter`、`sleep`） | 结构逐行对应：「有变化就 wake、合窗后重发」的推流骨架 |
+| `src/swarm-registry.ts` 的按会话唤醒（`framesFor` 的 sessionId 过滤） | 同上，`streamJobRows` | 只对齐行为（只有本会话的变化才唤醒），代码为本仓自写 |
+| `src/batch-plan.ts` 的 `delegationDepthOfParent` | `@deepseek-ai/dsh-subagent` 的 `delegationDepthOf` | 只对齐口径（会话头与运行期选项取较大者），代码为本仓自写，且刻意宽松 |
+| `src/batch-plan.ts` 的 `resolveMemberMaxDepth` | `@deepseek-ai/dsh-tool-subagent` 的 `maxDepth` 透传方式 | 只对齐 API 用法（`resolveMaxDepth` 与 `"provider-managed"` 语义），代码为本仓自写 |
+
+`@deepseek-ai/dsh-api-job-controller` 的许可原文：
+
+```
+MIT License
+
+Copyright (c) 2026 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
