@@ -287,3 +287,38 @@ export function renderSwarmResult(
   ];
   return lines.join("\n");
 }
+
+/**
+ * 生产渲染入口：先按降级模式渲染（编号错位不抛错），再兜住**任何**其它渲染期异常。
+ *
+ * 为什么要有第二层 try/catch（degradeOnIndexMismatch 只挡编号错位一类）：
+ * 渲染是这条链路的最后一环，它抛错的代价是**整批**结果消失——包括上百个已经跑完、
+ * 已经付费、正文完好的成员。那是本仓最贵的失败模式，且与"不静默吞错"并不冲突：
+ * 兜底不是把错误吃掉，而是把错误**变成模型看得见的结果内容**——
+ * 逐成员按 item / outcome / 正文降级渲染，并把渲染失败的原文写进 <summary>。
+ *
+ * 只有二次降级也失败（连单成员渲染都做不出来）时才把错误抛出：那时连"保住结果"
+ * 都已不可能，抛错反而是更诚实的信号。
+ */
+export function renderSwarmResultSafely(results: readonly SwarmTaskResult[]): string {
+  try {
+    return renderSwarmResult(results, { omitNotStarted: false, degradeOnIndexMismatch: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const header = [
+      `<${SWARM_RESULT_TAG}>`,
+      `<summary>render failed: ${escapeXmlText(message)}</summary>`,
+    ].join("\n");
+    const body = results
+      .map((result) => {
+        // 单成员同样可能抛（脏数据极端形态），故逐条兜住，坏的那条只出占位而不中断整批。
+        try {
+          return renderSubagentElement(result);
+        } catch {
+          return `<subagent item="${escapeXmlAttribute(String(result.spec?.item ?? ""))}" outcome="${escapeXmlAttribute(String(result.outcome))}">member could not be rendered</subagent>`;
+        }
+      })
+      .join("\n");
+    return [header, body, `</${SWARM_RESULT_TAG}>`].filter((line) => line !== "").join("\n");
+  }
+}

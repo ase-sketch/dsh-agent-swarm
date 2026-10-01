@@ -1,60 +1,38 @@
 /**
- * dsh-agent-swarm — 插件集成层（DSH 依赖的唯一文件）
+ * dsh-agent-swarm — 插件入口（宿主集成层）
  *
- * 职责：把 M1 的纯函数层（validate → scheduler → result-xml）接到 DSH runtime 上。
- *   1. 声明插件元信息（name / inject / Config）与 apply(ctx, config)
- *   2. 通过 ctx.tools.register 注册 `agent_swarm` 工具
- *   3. 在 executor 内用 ctx.subagents.start 派发 one-shot 子代理
- *   4. 收齐全部结果后一次性渲染 XML 返回模型
+ * 只做装配：声明插件元信息（name / inject / Config），在 apply 里注册 `agent_swarm` 工具。
+ * 一次工具调用的完整链路是三段，各自一个模块：
  *
- * 本文件是 DSH 侧适配的唯一入口；M1 四个纯函数文件不依赖 DSH，保持可单测。
+ *   batch-plan.ts   规划：六道硬校验 + 宿主策略上限 + 模型路由 + 父 agent/会话 → 批次计划
+ *                   （**所有整体拒绝都发生在这里**，在任何子代理启动、任何批次登记之前）
+ *   batch-run.ts    执行：开批次 → 调度器（scheduler.ts）→ 逐成员 ctx.subagents.start → 收批次
+ *   result-xml.ts   渲染：renderSwarmResultSafely → <agent_swarm_result>（成员状态的唯一权威）
  *
  * 关键契约（docs/spike-dsh-api.md + 0.2.0-rc.2 实装类型双向核对）：
  *   - 命名导出 name / inject / Config / apply，**不写 export default**
  *   - inject 只需要 ["tools", "subagents"]：注册工具 + 派发子代理
- *   - ctx.subagents.start 返回的是 run 句柄，**成功 start 后必须 finally 配对 dispose()**，否则泄漏
- *   - start 请求无 timeout 字段：单任务超时自建 AbortSignal.any([父signal, AbortSignal.timeout])
- *   - stopReason "aborted" 归"取消"而非"限流"
  *   - 不设任何审批字段（spike Q8：无 approvalRule 机制，不调 ctx.approval 即不弹窗）
  */
 
-import Schema from "@deepseek-ai/schemastery";
 import type { Context } from "@deepseek-ai/cordis";
 import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
-// ContentBlock 定义在 @deepseek-ai/dsh-llm（dsh-tools 的依赖）。我们不直接依赖它，
-// 而是从本文件真正产出的那处声明反推结构类型，避免为一次类型注解新增一条依赖。
-type ContentBlock = { type: "text"; text: string };
-// `import type` 仍会把该包的 declare module 增强拉进编译单元：
-// 它给 Context 增补了 `subagents: SubagentRuntime`，也导出 SubagentStartRequest。
-import type { SubagentStartRequest } from "@deepseek-ai/dsh-subagent";
+import type { SwarmPluginConfig } from "./config.js";
+import { planSwarmBatch, type SwarmExecuteArgs } from "./batch-plan.js";
+import { runSwarmBatch } from "./batch-run.js";
+import { renderSwarmResultSafely } from "./result-xml.js";
 import {
-  DEFAULT_SWARM_SCHEDULER_CONFIG,
-  DEFAULT_TASK_TIMEOUT_MS,
-  SWARM_ERROR_CODES,
-  SWARM_MAX_SUBAGENTS,
-  SWARM_MIN_ITEMS,
-  type SwarmAttemptContext,
-  type SwarmAttemptResult,
-  type SwarmModelRoute,
-  type SwarmOutcome,
-  type SwarmRateLimitClass,
-  type SwarmTaskResult,
-  type SwarmTaskSpec,
-  type SwarmValidationError,
-} from "./types.js";
-import { resolveSwarmModelRoute, validateSwarmInput } from "./validate.js";
-import { runSwarm } from "./scheduler.js";
-import {
-  SWARM_RESULT_TAG,
-  escapeXmlAttribute,
-  escapeXmlText,
-  renderSubagentElement,
-  renderSwarmResult,
-} from "./result-xml.js";
+  SWARM_TOOL_NAME,
+  TOOL_OUTPUT,
+  buildToolDescription,
+  buildToolParameters,
+  effectiveMaxItems,
+} from "./tool-spec.js";
 import { SwarmRegistry } from "./swarm-registry.js";
 import { SwarmRemote } from "./remote.js";
 
-// ───────────────────────── 插件元信息 ─────────────────────────
+export { Config } from "./config.js";
+export type { SwarmPluginConfig } from "./config.js";
 
 export const name = "agent-swarm";
 
@@ -64,757 +42,47 @@ export const name = "agent-swarm";
  */
 export const inject = ["tools", "subagents"] as const;
 
-/** 插件配置：provider、调度节奏、单任务超时、items 上限、子代理固定路由。 */
-export const Config = Schema.object({
-  /** 子代理 provider 名（不硬编码调用方，默认官方 spawn 进程内 provider）。 */
-  provider: Schema.string().default("spawn"),
-  /** 首波并发（照上游实测默认 5）。 */
-  firstWave: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.initialLaunchLimit),
-  /** 首波之后每个任务的放量间隔（默认 700ms）。 */
-  releaseIntervalMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.initialLaunchIntervalMs),
-  /** 限流退避基数（默认 3000ms × retryFactor^n）。 */
-  backoffInitialMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.retryBaseMs),
-  /** 限流退避指数因子（默认 2）。 */
-  retryFactor: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.retryFactor),
-  /** 容量收缩防抖间隔（默认 2000ms）。 */
-  shrinkDebounceMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.capacityShrinkDebounceMs),
-  /** 容量恢复检查间隔（默认 180s 恢复 +1）。 */
-  recoverIntervalMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.capacityRecoveryIntervalMs),
-  /**
-   * 单任务超时，默认 {@link DEFAULT_TASK_TIMEOUT_MS}（2h）；<=0 = 不超时。
-   * start() 无 timeout 字段，超时信号由 AbortSignal.timeout 自建。
-   */
-  taskTimeoutMs: Schema.natural().default(DEFAULT_TASK_TIMEOUT_MS),
-  /**
-   * items 数量上限（策略上限）。取 SWARM_MAX_SUBAGENTS 与本项的较小者作为生效值：
-   * 硬校验 128 不可绕过（协议契约），本项只允许宿主把它**调低**，不允许调高。
-   */
-  maxItems: Schema.natural().default(SWARM_MAX_SUBAGENTS),
-  /**
-   * 子代理 LLM 路由（写死，不开 modelSelectionSettings，避免命中会话白名单拒绝）。
-   * 不传 → 子代理自动继承父 agent 的 provider/model/effort/maxTokens。
-   * 传了 → 需要 provider 声明 capabilities.agentOptions。
-   */
-  agentOptions: Schema.object({
-    provider: Schema.string(),
-    model: Schema.string(),
-    reasoningEffort: Schema.string().min(1),
-    maxTokens: Schema.natural().min(1),
-  }), // 不给 .default()：schemastery 的对象属性本就可缺省，缺省即 undefined
-});
-
 /**
- * 父 Agent 的最小结构类型。
- * 直接取自 SubagentStartRequest["parent"]，避免为一个类型注解引入整个 dsh-agent 依赖。
+ * 取得面板数据源 registry：同一 Context 树上已有 swarmRemote 服务就复用它的 registry，
+ * 否则新建 registry 并挂上 SwarmRemote（host 半的 Remote 流服务）。
+ *
+ * 可逆性：SwarmRemote 是 cordis Service，构造即 `ctx.reflect.provide`，
+ * 所属 fiber 卸载时由 cordis 自动注销（cordis Service 构造函数的契约），无需手动清理。
  */
-type SwarmParentAgent = SubagentStartRequest["parent"];
-
-/**
- * 子代理路由覆盖。取自 SubagentStartRequest["agentOptions"] 的元素类型，
- * 保证 config 里存的字符串在 start() 处能被 DSH 的品牌类型接受。
- */
-type SwarmAgentOptions = NonNullable<SubagentStartRequest["agentOptions"]>;
-
-/** 插件配置解析后的形状（Config 已给全部字段默认值，apply 收到的就是完整配置）。 */
-export interface SwarmPluginConfig {
-  provider: string;
-  firstWave: number;
-  releaseIntervalMs: number;
-  backoffInitialMs: number;
-  retryFactor: number;
-  shrinkDebounceMs: number;
-  recoverIntervalMs: number;
-  taskTimeoutMs: number;
-  /** 生效的 items 上限 = min(config.maxItems, SWARM_MAX_SUBAGENTS)。 */
-  maxItems: number;
-  /** 见上方 SwarmAgentOptions：品牌化的路由覆盖，缺省则继承父 agent。 */
-  agentOptions?: SwarmAgentOptions;
-}
-
-// ──────────────────────── 生效上限（描述与校验的唯一口径）────────────────────────
-
-/**
- * 生效的 items 上限 = min(config.maxItems, SWARM_MAX_SUBAGENTS)。
- *
- * 这是全插件**唯一**算上限的地方：工具描述、参数描述与运行时校验全部调它。
- * 集中在一处是本条契约能成立的唯一保证——三处各算一遍，
- * 即便写法一样，下一次改其中一处就会重新分叉出“文案说 10、校验按 128”或反之的偏差。
- *
- * 协议常量 128 是硬上限，宿主只允许调低；调高（如 999）在这里被静默收敛回 128。
- */
-function effectiveMaxItems(config: SwarmPluginConfig): number {
-  return Math.min(config.maxItems, SWARM_MAX_SUBAGENTS);
-}
-
-// ──────────────────────── 工具描述（面向模型，全文自拟）────────────────────────
-
-/**
- * 工具描述：英文、面向模型、全部自拟（clean-room，未复制任何上游原文）。
- * 覆盖四块：用途 / 六道硬校验 / 与单个 subagent 工具的分工 / 禁止嵌套（maxDepth=1）。
- *
- * 文案里的**上界一律取生效上限**（{@link effectiveMaxItems}），不是协议常量 128。
- * 理由：模型是照着这段说明去规划批量的——若宿主把 config.maxItems 调到 10，
- * 描述却仍写 "at most 128"，模型会按 128 去切批，然后被第 11 条以
- * TOO_MANY_SUBAGENTS 拒掉，"描述与运行时校验不符"会变成稳定可复现的浪费。
- * 因此描述在 apply 期按 config 生成（每个插件实例各一份），与校验走同一个上限函数，
- * 不存在"文案一个数、校验另一个数"的可能。
- *
- * 下界仍取 SWARM_MIN_ITEMS（协议常量，宿主不可调）。
- *
- * 协议硬上限的说明始终保留：它解释的是"为什么宿主只能调低"，即便生效上限正好等于
- * 128（宿主未调低）也要写——否则配置作者看不到这条不可绕过的边界。
- */
-function buildToolDescription(effectiveMax: number): string {
-  return [
-    "Dispatch a batch of independent, same-shaped tasks as multiple parallel subagents, and receive every member's result in one aggregated XML report.",
-    "",
-    `Use this when you have N (${String(SWARM_MIN_ITEMS)} to ${String(effectiveMax)}) self-contained subtasks of the same kind that can run in parallel without depending on each other's output — reviewing N files the same way, researching N independent topics, applying one transform to N inputs. Each entry in items is substituted into prompt_template and dispatched as its own subagent; the call returns a single <agent_swarm_result> block listing every member's outcome and output.`,
-    "",
-    "Hard requirements (the call is rejected before any subagent starts if violated):",
-    `1. items must contain at least ${String(SWARM_MIN_ITEMS)} entries.`,
-    `2. items must contain at most ${String(effectiveMax)} entries.`,
-    "3. if you provide items, you must also provide prompt_template.",
-    "4. prompt_template must contain the {{item}} placeholder, which is replaced once per item.",
-    "5. every item must expand to a distinct prompt; items that expand to the same prompt are rejected.",
-    "",
-    `Item-count limit: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} entries and cannot be raised; the host can only lower it, and the effective limit on this deployment is ${String(effectiveMax)}. Plan and split your batch against the number stated in requirement 2 above — submitting more than the effective limit is rejected.`,
-    "",
-    "How to choose between this tool and a single-subagent tool:",
-    "- Use this tool for several independent, same-shaped tasks that benefit from running at the same time.",
-    "- Use a single-subagent tool when the work is one cohesive task, or when a later step depends on an earlier step's result — swarm members cannot see each other or your intermediate work.",
-    "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported (delegation depth is capped at 1); call it from your own turn instead.",
-    "",
-    "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
-    "",
-    "Optional model routing: pass model as \"provider/model\" (or a bare model id that is unique in this deployment's allowed subagent models) to run the whole batch on that route. The route must appear in the deployment's subagent model allowlist — discover candidates with list_subagent_models when that tool is available. Omit model to inherit the calling agent's route (or the plugin's configured fixed route). A rejected model fails the call before any subagent starts.",
-  ].join("\n");
-}
-
-// ───────────────────────── 限流判定（一期：时间与存活率启发式）─────────────────────────
-
-/**
- * 一期限流判定（M3 实机验证前的保守实现）。
- *
- * 为什么不能按错误码判：in-process（spawn）路径下，子代理结果只有 stopReason，
- * **没有** diagnostic / failure.code（见 spike Q6：限流与 429 信息在子代理内部的
- * 重试层被吃掉，父层拿不到稳定信号）。因此"检测 429"在一期写不出来。
- *
- * 一期策略：**不猜**。结果级一律不判限流（返回 false → 终态 failed），
- * 避免把普通错误误当限流把整批拖进无限重排队。
- *
- * ⚠️ 交付态订正（2026-10-01 审查）：恒返回 false 意味着调度器的整条限流分支
- * （退避、容量收缩与恢复、`retrying` 相位、面板退避 UI）**当前完全不触发**。
- * 此处原写「容量收缩/恢复/退避仍然照常工作，只是不由错误码触发」——该表述与代码事实
- * 相反（这些机制的唯一入口就是本判定），已删除。能力状态与启用前置条件见
- * docs/spec.md「交付状态」与 .agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md。
- *
- * **M3 待办（spike R1）**：改用子会话 `llm/retry` 事件，在 failure.code === "RATE_LIMIT"
- * 时于**子代理级**触发退避，而不是在结果级判定。本函数与 {@link classifyRateLimitPhaseOne}
- * 就是那个注入点——调度器通过 SwarmSchedulerDeps 接收二者，实装时替换即可，无需改调度器。
- * 启用前必须先补该子系统的三处缺口（容量无上界、限流模式无退出路径、并发闸门与容量恢复互锁），
- * 否则宿主的 maxConcurrency 一旦被装配即可能让批次停摆。
- */
-function isRateLimitErrorPhaseOne(_error: unknown): boolean {
-  return false;
-}
-
-/** 一期不判限流，此处仅为注入点保留语义（执行层无法区分 → 按"运行中被限流"轻罚）。 */
-function classifyRateLimitPhaseOne(_error: unknown): SwarmRateLimitClass {
-  return "in-flight-limited";
-}
-
-// ───────────────────────── 子代理派发 ─────────────────────────
-
-/**
- * 把 M1 的结构化校验错误包装成可抛出的 Error。
- * 
- * 三个附加字段让调用方（模型 / 日志 / 测试）既能读到人话，也能按 code 做机器判定：
- *   name = "SwarmValidationError"、swarmErrorCode、swarmErrorDetails。
- */
-function swarmValidationError(error: SwarmValidationError): Error {
-  const wrapped = new Error(error.message) as Error & {
-    swarmErrorCode?: string;
-    swarmErrorDetails?: Record<string, unknown>;
-  };
-  wrapped.name = "SwarmValidationError";
-  wrapped.swarmErrorCode = error.code;
-  if (error.details !== undefined) wrapped.swarmErrorDetails = error.details;
-  return wrapped;
+function acquireRegistry(ctx: Context): SwarmRegistry {
+  const existingRemote = ctx.get("swarmRemote") as SwarmRemote | undefined;
+  if (existingRemote) return existingRemote.getRegistry();
+  const registry = new SwarmRegistry();
+  new SwarmRemote(ctx, registry);
+  return registry;
 }
 
 /**
- * 单成员失败。带品牌以免与调度器的"限流判定"混淆：
- * 调度器只对 isRateLimitError 认可的 rejection 做重排队，本错误不是限流。
- */
-class SwarmTaskFailure extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SwarmTaskFailure";
-  }
-}
-
-/** 把子代理的 output 内容块拼成一段纯文本（供 XML body 使用）。 */
-function joinContentBlocks(blocks: readonly { type: string; text?: string }[]): string {
-  return blocks
-    .map((block) => (typeof block.text === "string" ? block.text : ""))
-    .filter((text) => text !== "")
-    .join("\n");
-}
-
-/** 失败详情拼接：stopReason + 可选 diagnostic（in-process 路径通常没有 diagnostic）。 */
-function failureDetail(result: { stopReason: string; diagnostic?: string }): string {
-  return result.diagnostic === undefined
-    ? result.stopReason
-    : `${String(result.stopReason)}; diagnostic: ${String(result.diagnostic)}`;
-}
-
-/**
- * 宿主侧成员终态的归属判定：**批次信号是否已 abort** 是唯一判据。
- *
- * 语义：批次被中断（用户取消 / 上游 abort）时，调度器在 #finishWithAbort 里把所有尚未落定结果的
- * 成员统一判成 aborted，这是 XML 的权威口径；registry 因此必须按同一判据落终态，两个口径才不会
- * 再次分叉。非中断收场（真实失败、单任务超时、子代理自报 aborted）一律 failed。
- *
- * ⚠️ 不要改用 attempt.signal.aborted 判——它"看起来更近"，却是错的：
- *   调度器自己的超时闸门（scheduler.ts #linkAttemptSignals）在超时那一刻执行
- *   attempt.controller.abort(new Error("Subagent timed out."))，而 attempt.controller.signal
- *   正是 executor 拿到的 attempt.signal。也就是说**超时同样会把 attempt.signal 置成 aborted**，
- *   与批次中断在这一位上完全同形；据此判定会把超时成员错记成 aborted，而 XML 侧对超时打的是
- *   failed（调度器把任何 rejection 都落成 #failedResult，"Subagent timed out." 正是它的文案）。
- *   tests/plugin.test.ts 的 WP-C2 ③a 用例就是这条反例的护栏。
- *
- * 两种到达顺序都成立：
- *   ① 先中断、后收场（reject 或优雅 resolve）→ 此刻批次信号已 aborted → aborted，与 XML 一致
- *      （该成员的结果尚未落定，被 #finishWithAbort 覆盖成 aborted）；
- *   ② 先收场、后中断 → 本次判定发生在中断之前，批次信号尚未 aborted → failed；此时调度器已记录
- *      该成员的结果，随后的中断不覆写它（#finishWithAbort 保留已有结果），XML 同样是 failed。
- *
- * 已知边界：判定与调度器真正落定该成员结果之间隔着 runOneTask finally 里的 await run.dispose()。
- * 若中断恰好落进这段窗口，registry 会停在 failed 而 XML 已被 #finishWithAbort 改判 aborted；
- * 彻底闭合需要改调度器/宿主的分工（把落终态推迟到 dispose 之后），不在本次改动范围内。
- */
-function settleOutcomeAfter(batchSignal: AbortSignal | undefined): "aborted" | "failed" {
-  return batchSignal?.aborted === true ? "aborted" : "failed";
-}
-
-/**
- * 内部结局 → registry 成员终态相位的**唯一**映射点。
- *
- * 内部结局的取值域比 registry 的三态宽，来源有两处：
- *   - 调度器 SwarmAbandonedEvent.outcome：`"failed" | "cancelled"`（cancelled = 批次被中断而放弃）；
- *   - 结果级 SwarmOutcome 及子代理自报的 stopReason：`"completed" | "failed" | "aborted"`。
- * registry（swarm-registry.ts 的 SwarmPhase 终态）只有 completed / failed / aborted 三档，
- * 映射表为：completed → completed；failed → failed；aborted 与 cancelled → aborted（同为"中断"档）。
- *
- * 为什么要收敛到一处：这张表原先散在宿主侧的多处字面量里（onAbandoned 的
- * `cancelled ? "aborted" : "failed"`、正常收场分支的 `"completed"`），registry 将来增删相位时
- * 极易漏改其中一处，让面板结论与 XML 结论分叉。
- *
- * 边界：判定"本次收场是否属于中断"的判据仍在 {@link settleOutcomeAfter}（批次信号，本轮不动它），
- * 本函数只负责把已经定下来的结局翻译成 registry 的相位词表。
- */
-function toSettledPhase(outcome: SwarmOutcome | "cancelled"): "completed" | "failed" | "aborted" {
-  if (outcome === "completed") return "completed";
-  if (outcome === "failed") return "failed";
-  return "aborted";
-}
-
-/**
- * 派发**一个**子代理并落成 SwarmAttemptResult。
- *
- * 红线（依赖顺序，缺一不可）：
- *   1. start() **成功后**必须有配对 dispose()（spike Q2.3；start 抛错时无 run 可 dispose）
- *   2. stopReason "aborted" 归取消/超时，绝不当限流（spike Q5）
- *   3. 不向 start 传它不支持的字段（如 timeout；超时自建 AbortSignal.timeout）
- *   4. parent 传 exec.agent，子代理沙箱档位据此自动继承（spike Q9）
- *   5. 成员终态由**批次信号**（batchSignal = exec.signal）归属，不是成员信号 attempt.signal：
- *      调度器的超时闸门同样会 abort attempt.signal，用它会把超时误判成批次中断。见 settleOutcomeAfter。
- *
- * **失败必须用 throw 表达**：调度器把 executor 的「resolve」一律当作 completed
- * （scheduler.ts #runAttempt 无条件写 outcome:"completed"），只有 reject 才落 failed/aborted。
- * 所以这里不返回"失败对象"，而是抛出——否则失败成员会被 XML 谎报成 completed。
- */
-async function runOneTask(
-  ctx: Context,
-  config: SwarmPluginConfig,
-  spec: SwarmTaskSpec,
-  attempt: SwarmAttemptContext,
-  parent: SwarmParentAgent,
-  label: string,
-  /** 本批次的生效路由覆盖（execute 期一次性解析：per-call model > config 固定路由 > 缺省继承）。 */
-  agentOptions: SwarmAgentOptions | undefined,
-  swarmId?: string,
-  registry?: SwarmRegistry,
-  /** 批次级信号（exec.signal）：只判"批次是否被中断"，不判单个成员的信号。 */
-  batchSignal?: AbortSignal,
-): Promise<SwarmAttemptResult> {
-  // 向 provider 发出首个请求前不动；成功 start 之后立刻标记。
-  // 这是区分"首个请求未发出就失败"（重罚）与"运行中失败"（轻罚）的唯一依据（types.ts 契约）。
-  let run;
-  try {
-    if (registry && swarmId) {
-      registry.markStarting(swarmId, spec.index);
-    }
-
-    const timeoutMs = config.taskTimeoutMs;
-    const signal =
-      timeoutMs > 0
-        ? AbortSignal.any([attempt.signal, AbortSignal.timeout(timeoutMs)])
-        : attempt.signal;
-
-    run = await ctx.subagents.start(config.provider, {
-      parent,
-      prompt: [{ type: "text", text: spec.prompt }],
-      label,
-      signal,
-      ...(agentOptions === undefined ? {} : { agentOptions }),
-    });
-  } catch (error) {
-    const detail = `Subagent could not be started: ${error instanceof Error ? error.message : String(error)}`;
-    if (registry && swarmId) {
-      registry.markSettled(swarmId, spec.index, "failed", detail);
-    }
-    throw new SwarmTaskFailure(detail);
-  }
-
-  // start 已成功：从这一刻起 run 存在，**必须**配对 dispose。
-  attempt.setAgentId(run.id);
-  if (registry && swarmId) {
-    registry.setAgentId(swarmId, spec.index, run.id);
-  }
-
-  attempt.markReady();
-  if (registry && swarmId) {
-    registry.markReady(swarmId, spec.index);
-  }
-
-  try {
-    const result = await run.result;
-    if (result.stopReason === "completed") {
-      if (registry && swarmId) {
-        registry.markSettled(swarmId, spec.index, toSettledPhase(result.stopReason));
-      }
-      return { result: joinContentBlocks(result.output), stopReason: result.stopReason };
-    }
-    const detail = failureDetail(result);
-    // 落终态与 catch 用同一条判据（批次信号），不用子代理自报的 stopReason：
-    // 子代理自报 "aborted" 只说明它被取消，不说明**批次**被打断——单任务超时同样会让成员优雅
-    // 收场成 aborted，而 XML 侧对这条路径打的是 failed。详见 settleOutcomeAfter。
-    const outcome = settleOutcomeAfter(batchSignal);
-    if (registry && swarmId) {
-      registry.markSettled(swarmId, spec.index, outcome, detail);
-    }
-    throw new SwarmTaskFailure(detail);
-  } catch (error) {
-    if (registry && swarmId) {
-      // 终态不覆写：上面的相位守卫挡一次，markSettled 内部对已落定成员也是粘性的。
-      const batch = registry.getBatch(swarmId);
-      const member = batch?.members.get(spec.index);
-      if (member && member.phase !== "completed" && member.phase !== "failed" && member.phase !== "aborted") {
-        // 批次被中断 → aborted（与 XML 同结论）；其余（真实失败 / 超时）→ failed。
-        // 判别式为什么必须是批次信号而不是 attempt.signal，见 settleOutcomeAfter 的注释。
-        registry.markSettled(
-          swarmId,
-          spec.index,
-          settleOutcomeAfter(batchSignal),
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    }
-    throw error;
-  } finally {
-    // 幂等 dispose；即使 await run.result 抛错也必须走到这里。
-    await run.dispose();
-  }
-}
-
-// ───────────────────────── 工具注册与 apply ─────────────────────────
-
-/**
- * 扁平参数映射：description / prompt_template / items；required 只写布尔 true。
- *
- * 与 buildToolDescription 同理：items 的上界取**生效上限**而非协议常量 128。
- * 参数描述是模型填参时直接对着的文案，
- * 它说 128 就会让模型往里塞 128 条，因此与工具描述同一标准（同一上限函数）。
- */
-function buildToolParameters(effectiveMax: number) {
-  return {
-    description: {
-      type: "string",
-      required: true,
-      description: "One short sentence describing what this whole batch accomplishes.",
-    },
-    prompt_template: {
-      type: "string",
-      required: true,
-      description:
-        "Prompt template sent to every member, containing the {{item}} placeholder. Each entry of items is substituted for it to form one member's full prompt.",
-    },
-    items: {
-      type: "array",
-      items: { type: "string" },
-      required: true,
-      description: `The independent per-member inputs, at least ${String(SWARM_MIN_ITEMS)} and at most ${String(effectiveMax)} entries. Plan against this number: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} and cannot be raised, so on this deployment the host can only lower the cap, and more than ${String(effectiveMax)} entries is rejected before any subagent starts.`,
-    },
-    model: {
-      type: "string",
-      description:
-        "Optional LLM route for the whole batch: \"provider/model\", or a bare model id unique in this deployment's allowed subagent models. Must appear in the subagent model allowlist (see list_subagent_models). Omit to inherit the calling agent's route (or the plugin's fixed route).",
-    },
-  } as const;
-}
-
-/** 输出契约：{ xml: string }，render 两参（args, value），返回内容块数组。 */
-const TOOL_OUTPUT = {
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    properties: { xml: { type: "string" } },
-  },
-  render: (_args: unknown, value: { xml: string }): ContentBlock[] => [{ type: "text", text: value.xml }],
-} as const;
-
-// ───────────────────────── execute 分段（校验 / 上下文 / 调度装配）─────────────────────────
-
-/** agent_swarm 的入参（与 TOOL_PARAMETERS 的属性一一对应）。 */
-interface SwarmExecuteArgs {
-  description: string;
-  prompt_template: string;
-  items: string[];
-  model?: string;
-}
-
-/**
- * ① 校验 + 展开 + 宿主策略上限。
- *
- * 六道硬校验与宿主策略上限一律在**启动任何子代理之前**完成；两者失败都抛结构化错误
- * （code + 人可读 message + 机器可读 details 全部带出去）。
- * 抛异常即工具失败（spike Q7.4：execute 不返回 isError，失败就是抛）。
- */
-function resolveSwarmSpecs(args: SwarmExecuteArgs, config: SwarmPluginConfig): SwarmTaskSpec[] {
-  const validation = validateSwarmInput({
-    description: args.description,
-    promptTemplate: args.prompt_template,
-    items: args.items,
-  });
-  if (!validation.ok) {
-    throw swarmValidationError(validation.error);
-  }
-  const specs = validation.specs;
-
-  // 宿主策略上限：M1 的 128 硬校验不可绕过，config.maxItems 只能把它调低。
-  // 与六道硬校验同一层（同样结构化报错），同样在启动任何子代理之前拒绝。
-  // 取值走 effectiveMaxItems：与描述同一口径，正是为了防“校验说 10、文案说 128”的分叉。
-  const effectiveMax = effectiveMaxItems(config);
-  if (specs.length > effectiveMax) {
-    throw swarmValidationError({
-      code: SWARM_ERROR_CODES.TOO_MANY_SUBAGENTS,
-      message: `This deployment accepts at most ${String(effectiveMax)} swarm members, got ${String(specs.length)}.`,
-      details: { total: specs.length, max: effectiveMax },
-    });
-  }
-  return specs;
-}
-
-// ───────────────────────── per-call 模型路由（白名单权威）─────────────────────────
-
-/**
- * 宿主子代理模型选择服务的结构形状。
- * 真身是 @deepseek-ai/dsh-tool-subagent/model-selection-settings 注册的
- * `ctx.subagentModelSelection` 服务（设置页「子智能体 → Model selection」的数据源）。
- * 这里只声明消费面，不为一个类型注解新增依赖（与本文件头部 SwarmParentAgent 同一手法）。
- */
-interface SubagentModelSelectionReader {
-  current(): { enabled: boolean; allowedModels: SwarmModelRoute[] };
-}
-
-/**
- * 读取宿主白名单服务；未挂载（或形状不符）返回 undefined。
- *
- * 用 ctx.get 而不是 inject 声明：这是**可选**能力——服务缺失时插件其余功能必须照常工作
- * （只有模型显式传了 model 的那次调用才报 MODEL_SELECTION_UNAVAILABLE），
- * inject 是硬依赖，会把"可选"变成"没它就起不来"。
- */
-function readSubagentModelSelection(ctx: Context): SubagentModelSelectionReader | undefined {
-  const candidate = ctx.get("subagentModelSelection") as unknown;
-  if (
-    typeof candidate === "object" &&
-    candidate !== null &&
-    typeof (candidate as { current?: unknown }).current === "function"
-  ) {
-    return candidate as SubagentModelSelectionReader;
-  }
-  return undefined;
-}
-
-/**
- * 解析本批次的生效路由覆盖。优先级：per-call `model` > config.agentOptions 固定路由 >
- * 缺省（继承父 agent，由 start() 不传 agentOptions 实现）。
- *
- * per-call 路径的权威源是宿主白名单（一事一处：插件不自备第二份允许清单）；
- * 服务未挂载、未开启、或路由不在名单内，一律在任何子代理启动之前抛结构化错误。
- * 服务 current() 自身抛错（白名单配置非法：重复路由等）同样归并到
- * MODEL_SELECTION_UNAVAILABLE——那是"选择机制不可用"，不是"这条路由不被允许"。
- */
-function resolveBatchAgentOptions(
-  args: SwarmExecuteArgs,
-  config: SwarmPluginConfig,
-  ctx: Context,
-): SwarmAgentOptions | undefined {
-  if (args.model === undefined) return config.agentOptions;
-  // 空白串视同未提供（与 validate.ts 的 normalizeOptionalString 同一口径）；
-  // 非字符串等畸形值不放行、不静默忽略，交给匹配器报 MODEL_NOT_ALLOWED。
-  if (typeof args.model === "string" && args.model.trim() === "") return config.agentOptions;
-
-  const service = readSubagentModelSelection(ctx);
-  if (service === undefined) {
-    throw swarmValidationError({
-      code: SWARM_ERROR_CODES.MODEL_SELECTION_UNAVAILABLE,
-      message:
-        "Per-batch model routing requires the host's subagent model selection, which is not available in this composition. Enable it in Settings → 子智能体 → Model selection, or omit the model parameter.",
-    });
-  }
-  let selection: { enabled: boolean; allowedModels: SwarmModelRoute[] };
-  try {
-    selection = service.current();
-  } catch (error) {
-    throw swarmValidationError({
-      code: SWARM_ERROR_CODES.MODEL_SELECTION_UNAVAILABLE,
-      message: `The host's subagent model selection could not be read: ${error instanceof Error ? error.message : String(error)}`,
-    });
-  }
-  if (!selection.enabled) {
-    throw swarmValidationError({
-      code: SWARM_ERROR_CODES.MODEL_SELECTION_UNAVAILABLE,
-      message:
-        "Per-batch model routing is disabled: the host's subagent model selection is off. Enable it in Settings → 子智能体 → Model selection (and maintain the allowlist there), or omit the model parameter.",
-    });
-  }
-  const resolution = resolveSwarmModelRoute(args.model, selection.allowedModels);
-  if (!resolution.ok) {
-    throw swarmValidationError(resolution.error);
-  }
-  return { provider: resolution.route.provider, model: resolution.route.model };
-}
-
-/**
- * 批次路由的展示标签（面板用）。
- * 有覆盖就显示覆盖值；继承时尽力读父 agent 当前请求路由
- * （requestHeader 优先于创建期 options，与 resolveChildAgentOptions 的继承口径一致）；
- * 都读不到返回 undefined，面板对应位置留空而不是猜。
- */
-function describeBatchRoute(
-  agentOptions: SwarmAgentOptions | undefined,
-  parent: SwarmParentAgent,
-): string | undefined {
-  if (agentOptions?.provider !== undefined && agentOptions.model !== undefined) {
-    return `${agentOptions.provider}/${agentOptions.model}`;
-  }
-  const header = (
-    parent as { session?: { requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } }
-  ).session?.requestHeader?.()?.config;
-  const options = (parent as { options?: { provider?: string; model?: string } }).options;
-  const provider = header?.provider ?? options?.provider;
-  const model = header?.model ?? options?.model;
-  return provider !== undefined && model !== undefined ? `${provider}/${model}` : undefined;
-}
-
-/** ② 父 Agent（必填项，缺失即抛——官方包同样写法）与会话标识（用于会话面板隔离）。 */
-function resolveSwarmContext(exec: ToolRunContext): { parent: SwarmParentAgent; sessionId: string } {
-  const parent = exec.agent;
-  if (parent === undefined) {
-    throw new Error("agent_swarm requires a calling agent (exec.agent was undefined)");
-  }
-
-  const sessionId =
-    (parent as { session?: { id?: string } })?.session?.id ??
-    (parent as { sessionId?: string })?.sessionId ??
-    (exec as { session?: { id?: string } })?.session?.id ??
-    "session-default";
-
-  return { parent, sessionId };
-}
-
-/** ③ 一批任务的完整装配输入（runSwarmBatch 的入参）。 */
-interface SwarmBatchRunInput {
-  ctx: Context;
-  config: SwarmPluginConfig;
-  specs: readonly SwarmTaskSpec[];
-  parent: SwarmParentAgent;
-  sessionId: string;
-  description: string;
-  /** 本批次的生效路由覆盖（execute 期已解析完毕）。 */
-  agentOptions: SwarmAgentOptions | undefined;
-  /** 面板展示的批次路由标签；读不到时为 undefined（面板留空不猜）。 */
-  routeLabel: string | undefined;
-  registry: SwarmRegistry;
-  /** 批次级信号（exec.signal）：用户中断级联，同时是成员终态归属的判据（见 settleOutcomeAfter）。 */
-  signal: AbortSignal;
-}
-
-/**
- * ③ 调度装配：开批次 → 接好调度器的依赖与配置 → 跑完一整批 → 无论成败都收批次。
- *
- * beginBatch / endBatch 严格配对：runSwarm 只在 config 非法时 reject，此时 finally 仍然要收批次，
- * 否则会话面板会永远停在 running（成员相位还留在 pending）。
- */
-async function runSwarmBatch(batch: SwarmBatchRunInput): Promise<readonly SwarmTaskResult[]> {
-  const { ctx, config, specs, parent, sessionId, description, agentOptions, routeLabel, registry, signal } = batch;
-  const swarmId = registry.beginBatch(sessionId, description, specs, Date.now(), routeLabel);
-
-  try {
-    // executor 内派发子代理；批次信号 = exec.signal（用户中断级联）。
-    return (await runSwarm(
-      specs,
-      {
-        now: () => Date.now(),
-        setTimeout: (handler, ms) => setTimeout(handler, ms),
-        clearTimeout: (handle) => {
-          clearTimeout(handle as ReturnType<typeof setTimeout>);
-        },
-        signal,
-        isRateLimitError: isRateLimitErrorPhaseOne,
-        classify: classifyRateLimitPhaseOne,
-        onSuspended: (event) => {
-          registry.markSuspended(
-            swarmId,
-            event.spec.index,
-            event.retryCount,
-            event.retryReadyAt,
-            event.reason,
-          );
-        },
-        onAbandoned: (event) => {
-          // 内部结局（failed / cancelled）经唯一映射点落到 registry 三态。
-          registry.markSettled(swarmId, event.spec.index, toSettledPhase(event.outcome), event.error);
-        },
-        executor: {
-          run: (spec, attempt) =>
-            runOneTask(
-              ctx,
-              config,
-              spec,
-              attempt,
-              parent,
-              `${String(spec.index)}/${String(specs.length)}: ${String(spec.item)}`,
-              agentOptions,
-              swarmId,
-              registry,
-              signal,
-            ),
-        },
-      },
-      {
-        initialLaunchLimit: config.firstWave,
-        initialLaunchIntervalMs: config.releaseIntervalMs,
-        retryBaseMs: config.backoffInitialMs,
-        retryFactor: config.retryFactor,
-        capacityShrinkDebounceMs: config.shrinkDebounceMs,
-        capacityRecoveryIntervalMs: config.recoverIntervalMs,
-        // 调度器自己的超时闸门：命中后该成员落 "Subagent timed out." 文案（failed）。
-        // 把它透传给调度器，是为了保留这条可读文案；实际取消仍然由上面 executor 里
-        // 那个 AbortSignal.timeout 完成（调度器只负责标记与文案，不负责杀进程）。
-        timeoutMs: config.taskTimeoutMs,
-      },
-    )) as readonly SwarmTaskResult[];
-  } finally {
-    registry.endBatch(swarmId);
-  }
-}
-
-/**
- * 渲染的兜底：先按降级模式渲染（编号错位不抛错），再兜住**任何**其它渲染期异常。
- *
- * 为什么要有第二层 try/catch（degradeOnIndexMismatch 只挡编号错位一类）：
- * 渲染是这条链路的最后一环，它抛错的代价是**整批**结果消失——包括上百个已经跑完、
- * 已经付费、正文完好的成员。那是本仓最贵的失败模式，且与"不静默吞错"并不冲突：
- * 兜底不是把错误吃掉，而是把错误**变成模型看得见的结果内容**——
- * 逐成员按 item / outcome / 正文降级渲染，并把渲染失败的原文写进 <summary>。
- *
- * 只有二次降级也失败（连单成员渲染都做不出来）时才把错误抛出：那时连"保住结果"
- * 都已不可能，抛错反而是更诚实的信号。
- */
-function renderSwarmResultSafely(results: readonly SwarmTaskResult[]): string {
-  try {
-    return renderSwarmResult(results, { omitNotStarted: false, degradeOnIndexMismatch: true });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const header = [
-      `<${SWARM_RESULT_TAG}>`,
-      `<summary>render failed: ${escapeXmlText(message)}</summary>`,
-    ].join("\n");
-    const body = results
-      .map((result) => {
-        // 单成员同样可能抛（脏数据极端形态），故逐条兜住，坏的那条只出占位而不中断整批。
-        try {
-          return renderSubagentElement(result);
-        } catch {
-          return `<subagent item="${escapeXmlAttribute(String(result.spec?.item ?? ""))}" outcome="${escapeXmlAttribute(String(result.outcome))}">member could not be rendered</subagent>`;
-        }
-      })
-      .join("\n");
-    return [header, body, `</${SWARM_RESULT_TAG}>`].filter((line) => line !== "").join("\n");
-  }
-}
-
-/**
- * 插件入口。只做两件有副作用的事：注册工具、返回它的 disposer。
- *
- * ctx 副作用可逆性：Cordis 会把 apply 返回的函数登记为该 fiber 的 effect，
- * 卸载时自动调用 → ctx.tools.register 的 disposer 随之注销工具。
- * 本文件不注册监听器、不起定时器，故无其他需要清理的副作用。
+ * 插件入口。有副作用的事只有两件：挂 SwarmRemote 服务（见 acquireRegistry）、注册工具。
+ * 两者都可逆：前者随 fiber 卸载由 cordis 注销；后者由返回的 disposer 注销
+ * （Cordis 把 apply 返回的函数登记为该 fiber 的 effect，卸载时自动调用）。
  */
 export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
-  const existingRemote = ctx.get("swarmRemote") as SwarmRemote | undefined;
-  const registry = existingRemote ? existingRemote.getRegistry() : new SwarmRegistry();
-  if (!existingRemote) {
-    new SwarmRemote(ctx, registry);
-  }
+  const registry = acquireRegistry(ctx);
 
   // 描述在 apply 期按**生效上限**生成，不是模块级常量：宿主把 config.maxItems 调低后，
-  // 模型收到的必须与下面 resolveSwarmSpecs 拒绝它时用的是同一个数。
-  const effectiveMax = effectiveMaxItems(config);
+  // 模型收到的必须与 batch-plan 拒绝它时用的是同一个数。
+  const effectiveMax = effectiveMaxItems(config.maxItems);
 
   const agentSwarm = defineTool({
-    name: "agent_swarm",
+    name: SWARM_TOOL_NAME,
     description: buildToolDescription(effectiveMax),
     parameters: buildToolParameters(effectiveMax),
     output: TOOL_OUTPUT,
     // 与官方 subagent 工具一致：允许模型在同一条消息里并发调用多个 agent_swarm。
     isConcurrencySafe: () => true,
     async execute(args: SwarmExecuteArgs, exec: ToolRunContext): Promise<{ xml: string }> {
-      // ① 校验 + 展开 + 宿主策略上限：全部在任何子代理启动之前完成。
-      const specs = resolveSwarmSpecs(args, config);
-
-      // ② 生效路由：per-call model 过宿主白名单；拒绝同样发生在任何子代理启动之前。
-      const agentOptions = resolveBatchAgentOptions(args, config, ctx);
-
-      // ③ 父 Agent 与会话标识：缺父 Agent 即抛（此刻尚未开批次，无需收批次）。
-      const { parent, sessionId } = resolveSwarmContext(exec);
-
-      // ④ 调度：executor 内派发子代理；批次信号 = exec.signal（用户中断级联）。
-      const results = await runSwarmBatch({
-        ctx,
-        config,
-        specs,
-        parent,
-        sessionId,
-        description: args.description,
-        agentOptions,
-        routeLabel: describeBatchRoute(agentOptions, parent),
-        registry,
-        signal: exec.signal,
-      });
-
-      // ⑤ 收齐全部结果后一次性渲染：个别成员失败不拖垮整个工具调用，
-      //    失败与成功在 XML 里如实分列（spike Q7.4 末条）。
-      //
-      //    degradeOnIndexMismatch：编号错位时**不**抛错把整批赔进去，改为按实际顺序降级渲染，
-      //    错位说明写进 <summary>（可见、不静默）。2026-10-01 审查实证：修复前此处无兜底，
-      //    一次错位就让包括已跑完成员正文在内的**全部**结果一起消失。
-      return {
-        xml: renderSwarmResultSafely(results),
-      };
+      // ① 规划：全部整体拒绝都在这里，发生在任何子代理启动之前。
+      const plan = planSwarmBatch(args, config, ctx, exec);
+      // ② 执行：批次信号 = exec.signal（用户中断级联）。个别成员失败不拖垮整次调用。
+      const results = await runSwarmBatch(ctx, config, plan, registry, exec.signal);
+      // ③ 收齐全部结果后一次性渲染；失败与成功在 XML 里如实分列（spike Q7.4 末条）。
+      return { xml: renderSwarmResultSafely(results) };
     },
   });
 
