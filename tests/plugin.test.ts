@@ -31,6 +31,19 @@ interface StartCall {
   request: Record<string, unknown>;
 }
 
+/** 交给自定义 run 工厂的一次 start 调用（index 为 0-based 调用序号）。 */
+interface StartInvocation extends StartCall {
+  index: number;
+}
+
+/** start() 返回的 run 句柄桩（形状对齐 SubagentRun 中本插件用到的字段）。 */
+interface MockRun {
+  id: string;
+  localAgent?: unknown;
+  result: Promise<unknown>;
+  dispose: () => Promise<void>;
+}
+
 interface MockContextOptions {
   /** 每个成员的 stopReason（按调用次序循环取用）。 */
   stopReasons?: string[];
@@ -45,6 +58,13 @@ interface MockContextOptions {
    * 走真实 ctx.provide 注册——插件经 ctx.get 读取，与生产同一条路径。
    */
   modelSelection?: { enabled: boolean; allowedModels: { provider: string; model: string }[] };
+  /**
+   * 完全接管 run 的构造（信号驱动、事件驱动、可控 result 等场景）。
+   * 给了它，stopReasons / failStartAt / rejectResultAt 都不再生效；dispose 计数仍由 harness 统计。
+   */
+  runFactory?: (call: StartInvocation) => Promise<MockRun>;
+  /** ctx.subagents 上 start 之外的桩方法（resolveMaxDepth / getProvider 等）。 */
+  subagents?: Record<string, unknown>;
 }
 
 interface MockHarness {
@@ -89,10 +109,20 @@ function createHarness(options: MockContextOptions = {}): MockHarness {
   Object.defineProperty(ctx, "subagents", {
     configurable: true,
     value: {
+      ...options.subagents,
       start: (provider: string, request: Record<string, unknown>) => {
         const current = callIndex;
         callIndex += 1;
         startCalls.push({ provider, request });
+        if (options.runFactory !== undefined) {
+          return options.runFactory({ provider, request, index: current }).then((run) => ({
+            ...run,
+            dispose: () => {
+              disposeCount += 1;
+              return run.dispose();
+            },
+          }));
+        }
         if (failStartAt.has(current)) {
           return Promise.reject(new Error(`provider "${String(provider)}" refused to start`));
         }
@@ -155,6 +185,26 @@ function defaultConfig(): Parameters<typeof plugin.apply>[1] {
     taskTimeoutMs: 7_200_000,
     maxItems: 128,
   };
+}
+
+/**
+ * run.result 一直挂着，直到成员信号 abort 才按 `onAbort` 收场——这是真实 provider 被取消后的行为
+ * （spike Q5：发布后 abort → settle 为 aborted）。用于观察"成员已在跑、随后被中断/超时"的时序。
+ */
+function settleOnAbort(
+  signal: AbortSignal,
+  onAbort: (resolve: (value: unknown) => void, reject: (reason: unknown) => void) => void,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const settle = (): void => {
+      onAbort(resolve, reject);
+    };
+    if (signal.aborted) {
+      settle();
+      return;
+    }
+    signal.addEventListener("abort", settle, { once: true });
+  });
 }
 
 /** 最小可用的执行上下文。 */
@@ -520,59 +570,33 @@ describe("D. 派发红线", () => {
     // 修复前：无条件 AbortSignal.timeout(0) 会在一个微任务后 abort，
     // 等于把每个成员秒杀成 aborted（配置成"不超时"反而全灭）。
     const controller = new AbortController();
-    const ctx = new Context() as unknown as Context & Record<string, unknown>;
-    let definition: ToolDefinition | undefined;
-    const startCalls: StartCall[] = [];
-    Object.defineProperty(ctx, "tools", {
-      configurable: true,
-      value: { register: (def: ToolDefinition) => void (definition = def) },
-    });
-    Object.defineProperty(ctx, "subagents", {
-      configurable: true,
-      value: {
-        start: (provider: string, request: Record<string, unknown>) => {
-          startCalls.push({ provider, request });
-          const signal = request.signal as AbortSignal;
-          return Promise.resolve({
-            id: `run-${String(startCalls.length)}`,
-            localAgent: undefined,
-            // 挂起直到被 abort，这样断言期间 attempt 仍存活，级联可观测。
-            // 时序本身就是回归证据：若修复前拼了 AbortSignal.timeout(0)，
-            // 每个成员会在一个微任务后被 abort，永远走不到 completed。
-            result: new Promise((resolve) => {
-              const finish = (): void => {
-                resolve({
-                  output: [{ type: "text", text: "ok" }],
-                  stopReason: signal.aborted ? "aborted" : "completed",
-                });
-              };
-              if (signal.aborted) {
-                finish();
-                return;
-              }
-              signal.addEventListener("abort", finish, { once: true });
-            }),
-            dispose: () => Promise.resolve(),
-          });
-        },
+    const harness = createHarness({
+      config: { ...defaultConfig(), taskTimeoutMs: 0 },
+      // 挂起直到被 abort，这样断言期间 attempt 仍存活，级联可观测。
+      // 时序本身就是回归证据：若拼了 AbortSignal.timeout(0)，
+      // 每个成员会在一个微任务后被 abort，永远走不到 completed。
+      runFactory: ({ request, index }) => {
+        const signal = request.signal as AbortSignal;
+        return Promise.resolve({
+          id: `run-${String(index + 1)}`,
+          result: settleOnAbort(signal, (resolve) => {
+            resolve({ output: [{ type: "text", text: "ok" }], stopReason: "aborted" });
+          }),
+          dispose: () => Promise.resolve(),
+        });
       },
     });
-    // taskTimeoutMs = 0 表示"不设单任务超时"
-    plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: 0 });
-    if (definition === undefined) throw new Error("not registered");
-    const pending = definition.execute(validArgs(), makeExec(controller.signal) as never) as Promise<{
+    const pending = harness.definition.execute(validArgs(), makeExec(controller.signal) as never) as Promise<{
       xml: string;
     }>;
 
     // 等所有成员真正派发出去（此时它们仍挂在 signal 上等待）
     await vi.waitFor(() => {
-      expect(startCalls).toHaveLength(3);
+      expect(harness.startCalls).toHaveLength(3);
     });
-    const memberSignal = (startCalls[0] as StartCall).request.signal as AbortSignal;
+    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
 
-    // 关键断言：signal 没有被自动 abort。
-    // 修复前无条件 AbortSignal.timeout(0) 会让信号在一��微任务后变 aborted，
-    // 配置成「不超时」反而把每个成员秒杀——这里就是那道护栏。
+    // 关键断言：signal 没有被自动 abort（配置成「不超时」不能把每个成员秒杀）。
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(memberSignal.aborted).toBe(false);
 
@@ -581,44 +605,26 @@ describe("D. 派发红线", () => {
     expect(memberSignal.aborted).toBe(true);
 
     // 三个成员都落在 aborted 档（批次级中断），而不是 completed。
-    // 这同时说明：它们是被我们**手动**中断的，而不是被一个 0ms 超时秒杀——
-    // 若修复前拼了 AbortSignal.timeout(0)，在 controller.abort() 之前它们早已 aborted。
     const result = await pending;
     expect(result.xml).toContain("<summary>aborted: 3</summary>");
   });
 
   it("回归 F2：taskTimeoutMs 透传给调度器，超时成员落 Subagent timed out. 文案", async () => {
     // 修复前：runSwarm 没接 timeoutMs，调度器永远不会打出这句文案。
-    const ctx = new Context() as unknown as Context & Record<string, unknown>;
-    let definition: ToolDefinition | undefined;
-    Object.defineProperty(ctx, "tools", {
-      configurable: true,
-      value: { register: (def: ToolDefinition) => void (definition = def) },
-    });
-    Object.defineProperty(ctx, "subagents", {
-      configurable: true,
-      value: {
-        start: (_provider: string, request: Record<string, unknown>) =>
-          Promise.resolve({
-            id: "run-timeout",
-            localAgent: undefined,
-            // 只有被 abort 才会 settle：真实 provider 在 signal 触发后返回 aborted。
-            // 修复前这里用永不 settle 的 Promise，会让用例超时而非验证文案。
-            result: new Promise((resolve) => {
-              (request.signal as AbortSignal).addEventListener(
-                "abort",
-                () => resolve({ output: [], stopReason: "aborted" }),
-                { once: true },
-              );
-            }),
-            dispose: () => Promise.resolve(),
+    const harness = createHarness({
+      // 很短的超时，让调度器的闸门先于任何真实完成触发
+      config: { ...defaultConfig(), taskTimeoutMs: 10 },
+      // 只有被 abort 才会 settle：真实 provider 在 signal 触发后返回 aborted。
+      runFactory: ({ request }) =>
+        Promise.resolve({
+          id: "run-timeout",
+          result: settleOnAbort(request.signal as AbortSignal, (resolve) => {
+            resolve({ output: [], stopReason: "aborted" });
           }),
-      },
+          dispose: () => Promise.resolve(),
+        }),
     });
-    // 很短的超时，让调度器的闸门先于任何真实完成触发
-    plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: 10 });
-    if (definition === undefined) throw new Error("not registered");
-    const result = (await definition.execute(validArgs(), makeExec() as never)) as { xml: string };
+    const result = (await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string };
     expect(result.xml).toContain("Subagent timed out.");
     expect(result.xml).toContain('<summary>failed: 3</summary>');
   });
@@ -916,58 +922,30 @@ function createSignalDrivenHarness(options: {
   /** 首个成员不等待信号、立刻因自身原因失败（用于"先失败、后中断"的到达顺序）。 */
   firstFailsImmediately?: boolean;
 }): { ctx: Context; definition: ToolDefinition; memberSignals: AbortSignal[] } {
-  const ctx = new Context() as unknown as Context & Record<string, unknown>;
   const memberSignals: AbortSignal[] = [];
-  let definition: ToolDefinition | undefined;
-
-  Object.defineProperty(ctx, "tools", {
-    configurable: true,
-    value: {
-      register: (def: ToolDefinition) => {
-        definition = def;
-        return () => {
-          definition = undefined;
-        };
-      },
-    },
-  });
-
-  Object.defineProperty(ctx, "subagents", {
-    configurable: true,
-    value: {
-      start: (_provider: string, request: Record<string, unknown>) => {
-        const signal = request.signal as AbortSignal;
-        memberSignals.push(signal);
-        return Promise.resolve({
-          id: "run-" + String(memberSignals.length),
-          localAgent: undefined,
-          result: new Promise((resolve, reject) => {
-            if (options.firstFailsImmediately === true && memberSignals.length === 1) {
-              reject(new Error("member 1 failed on its own before any interrupt"));
-              return;
-            }
-            const settle = (): void => {
+  const harness = createHarness({
+    config: { ...defaultConfig(), taskTimeoutMs: options.taskTimeoutMs },
+    runFactory: ({ request }) => {
+      const signal = request.signal as AbortSignal;
+      memberSignals.push(signal);
+      const result =
+        options.firstFailsImmediately === true && memberSignals.length === 1
+          ? Promise.reject(new Error("member 1 failed on its own before any interrupt"))
+          : settleOnAbort(signal, (resolve, reject) => {
               if (options.settle === "resolve-aborted") {
                 resolve({ output: [], stopReason: "aborted" });
                 return;
               }
               reject(new Error("run.result rejected after the swarm was interrupted"));
-            };
-            if (signal.aborted) {
-              settle();
-              return;
-            }
-            signal.addEventListener("abort", settle, { once: true });
-          }),
-          dispose: () => Promise.resolve(),
-        });
-      },
+            });
+      return Promise.resolve({
+        id: "run-" + String(memberSignals.length),
+        result,
+        dispose: () => Promise.resolve(),
+      });
     },
   });
-
-  plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: options.taskTimeoutMs });
-  if (definition === undefined) throw new Error("apply() did not register a tool");
-  return { ctx, definition, memberSignals };
+  return { ctx: harness.ctx, definition: harness.definition, memberSignals };
 }
 
 describe("G. WP-C2：中断 / 失败 / 超时三类收场的结论一致性", () => {
