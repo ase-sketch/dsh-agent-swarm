@@ -26,6 +26,7 @@ import { ClientSwarmModel } from "./model.js";
 import { ClientSwarmService } from "./service.js";
 import type { RemoteClientFace } from "./service.js";
 import { ensureCssInjected, SwarmHeaderAction } from "./SwarmHeaderAction.js";
+import { SWARM_DICTIONARIES, SWARM_LOCALE_NAMESPACE } from "./locales.js";
 
 /**
  * 父 fiber 的服务依赖。
@@ -88,17 +89,6 @@ export interface SwarmHeaderInjectedProps {
   watchSwarm: (sessionId: string) => () => void;
 }
 
-/** 面板字典（中英双语）。 */
-const DICTIONARIES: Record<string, Record<string, string>> = {
-  zh: {
-    title: "Swarm 智能体队列",
-    empty: "当前会话暂无 Swarm 任务",
-  },
-  en: {
-    title: "Swarm Agent Queue",
-    empty: "No Swarm tasks in current session",
-  },
-};
 
 export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
   // ① 父 fiber：动态挂载专属 Remote 命名空间（swarm）。本 fiber 是它的提供者，
@@ -120,7 +110,7 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
       const service = new ClientSwarmService(panelCtx.remote, model);
 
       panelCtx.effect(
-        () => panelCtx.locale.register("agentSwarm", DICTIONARIES),
+        () => panelCtx.locale.register(SWARM_LOCALE_NAMESPACE, SWARM_DICTIONARIES),
         "agent-swarm: dictionaries",
       );
 
@@ -136,7 +126,8 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
             name: "conversation.session.header.actions",
             id: "agent-swarm",
             order: 30,
-            locale: "agentSwarm",
+            // 声明命名空间后，框架把绑定到它的 `t` 注入给 SwarmHeaderAction（与官方 jobs 面板同一机制）。
+            locale: SWARM_LOCALE_NAMESPACE,
             inject: () => injectedProps,
           },
           SwarmHeaderAction,

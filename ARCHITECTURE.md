@@ -32,9 +32,12 @@ src/
                        —— 提供与消费必须分属两个 fiber，理由见决策笔记 2026-10-01-client-namespace-inject-isolation.md
     model.ts               会话视图（可见批次列表）的内存模型（useSwarm 的订阅源）+ 帧合并纯函数
     service.ts             按会话引用计数订阅 swarm/roster 流
-    SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式；成员按相位四组独立折叠、批次路由标签）
+    SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式；成员按相位四组独立折叠、批次路由标签、多批次切换）；
+                           文案全部经框架注入的 `t`（槽位声明 locale 后由 DSH 注入，同官方 jobs 面板），缺省回落中文
+    locales.ts             面板中英字典（键集合一致）+ `{name}` 插值 + 缺省翻译
 scripts/build-client.mjs   esbuild 预构建：src/client/index.ts → dist/client.js（__ModuleLoader__ 包）
 tests/                     vitest：纯函数单测 + mock Context 契约测试 + 真实 Loader 测试 + client 模型/服务
+                           + 组件渲染测试（client-render.test.tsx，jsdom + @testing-library/react）
 cordis.patch.yml           bundle 层：insert 唯一的 agent-swarm 行（name 自指本包）
 icon.svg                   插件管理页图标
 docs/                      spec.md、code-quality-review 报告、spike 笔记

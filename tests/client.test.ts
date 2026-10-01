@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, it, expect, vi } from "vitest";
 import { ClientSwarmModel, latestBatchOf, mergeRosterFrame } from "../src/client/model.js";
+import { SWARM_DICTIONARIES, fallbackTranslate, interpolate } from "../src/client/locales.js";
 import { ClientSwarmService } from "../src/client/service.js";
 import {
   RetryTicker,
@@ -161,6 +162,21 @@ describe("多批次合并（同一会话并发的几次调用）", () => {
       badgeText: "7/7",
       isLive: false,
     });
+  });
+});
+
+describe("面板字典", () => {
+  it("中英字典键集合完全一致（DSH 的 register 要求每个内置语言给齐全部键）", () => {
+    expect(Object.keys(SWARM_DICTIONARIES.en).sort()).toEqual(Object.keys(SWARM_DICTIONARIES.zh).sort());
+    for (const dict of Object.values(SWARM_DICTIONARIES)) {
+      for (const value of Object.values(dict)) expect(value.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("插值：{name} 占位符替换，未提供的占位符原样保留；缺省翻译为中文", () => {
+    expect(interpolate("{count} 个成员", { count: 3 })).toBe("3 个成员");
+    expect(interpolate("a {x} b {y}", { x: "1" })).toBe("a 1 b {y}");
+    expect(fallbackTranslate("header.route", { route: "p/m" })).toBe("模型: p/m");
   });
 });
 
