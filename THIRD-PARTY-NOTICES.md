@@ -112,7 +112,8 @@
 - **M1 纯函数核心**：`types.ts` / `validate.ts` / `result-xml.ts` / `scheduler.ts`，零 DSH 依赖。
 - **M2 插件集成层**：`index.ts`（具名导出 `name` / `inject` / `Config` / `apply`，无 `export default`）
   + `tests/plugin.test.ts`（mock Context 契约测试 + 真实 Loader 加载路径测试）。
-  插件注册 `agent_swarm` 工具，执行链为 `validate → scheduler → renderSwarmResults → {xml}`。
+  插件注册 `agent_swarm` 工具，执行链为 `batch-plan（validate 等）→ batch-run（scheduler）→ result-xml → {xml}`
+  （2026-10-01 第三轮把原 index.ts 按职责拆分，模块边界见 ARCHITECTURE.md）。
   DSH 侧契约依据 `docs/spike-dsh-api.md`（对 `@deepseek-ai/*` 0.2.0-rc.2 的只读调研）。
 
 ### 已知未覆盖项
@@ -126,8 +127,8 @@
   `types.ts` 中以注释标出扩展点，`validate.ts` 的校验 1 一期无豁免路径。
 - **成员可见性**：one-shot 子代理不进入官方智能体团队面板（`spike-dsh-api.md` Q10），
   一期以工具返回的 XML 作为成员状态的唯一来源；自研 client 面板属 M4。
-- **子代理级路由**：`config.agentOptions` 已接线，但未开启 `modelSelectionSettings`，
-  因此不会命中会话级模型白名单；实际生效路由需 M3 实机确认。
+- **子代理级路由**：`config.agentOptions` 固定路由与 per-call `model`（经宿主 `subagentModelSelection`
+  白名单校验，1.5 期）均已接线；白名单服务在 host bundle 层的可达性与实际生效路由需 M3 实机确认。
 - **取消与失败未分档**：`SwarmOutcome` 只认 `completed` / `failed` / `aborted` 三档，
   单成员被取消时在 XML 中呈现为 `outcome="failed"` + `stop_reason="aborted"`。
   （2026-10-01 复核：单成员 `stopReason=aborted` 时 registry 侧落 aborted、XML 侧落 failed，
