@@ -28,6 +28,11 @@ export function effectiveMaxItems(configuredMaxItems: number): number {
   return Math.min(configuredMaxItems, SWARM_MAX_SUBAGENTS);
 }
 
+/** fork 批次的生效上限 = min(通用生效上限, fork 专属上限)。同样是描述与校验的唯一口径。 */
+export function effectiveMaxForkItems(configuredMaxItems: number, configuredMaxForkItems: number): number {
+  return Math.min(effectiveMaxItems(configuredMaxItems), configuredMaxForkItems);
+}
+
 // ──────────────────────── 工具描述 ────────────────────────
 
 /**
@@ -45,7 +50,7 @@ export function effectiveMaxItems(configuredMaxItems: number): number {
  * 协议硬上限的说明始终保留：它解释的是"为什么宿主只能调低"，即便生效上限正好等于
  * 128（宿主未调低）也要写——否则配置作者看不到这条不可绕过的边界。
  */
-export function buildToolDescription(effectiveMax: number): string {
+export function buildToolDescription(effectiveMax: number, effectiveForkMax: number): string {
   return [
     "Dispatch a batch of independent, same-shaped tasks as multiple parallel subagents, and receive every member's result in one aggregated XML report.",
     "",
@@ -69,13 +74,15 @@ export function buildToolDescription(effectiveMax: number): string {
     "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
     "",
     "Optional model routing: pass model as \"provider/model\" (or a bare model id that is unique in this deployment's allowed subagent models) to run the whole batch on that route. The route must appear in the deployment's subagent model allowlist — discover candidates with list_subagent_models when that tool is available. Omit model to inherit the calling agent's route (or the plugin's configured fixed route). A rejected model fails the call before any subagent starts.",
+    "",
+    `Optional starting context: by default (context "fresh") every member starts from a blank conversation and sees only its own prompt, so the prompt must carry everything it needs. Pass context "fork" when members should build on this conversation: each member then starts with a copy of the conversation's completed turns (your current, in-progress turn is not included). A fork batch accepts at most ${String(effectiveForkMax)} entries because every member carries the whole conversation, and it cannot be combined with model, since forked members stay on the calling agent's route.`,
   ].join("\n");
 }
 
 // ──────────────────────── 参数映射 ────────────────────────
 
 /**
- * 扁平参数映射：description / prompt_template / items / model；required 只写布尔 true。
+ * 扁平参数映射：description / prompt_template / items / model / context；required 只写布尔 true。
  *
  * 与 buildToolDescription 同理：items 的上界取**生效上限**而非协议常量 128。
  * 参数描述是模型填参时直接对着的文案，它说 128 就会让模型往里塞 128 条。
@@ -84,7 +91,7 @@ export function buildToolDescription(effectiveMax: number): string {
  * 以 ToolArgsError 被宿主拒绝），但不支持 minItems/maxItems 这类数量约束——数量仍由
  * validate.ts 的硬校验负责。
  */
-export function buildToolParameters(effectiveMax: number) {
+export function buildToolParameters(effectiveMax: number, effectiveForkMax: number) {
   return {
     description: {
       type: "string",
@@ -107,6 +114,10 @@ export function buildToolParameters(effectiveMax: number) {
       type: "string",
       description:
         "Optional LLM route for the whole batch: \"provider/model\", or a bare model id unique in this deployment's allowed subagent models. Must appear in the subagent model allowlist (see list_subagent_models). Omit to inherit the calling agent's route (or the plugin's fixed route).",
+    },
+    context: {
+      type: "string",
+      description: `Optional starting context for every member: "fresh" (default) starts each member from a blank conversation; "fork" starts each member with a copy of this conversation's completed turns. A fork batch accepts at most ${String(effectiveForkMax)} entries and cannot be combined with model.`,
     },
   } as const;
 }

@@ -22,6 +22,7 @@ import {
   SWARM_MAX_SUBAGENTS,
   SWARM_MIN_ITEMS,
   SWARM_PROMPT_PLACEHOLDER,
+  type SwarmContextMode,
   type SwarmModelRoute,
   type SwarmRequestInput,
   type SwarmTaskSpec,
@@ -341,3 +342,33 @@ export function resolveSwarmModelRoute(
   };
 }
 
+
+// ───────────────────────── 成员起始上下文（纯函数）─────────────────────────
+
+export type SwarmContextModeResolution =
+  | { ok: true; mode: SwarmContextMode }
+  | { ok: false; error: SwarmValidationError };
+
+const CONTEXT_MODES: readonly SwarmContextMode[] = ["fresh", "fork"];
+
+/**
+ * 解析 `context` 参数。缺省或空白 = "fresh"（与 model 参数同一口径：空白串视同未提供）。
+ * 永不抛异常（与 validateSwarmInput 同一立意）。
+ */
+export function resolveSwarmContextMode(requested: unknown): SwarmContextModeResolution {
+  if (requested === undefined || (typeof requested === "string" && requested.trim() === "")) {
+    return { ok: true, mode: "fresh" };
+  }
+  const value = typeof requested === "string" ? requested.trim() : undefined;
+  const mode = CONTEXT_MODES.find((candidate) => candidate === value);
+  if (mode !== undefined) return { ok: true, mode };
+  const received = typeof requested === "string" ? `"${snippetOf(requested)}"` : describeInvalidValue(requested);
+  return {
+    ok: false,
+    error: {
+      code: SWARM_ERROR_CODES.CONTEXT_MODE_INVALID,
+      message: `context must be "fresh" or "fork"; received ${received}.`,
+      details: { received, allowed: [...CONTEXT_MODES] },
+    },
+  };
+}

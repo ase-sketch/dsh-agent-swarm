@@ -278,6 +278,12 @@ describe("A. 插件声明形态", () => {
     expect(resolve({ retryFactor: 1.5 }).retryFactor).toBe(1.5);
   });
 
+  it("fork：provider 默认 \"fork\"、fork 批次上限默认 16（且 >= 1）", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve()).toMatchObject({ forkProvider: "fork", maxForkItems: 16 });
+    expect(() => resolve({ maxForkItems: 0 })).toThrow(/maxForkItems/);
+  });
+
   it("rateLimit：默认关闭，限流码默认 RATE_LIMIT、重排队上限默认 3", () => {
     const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
     expect(resolve().rateLimit).toEqual({ enabled: false, failureCodes: ["RATE_LIMIT"], maxRetries: 3 });
@@ -319,6 +325,7 @@ describe("B. defineTool 注册形态", () => {
       required?: string[];
     };
     expect(Object.keys(parameters.properties).sort()).toEqual([
+      "context",
       "description",
       "items",
       "model",
@@ -1633,5 +1640,78 @@ describe("L. 限流退避接线", () => {
     harness.dispose();
     expect(listeners()).toBe(0);
     expect(() => bus.emit("session/event", { id: "x" }, { type: "turn/end" })).not.toThrow();
+  });
+});
+
+// ───────────────────────── M. 成员起始上下文：fork（DSH 原生 fork provider）─────────────────────────
+
+describe("M. context: \"fork\"", () => {
+  const MOUNTED = { capabilities: { depthLimit: true } };
+
+  function forkHarness(options: { mounted?: boolean; config?: Partial<ReturnType<typeof defaultConfig>> } = {}) {
+    return createHarness({
+      config: { ...defaultConfig(), ...options.config },
+      subagents: {
+        getProvider: (name: string) => (name === "fork" && options.mounted !== false ? MOUNTED : name === "spawn" ? MOUNTED : undefined),
+      },
+    });
+  }
+
+  async function errorOf(harness: MockHarness, args: Record<string, unknown>) {
+    return (await harness.definition.execute(validArgs(args), makeExec() as never).then(
+      () => undefined,
+      (e: unknown) => e,
+    )) as (Error & { swarmErrorCode?: string; swarmErrorDetails?: Record<string, unknown> }) | undefined;
+  }
+
+  it("缺省 context：照旧走 spawn provider（回归）", async () => {
+    const harness = forkHarness();
+    await harness.definition.execute(validArgs(), makeExec() as never);
+    expect(harness.startCalls.map((call) => call.provider)).toEqual(["spawn", "spawn", "spawn"]);
+  });
+
+  it("context \"fork\"：全部成员经 fork provider 派发（以调用方会话已完成的轮次为种子）", async () => {
+    const harness = forkHarness();
+    await harness.definition.execute(validArgs({ context: "fork" }), makeExec() as never);
+    expect(harness.startCalls.map((call) => call.provider)).toEqual(["fork", "fork", "fork"]);
+  });
+
+  it("fork 与 model 互斥：FORK_MODEL_CONFLICT，零派发", async () => {
+    const harness = forkHarness();
+    const error = await errorOf(harness, { context: "fork", model: "p/m" });
+    expect(error?.swarmErrorCode).toBe("FORK_MODEL_CONFLICT");
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("fork provider 未挂载：FORK_UNAVAILABLE，零派发", async () => {
+    const harness = forkHarness({ mounted: false });
+    const error = await errorOf(harness, { context: "fork" });
+    expect(error?.swarmErrorCode).toBe("FORK_UNAVAILABLE");
+    expect(error?.message).toContain("dsh-subagent-fork-in-process");
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("fork 批次单独封顶：超过 maxForkItems 报 TOO_MANY_SUBAGENTS（details 注明 fork），描述写的是同一个数", async () => {
+    const harness = forkHarness({ config: { maxForkItems: 2 } });
+    const error = await errorOf(harness, { context: "fork" });
+    expect(error?.swarmErrorCode).toBe("TOO_MANY_SUBAGENTS");
+    expect(error?.swarmErrorDetails).toEqual({ total: 3, max: 2, context: "fork" });
+    expect(harness.startCalls).toHaveLength(0);
+    expect(harness.definition.description).toContain("A fork batch accepts at most 2 entries");
+    // 非 fork 批次不受 fork 上限约束
+    await harness.definition.execute(validArgs(), makeExec() as never);
+    expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("fork 上限不会超过通用生效上限（maxItems 更小时取 maxItems）", () => {
+    const harness = forkHarness({ config: { maxItems: 4, maxForkItems: 16 } });
+    expect(harness.definition.description).toContain("A fork batch accepts at most 4 entries");
+  });
+
+  it("非法 context：CONTEXT_MODE_INVALID，零派发", async () => {
+    const harness = forkHarness();
+    const error = await errorOf(harness, { context: "share" });
+    expect(error?.swarmErrorCode).toBe("CONTEXT_MODE_INVALID");
+    expect(harness.startCalls).toHaveLength(0);
   });
 });

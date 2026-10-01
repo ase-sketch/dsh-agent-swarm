@@ -15,10 +15,25 @@ import {
   type SwarmSchedulerConfig,
 } from "./types.js";
 
+/** fork 上下文的缺省 provider 名（@deepseek-ai/dsh-subagent-fork-in-process 的缺省 providerName）。 */
+export const DEFAULT_FORK_PROVIDER = "fork";
+/** fork 批次的缺省成员数上限。 */
+export const DEFAULT_MAX_FORK_ITEMS = 16;
+
 /** 插件配置：provider、调度节奏、单任务超时、items 上限、子代理固定路由。 */
 export const Config = Schema.object({
   /** 子代理 provider 名（不硬编码调用方，默认官方 spawn 进程内 provider）。 */
   provider: Schema.string().default("spawn"),
+  /**
+   * `context: "fork"` 时使用的 provider 名（默认官方 fork 进程内 provider：
+   * @deepseek-ai/dsh-subagent-fork-in-process 以 providerName "fork" 注册）。
+   */
+  forkProvider: Schema.string().default(DEFAULT_FORK_PROVIDER),
+  /**
+   * fork 批次的成员数上限（与 maxItems 取较小者）。fork 成员各自复制一份调用方会话的已完成历史，
+   * 成本约等于"成员数 × 父会话历史长度"（同 provider/model 时可复用 KV cache 前缀），因此单独封顶。
+   */
+  maxForkItems: Schema.natural().min(1).default(DEFAULT_MAX_FORK_ITEMS),
   /** 首波并发（照上游实测默认 5）；至少 1——0 会让调度器构造期拒绝，等于每次调用都失败。 */
   firstWave: Schema.natural().min(1).default(DEFAULT_SWARM_SCHEDULER_CONFIG.initialLaunchLimit),
   /** 首波之后每个任务的放量间隔（默认 700ms）。 */
@@ -99,6 +114,10 @@ export function isRateLimitWiringEnabled(config: SwarmPluginConfig): boolean {
 /** 插件配置解析后的形状（Config 已给全部字段默认值，apply 收到的就是完整配置）。 */
 export interface SwarmPluginConfig {
   provider: string;
+  /** fork 上下文使用的 provider 名；缺省 "fork"。 */
+  forkProvider?: string;
+  /** fork 批次成员数上限；缺省 16。 */
+  maxForkItems?: number;
   firstWave: number;
   releaseIntervalMs: number;
   backoffInitialMs: number;

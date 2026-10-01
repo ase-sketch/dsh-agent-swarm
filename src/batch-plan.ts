@@ -12,11 +12,16 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { SubagentStartRequest } from "@deepseek-ai/dsh-subagent";
-import { SWARM_ERROR_CODES, type SwarmModelRoute, type SwarmTaskSpec } from "./types.js";
-import { resolveSwarmModelRoute, validateSwarmInput } from "./validate.js";
+import { SWARM_ERROR_CODES, type SwarmContextMode, type SwarmModelRoute, type SwarmTaskSpec } from "./types.js";
+import { resolveSwarmContextMode, resolveSwarmModelRoute, validateSwarmInput } from "./validate.js";
 import { toThrownSwarmError } from "./swarm-error.js";
-import { effectiveMaxItems } from "./tool-spec.js";
-import type { SwarmAgentOptions, SwarmPluginConfig } from "./config.js";
+import { effectiveMaxForkItems, effectiveMaxItems } from "./tool-spec.js";
+import {
+  DEFAULT_FORK_PROVIDER,
+  DEFAULT_MAX_FORK_ITEMS,
+  type SwarmAgentOptions,
+  type SwarmPluginConfig,
+} from "./config.js";
 
 /**
  * 父 Agent 的最小结构类型。
@@ -30,6 +35,7 @@ export interface SwarmExecuteArgs {
   prompt_template: string;
   items: string[];
   model?: string;
+  context?: string;
 }
 
 /** 一批任务的完整计划：执行阶段只读它，不再回头读入参或配置做判定。 */
@@ -39,6 +45,8 @@ export interface SwarmBatchPlan {
   /** 会话标识（面板按会话隔离）。 */
   sessionId: string;
   description: string;
+  /** 成员的起始上下文（"fork" 时 provider 为 fork provider）。 */
+  contextMode: SwarmContextMode;
   /** 本批次使用的子代理 provider 名。 */
   provider: string;
   /** 本批次的生效路由覆盖：per-call model > config 固定路由 > 缺省继承（undefined）。 */
@@ -51,8 +59,9 @@ export interface SwarmBatchPlan {
 
 /**
  * 规划一批任务。检查顺序即报错优先级：
- *   ① 六道硬校验 + 展开 + 宿主策略上限；② per-call 模型路由（白名单）；
- *   ③ 父 Agent 与会话；④ 委派深度上限（父 agent 的成员是否会超出宿主深度限制）。
+ *   ① 六道硬校验 + 展开 + 宿主策略上限；② 起始上下文（fork 的参数冲突与条数上限）；
+ *   ③ per-call 模型路由（白名单）；④ 父 Agent 与会话；⑤ provider 可用性（fork）；
+ *   ⑥ 委派深度上限（父 agent 的成员是否会超出宿主深度限制）。
  */
 export function planSwarmBatch(
   args: SwarmExecuteArgs,
@@ -61,9 +70,11 @@ export function planSwarmBatch(
   exec: ToolRunContext,
 ): SwarmBatchPlan {
   const specs = resolveSwarmSpecs(args, config);
+  const contextMode = resolveBatchContextMode(args, config, specs.length);
   const agentOptions = resolveBatchAgentOptions(args, config, ctx);
   const { parent, sessionId } = resolveSwarmContext(exec);
-  const provider = config.provider;
+  const provider = contextMode === "fork" ? (config.forkProvider ?? DEFAULT_FORK_PROVIDER) : config.provider;
+  if (contextMode === "fork") assertForkProviderMounted(ctx, provider);
   const maxDepth = resolveMemberMaxDepth(ctx, config, provider);
   assertDelegationDepth(parent, maxDepth);
   return {
@@ -71,6 +82,7 @@ export function planSwarmBatch(
     parent,
     sessionId,
     description: args.description,
+    contextMode,
     provider,
     agentOptions,
     routeLabel: describeBatchRoute(agentOptions, parent),
@@ -108,7 +120,60 @@ function resolveSwarmSpecs(args: SwarmExecuteArgs, config: SwarmPluginConfig): S
   return specs;
 }
 
-// ───────────────────────── ② per-call 模型路由（白名单权威）─────────────────────────
+// ───────────────────────── ② 起始上下文（fork）─────────────────────────
+
+/** 是否显式给了 model（空白串视同未提供，与 resolveBatchAgentOptions 同一口径）。 */
+function hasExplicitModel(args: SwarmExecuteArgs): boolean {
+  return args.model !== undefined && !(typeof args.model === "string" && args.model.trim() === "");
+}
+
+/**
+ * 解析 `context`，并对 fork 做两项整体检查（都在任何子代理启动之前）：
+ *   - 与 per-call model 互斥（FORK_MODEL_CONFLICT）：fork 的价值在于子代理复用父会话的 KV cache 前缀，
+ *     换路由会让继承的历史在新模型上整段重算——DSH 官方 fork 工具同样不开放路由选择；
+ *   - fork 专属条数上限（每个成员都复制一份父会话已完成的历史）。
+ * 插件配置里的固定路由（config.agentOptions）是部署方的决定，fork 时照常生效。
+ */
+function resolveBatchContextMode(
+  args: SwarmExecuteArgs,
+  config: SwarmPluginConfig,
+  memberCount: number,
+): SwarmContextMode {
+  const resolution = resolveSwarmContextMode(args.context);
+  if (!resolution.ok) throw toThrownSwarmError(resolution.error);
+  if (resolution.mode !== "fork") return resolution.mode;
+
+  if (hasExplicitModel(args)) {
+    throw toThrownSwarmError({
+      code: SWARM_ERROR_CODES.FORK_MODEL_CONFLICT,
+      message:
+        "context \"fork\" cannot be combined with model: forked members inherit this conversation and stay on the calling agent's route. Drop model, or use context \"fresh\" to route the batch elsewhere.",
+    });
+  }
+  const forkMax = effectiveMaxForkItems(config.maxItems, config.maxForkItems ?? DEFAULT_MAX_FORK_ITEMS);
+  if (memberCount > forkMax) {
+    throw toThrownSwarmError({
+      code: SWARM_ERROR_CODES.TOO_MANY_SUBAGENTS,
+      message: `A fork batch accepts at most ${String(forkMax)} members because each one carries the whole conversation, got ${String(memberCount)}. Split the batch, or use context "fresh" with self-contained prompts.`,
+      details: { total: memberCount, max: forkMax, context: "fork" },
+    });
+  }
+  return "fork";
+}
+
+/** fork provider 是否挂载；宿主不提供 getProvider 时跳过（交给 start 报错）。 */
+function assertForkProviderMounted(ctx: Context, providerName: string): void {
+  const subagents = ctx.subagents as unknown as { getProvider?(name: string): unknown };
+  if (typeof subagents.getProvider !== "function") return;
+  if (subagents.getProvider(providerName) !== undefined) return;
+  throw toThrownSwarmError({
+    code: SWARM_ERROR_CODES.FORK_UNAVAILABLE,
+    message: `context "fork" needs the "${providerName}" subagent provider, which is not mounted in this composition. Use context "fresh", or mount @deepseek-ai/dsh-subagent-fork-in-process.`,
+    details: { provider: providerName },
+  });
+}
+
+// ───────────────────────── ③ per-call 模型路由（白名单权威）─────────────────────────
 
 /**
  * 宿主子代理模型选择服务的结构形状。
@@ -211,7 +276,7 @@ function describeBatchRoute(
   return provider !== undefined && model !== undefined ? `${provider}/${model}` : undefined;
 }
 
-// ───────────────────────── ④ 委派深度上限 ─────────────────────────
+// ───────────────────────── ⑥ 委派深度上限 ─────────────────────────
 
 /** 本文件真正用到的子代理服务消费面（全部可选：旧宿主可能没有它们）。 */
 interface SubagentDepthFace {
@@ -278,7 +343,7 @@ function assertDelegationDepth(parent: SwarmParentAgent, maxDepth: number | unde
   });
 }
 
-// ───────────────────────── ③ 父 Agent 与会话 ─────────────────────────
+// ───────────────────────── ④ 父 Agent 与会话 ─────────────────────────
 
 /** 父 Agent（必填项，缺失即抛——官方包同样写法）与会话标识（用于会话面板隔离）。 */
 function resolveSwarmContext(exec: ToolRunContext): { parent: SwarmParentAgent; sessionId: string } {

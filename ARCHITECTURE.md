@@ -19,8 +19,9 @@ src/
   remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符
   ── 宿主集成层（依赖 DSH 运行时或其类型）──
   config.ts              插件 Config schema（schemastery）+ 解析后配置形状 + 插件配置→调度器配置的唯一映射
-  batch-plan.ts          批次规划：校验/策略上限/模型路由（读 ctx.subagentModelSelection 白名单）/父 agent 与会话
-                         → 批次计划。**所有整体拒绝都在这里，发生在任何子代理启动与批次登记之前**
+  batch-plan.ts          批次规划：校验/策略上限/起始上下文（fork）/模型路由（读 ctx.subagentModelSelection 白名单）
+                         /父 agent 与会话/provider 可用性/委派深度上限 → 批次计划。
+                         **所有整体拒绝都在这里，发生在任何子代理启动与批次登记之前**
   batch-run.ts           批次执行：开批次 → 装配调度器 → 逐成员 ctx.subagents.start（start/dispose 配对）→ 收批次；
                          限流接线开启时，子代理以 error 收场且被判限流 → 抛品牌错误交给调度器退避重排队
   remote.ts              host 半 Remote 服务：TypertRemoteService 以 stream 暴露 swarm/roster

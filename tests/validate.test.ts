@@ -11,6 +11,7 @@ import {
   ALLOWED_ROUTES_DETAILS_CAP,
   DUPLICATE_SNIPPET_MAX_CHARS,
   expandPromptTemplate,
+  resolveSwarmContextMode,
   resolveSwarmModelRoute,
   validateSwarmInput,
 } from "../src/validate.js";
@@ -582,6 +583,27 @@ describe("resolveSwarmModelRoute", () => {
     if (!r.ok) {
       expect((r.error.details?.allowedRoutes as unknown[]).length).toBe(ALLOWED_ROUTES_DETAILS_CAP);
       expect(r.error.details?.allowedCount).toBe(big.length);
+    }
+  });
+});
+
+describe("resolveSwarmContextMode", () => {
+  it("缺省 / 空白 → fresh；fresh / fork（允许首尾空白）→ 原值", () => {
+    for (const value of [undefined, "", "   "]) {
+      expect(resolveSwarmContextMode(value)).toEqual({ ok: true, mode: "fresh" });
+    }
+    expect(resolveSwarmContextMode("fresh")).toEqual({ ok: true, mode: "fresh" });
+    expect(resolveSwarmContextMode(" fork ")).toEqual({ ok: true, mode: "fork" });
+  });
+
+  it("其它取值一律 CONTEXT_MODE_INVALID，永不抛异常，回显截断", () => {
+    for (const value of ["Fork", "share", 1, null, {}, "x".repeat(10_000)]) {
+      const r = resolveSwarmContextMode(value);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe(SWARM_ERROR_CODES.CONTEXT_MODE_INVALID);
+        expect(r.error.message.length).toBeLessThan(DUPLICATE_SNIPPET_MAX_CHARS * 2);
+      }
     }
   });
 });

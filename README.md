@@ -10,6 +10,8 @@
 - **六道硬校验**：items ≥ 2、总数 ≤ 128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同、item 必须是非空字符串——全部在启动任何子代理之前拒绝
 - **自适应并发调度**：首波 5 并发、之后每 700ms 放一个、限流指数退避、容量收缩防抖与定时恢复、每任务超时（默认 2h 可配）、用户中断级联取消
 - **per-call 模型路由**：可选 `model` 参数按批次指定子代理模型（`provider/model` 或白名单内唯一裸 id），权威源与 DSH 设置页「子智能体 → Model selection」同一份白名单
+- **fork 上下文**：可选 `context: "fork"` 让成员以当前会话已完成的轮次为起点（DSH 原生 fork provider），单独封顶（默认 16）且不与 `model` 同用
+- **委派深度上限**：成员按宿主子代理深度限制（默认 1）派发，成员内再开 swarm 会在派发前被拒
 - **标题栏状态面板**（host/client 双半）：成员按相位四组折叠（进行中/失败/已完成/已取消）、批次路由标签、100ms 合帧 roster 推送
 - **可逆挂载**：以自指 bundle 形态安装后，在 DSH 插件管理页可见、可启停、可卸载
 
@@ -77,6 +79,8 @@ pnpm run build      # 编译 host 半 + 预构建 client 半到 dist/
 - **Six hard validations** (item count bounds, template/placeholder presence, prompt uniqueness, non-empty string items) — all rejected before any subagent starts
 - **Adaptive concurrency scheduling**: first wave of 5, then one every 700 ms, exponential backoff on rate limits, capacity shrink/recovery, per-task timeout (default 2 h, configurable), cascading cancellation on user interrupt
 - **Per-call model routing**: optional `model` parameter selects the subagent route per batch, validated against the same allowlist as DSH Settings → Subagents → Model selection
+- **Fork context**: optional `context: "fork"` starts every member from the conversation's completed turns (DSH's native fork provider); capped separately (16 by default) and not combinable with `model`
+- **Delegation depth limit**: members run under the host's subagent depth limit (1 by default); a nested swarm is rejected before anything starts
 - **Header status panel** (host/client halves): members grouped by phase with independent folding, batch route label, 100 ms coalesced roster streaming
 - **Reversible mounting**: installs as a self-referential bundle — visible, toggleable and uninstallable in the DSH plugin manager
 

@@ -17,7 +17,12 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
-import { isRateLimitWiringEnabled, toSchedulerConfig, type SwarmPluginConfig } from "./config.js";
+import {
+  DEFAULT_MAX_FORK_ITEMS,
+  isRateLimitWiringEnabled,
+  toSchedulerConfig,
+  type SwarmPluginConfig,
+} from "./config.js";
 import { validateSchedulerConfig } from "./scheduler.js";
 import { planSwarmBatch, type SwarmExecuteArgs } from "./batch-plan.js";
 import { runSwarmBatch, type SwarmHost } from "./batch-run.js";
@@ -28,6 +33,7 @@ import {
   TOOL_OUTPUT,
   buildToolDescription,
   buildToolParameters,
+  effectiveMaxForkItems,
   effectiveMaxItems,
 } from "./tool-spec.js";
 import { SwarmRegistry } from "./swarm-registry.js";
@@ -97,11 +103,12 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
   // 描述在 apply 期按**生效上限**生成，不是模块级常量：宿主把 config.maxItems 调低后，
   // 模型收到的必须与 batch-plan 拒绝它时用的是同一个数。
   const effectiveMax = effectiveMaxItems(config.maxItems);
+  const effectiveForkMax = effectiveMaxForkItems(config.maxItems, config.maxForkItems ?? DEFAULT_MAX_FORK_ITEMS);
 
   const agentSwarm = defineTool({
     name: SWARM_TOOL_NAME,
-    description: buildToolDescription(effectiveMax),
-    parameters: buildToolParameters(effectiveMax),
+    description: buildToolDescription(effectiveMax, effectiveForkMax),
+    parameters: buildToolParameters(effectiveMax, effectiveForkMax),
     output: TOOL_OUTPUT,
     // 与官方 subagent 工具一致：允许模型在同一条消息里并发调用多个 agent_swarm。
     isConcurrencySafe: () => true,

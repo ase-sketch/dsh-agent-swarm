@@ -25,6 +25,9 @@
 二期（本仓 backlog，另行 spike）：resume_agent_ids（continuable 续跑）、fork、模式状态机（enter/exit 提示词注入 + 轮末自动退出）、subagent_type 选择、团队面板整合（若自研面板后仍需要）。
 其中 `resume_agent_ids` 的前置条件（结果块需回传 `agent_id`）已于 2026-10-01 修复落地；
 `model`（按批次选模型）已于 2026-10-01 交付（见下「1.5 期」），`subagent_type` 因 DSH 无 agent profile 对应物仍留 backlog。
+**2026-10-01 第三轮**：`fork` 以 DSH 原生 fork provider 交付为可选参数 `context: "fork"`（见 `.agents/notes/implemented/feature/2026-10-01-fork-context.md`；
+与上游语义是否等价**未核实**，需 01-机制文档 的行为描述）；`resume_agent_ids` 订正为「阻塞于 one-shot 不可续跑」，
+改为先 spike（`.agents/notes/proposed/feature/2026-10-01-resume-agent-ids.md`）；模式状态机延后（`.agents/notes/proposed/feature/2026-10-01-swarm-mode-state-machine.md`）。
 
 ## 1.5 期（2026-10-01 交付）：per-call 模型路由 + 面板收纳
 
