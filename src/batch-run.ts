@@ -22,7 +22,6 @@ import type {
   SwarmAttemptContext,
   SwarmAttemptResult,
   SwarmOutcome,
-  SwarmRateLimitClass,
   SwarmTaskResult,
   SwarmTaskSpec,
 } from "./types.js";
@@ -61,17 +60,6 @@ class SwarmRateLimitedFailure extends Error {
 
 function isRateLimitError(error: unknown): boolean {
   return error instanceof SwarmRateLimitedFailure;
-}
-
-/**
- * 限流档位：一律按"运行中被限流"（轻罚）。
- *
- * 理由：DSH 的 start() 成功即意味着子代理已发布并开始首轮，限流只可能发生在子代理自己的请求上；
- * "首个请求还没发出就被限流"（重罚）在 DSH 里没有可观测的对应物——它要求在子代理首个成功步骤之前
- * 就把调度判定为未就绪，而那需要上游机制文档对"ready"的精确定义。保持 types.ts 契约里的安全默认。
- */
-function classifyRateLimit(_error: unknown): SwarmRateLimitClass {
-  return "in-flight-limited";
 }
 
 // ───────────────────────── 成员结局 ─────────────────────────
@@ -311,7 +299,6 @@ export async function runSwarmBatch(
         },
         signal: batchSignal,
         isRateLimitError,
-        classify: classifyRateLimit,
         onSuspended: (event) => {
           registry.markSuspended(swarmId, event.spec.index, event.retryCount, event.retryReadyAt, event.reason);
         },

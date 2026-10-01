@@ -137,23 +137,25 @@ export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
       return () => {
         try {
           disposeSlot?.();
-        } catch {
-          // ignore
+        } catch (error) {
+          // 卸载路径不让异常逃逸（会打断 cordis 的清理链），但必须留痕——不静默吞错。
+          console.warn("[agent-swarm] slot dispose failed during panel unload", error);
         }
       };
     },
   });
 
   return async () => {
+    // 两段各自独立 try：前一段抛错不得跳过后一段的清理；异常就地收下并 warn 留痕。
     try {
       panel.dispose();
-    } catch {
-      // ignore
+    } catch (error) {
+      console.warn("[agent-swarm] panel dispose failed during unload", error);
     }
     try {
       await disposeRemote?.();
-    } catch {
-      // ignore
+    } catch (error) {
+      console.warn("[agent-swarm] remote namespace dispose failed during unload", error);
     }
   };
 }

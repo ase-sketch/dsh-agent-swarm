@@ -202,9 +202,6 @@ export const DEFAULT_SWARM_SCHEDULER_CONFIG: SwarmSchedulerConfig = {
  */
 export const DEFAULT_TASK_TIMEOUT_MS = 7_200_000;
 
-/** 限流惩罚档位建议。执行函数无法区分时返回 `in-flight-limited`（轻罚，安全默认）。 */
-export type SwarmRateLimitClass = "first-request-blocked" | "in-flight-limited";
-
 /** 单次尝试的成功返回。 */
 export interface SwarmAttemptResult {
   /** 子代理最终文本。 */
@@ -220,7 +217,9 @@ export interface SwarmAttemptContext {
   readonly signal: AbortSignal;
   /**
    * 执行函数在「子代理已向 provider 发出首个请求」时调用。
-   * 这是区分「首个请求未发出就被限流」（重罚）与「运行中被限流」（轻罚）的唯一依据。
+   * 语义用途：结果里的 `state`（started/not_started）判定，以及批次中断时对未 ready 成员的
+   * 放弃路径。（2026-10-01 前还参与限流重罚/轻罚分档；重罚档位已因宿主无法观测
+   * 「首个请求未发出」而删除，见 .agents/notes 限流能力状态笔记。）
    */
   markReady(): void;
   /** 记录本次尝试拿到的 agentId（成功或失败都可调用）。 */
@@ -250,8 +249,6 @@ export interface SwarmSchedulerDeps {
   executor: SwarmExecutor;
   /** 限流判定门：true 表示该错误应重排队而非判终态 failed。 */
   isRateLimitError(error: unknown): boolean;
-  /** 限流惩罚档位建议（仅在 isRateLimitError 为 true 时有意义）。 */
-  classify(error: unknown): SwarmRateLimitClass;
   /** 任务被限流挂起（重排队）时的回调。 */
   onSuspended?(event: SwarmSuspendedEvent): void;
   /** 任务被放弃（死锁防护 / 批次取消）时的回调。 */

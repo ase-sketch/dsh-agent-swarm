@@ -718,6 +718,32 @@ describe("client bundle integration", () => {
     }
   });
 
+  it("卸载路径的清理异常不静默吞下：warn 留痕、后续清理照样执行、dispose 不 reject", async () => {
+    const { modExports } = await loadPluginExports();
+    const fake = installFakeDocument();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { dispose, slotDispose, remoteDispose } = await applyPlugin(modExports);
+      slotDispose.mockImplementation(() => {
+        throw new Error("slot boom");
+      });
+      remoteDispose.mockImplementation(() => {
+        throw new Error("remote boom");
+      });
+
+      await dispose(); // 修复前：两处异常无声消失；现在必须各留一条 warn
+
+      const messages = warn.mock.calls.map((call) => String(call[0]));
+      expect(messages.some((m) => m.includes("slot dispose failed"))).toBe(true);
+      expect(messages.some((m) => m.includes("remote namespace dispose failed"))).toBe(true);
+      // 前一段抛错不得跳过后一段清理
+      expect(remoteDispose).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+      fake.restore();
+    }
+  });
+
   it("槽位注入属性引用稳定（不再每次 inject 新建闭包，避免订阅抖动）", async () => {
     const { modExports } = await loadPluginExports();
     const fake = installFakeDocument();

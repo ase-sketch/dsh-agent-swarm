@@ -4,7 +4,6 @@ import { SwarmScheduler, runSwarm, validateSchedulerConfig } from "../src/schedu
 import type {
   SwarmAttemptContext,
   SwarmAttemptResult,
-  SwarmRateLimitClass,
   SwarmSchedulerConfig,
   SwarmSchedulerDeps,
   SwarmTaskSpec,
@@ -43,23 +42,14 @@ interface RunControl {
 interface HarnessOptions extends Partial<SwarmSchedulerDeps> {
   /**
    * 是否自动 markReady（默认 true）。设为 false 后由测试显式 `markReady(index)`，
-   * 用于构造「首个请求尚未发出就被限流」的重罚场景。
+   * 用于构造「成员尚未 ready」的场景（中断放弃路径、ready 与限流节奏的正交性等）。
    */
   autoReady?: boolean;
-  /**
-   * 限流档位判定的返回值（默认 `"first-request-blocked"`）。
-   *
-   * 为什么必须有这个旋钮：重罚/轻罚的判据是
-   * `!attempt.ready && classify() === "first-request-blocked"`，把档位钉死成一个值，
-   * 判据的后半截就永远进不了对照实验——差异会被误读成"ready 与否"造成的，
-   * 而看不出 classify 的返回值同样是判据的一部分（见「重罚 / 轻罚」用例组）。
-   */
-  rateLimitClass?: SwarmRateLimitClass;
 }
 
 /** 手动驾驶的执行器：时钟/定时器/执行函数全部注入，测试完全掌控节奏。 */
 function harness(over: HarnessOptions = {}) {
-  const { autoReady = true, rateLimitClass = "first-request-blocked", ...depsOver } = over;
+  const { autoReady = true, ...depsOver } = over;
   const runs: RunControl[] = [];
 
   const deps: SwarmSchedulerDeps = {
@@ -71,8 +61,6 @@ function harness(over: HarnessOptions = {}) {
       clearTimeout(handle as Parameters<typeof clearTimeout>[0]);
     },
     isRateLimitError: (error: unknown) => error instanceof Error && error.name === "RateLimitError",
-    // 档位可由 rateLimitClass 配置；deps 整体覆盖（...depsOver）仍然优先。
-    classify: () => rateLimitClass,
     executor: {
       run: (spec, ctx) => {
         let resolve!: (r: SwarmAttemptResult) => void;
@@ -584,25 +572,29 @@ describe("容量收缩与恢复", () => {
   });
 });
 
-// ───────────────────────── 重罚 / 轻罚 ─────────────────────────
+// ───────────────────────── 限流节奏（轻罚统一） ─────────────────────────
 
-describe("首个请求未发出的重罚 vs 运行中被限流的轻罚", () => {
-  it("ready 前被限流 → 全局间隔翻倍（6000ms）", async () => {
+describe("限流重排队：一律轻罚，与 ready 与否无关", () => {
+  it("ready 前被限流 → 全局间隔也只推 3000ms（重罚档已删除）", async () => {
+    // 曾有「首个请求未发出 → 全局间隔翻倍」的重罚档，但宿主无法观测该状态
+    //（DSH 的 start() 成功即意味着子代理已开始首轮），生产接线下永不可达，
+    // 2026-10-01 连同 classify 依赖一并删除。本条钉住删除后的行为：
+    // 未 ready 的成员被限流，节奏与已 ready 完全一致。
     const h = harness({ autoReady: false });
     const scheduler = new SwarmScheduler(specsOf(6), h.deps, SLOW);
     const p = scheduler.run();
     await flush(0);
     expect(h.runs[0]?.ready).toBe(false);
 
-    h.rateLimit(1); // 从未 markReady：模拟"连首个请求都没发出去"
+    h.rateLimit(1); // 从未 markReady
     await flush(0);
 
     const snap = scheduler.snapshot();
     expect(snap.rateLimitMode).toBe(true);
     expect(snap.startedSuccessCount).toBe(0);
     expect(snap.rateLimitCapacity).toBe(1); // max(1, 0) - 1 → 下限 1
-    expect(snap.globalRetryIntervalMs).toBe(6000); // 3000 × 2
-    expect(snap.nextRateLimitLaunchAt).toBe(Date.now() + 6000);
+    expect(snap.globalRetryIntervalMs).toBe(3000); // 轻罚：不翻倍
+    expect(snap.nextRateLimitLaunchAt).toBe(Date.now() + 3000);
 
     await drain(h, p);
   });
@@ -623,37 +615,22 @@ describe("首个请求未发出的重罚 vs 运行中被限流的轻罚", () => 
     await drain(h, p);
   });
 
-  it("markReady 后全局间隔复位回 3000ms", async () => {
+  it("限流模式下 markReady 重新锚定放量时刻（now + retryBaseMs）", async () => {
+    // 成员发出首个请求说明 provider 在响应 → 调度器把放量锚点重置到「现在 + 基准间隔」，
+    // 而不是继续沿用限流发生时刻算出的旧锚点。
     const h = harness({ autoReady: false });
     const scheduler = new SwarmScheduler(specsOf(6), h.deps, { initialLaunchLimit: 2, maxConcurrency: 2 });
     const p = scheduler.run();
     await flush(0);
 
-    h.rateLimit(1); // 重罚 → 6000
-    await flush(0);
-    expect(scheduler.snapshot().globalRetryIntervalMs).toBe(6000);
-
-    h.markReady(2); // 2 号发出首个请求 → 复位
-    expect(scheduler.snapshot().globalRetryIntervalMs).toBe(3000);
-
-    await drain(h, p);
-  });
-
-  it("classify 判为 in-flight-limited（轻罚）：ready 前被限流也只用 3000ms", async () => {
-    // 与上一条「ready 前被限流 → 翻倍 6000ms」构成对照实验：输入只差 classify 的返回值，
-    // 于是"翻倍与否由档位判据（ready && classify）共同决定"被真正钉住，
-    // 而不是只验证了 ready 这一半——这正是题面里"轻罚/重罚判据从未被区分过"的补漏。
-    const h = harness({ autoReady: false, rateLimitClass: "in-flight-limited" });
-    const scheduler = new SwarmScheduler(specsOf(6), h.deps, SLOW);
-    const p = scheduler.run();
-    await flush(0);
-    expect(h.runs[0]?.ready).toBe(false);
-
     h.rateLimit(1);
     await flush(0);
-    const snap = scheduler.snapshot();
-    expect(snap.globalRetryIntervalMs).toBe(3000); // 轻罚：不翻倍
-    expect(snap.nextRateLimitLaunchAt).toBe(Date.now() + 3000);
+    expect(scheduler.snapshot().globalRetryIntervalMs).toBe(3000);
+
+    await flush(1000); // 时钟推进，限流时刻算出的旧锚点已成过去时
+    h.markReady(2); // 2 号发出首个请求 → 重新锚定
+    expect(scheduler.snapshot().globalRetryIntervalMs).toBe(3000);
+    expect(scheduler.snapshot().nextRateLimitLaunchAt).toBe(Date.now() + 3000);
 
     await drain(h, p);
   });
@@ -714,27 +691,6 @@ describe("宿主回调抛错不得让调度停摆", () => {
     expect(results[1]?.outcome).toBe("completed");
   });
 
-  it("classify 抛错：按契约里的安全默认（轻罚）继续，告警并进结果文案", async () => {
-    const h = harness({
-      autoReady: false,
-      classify: () => {
-        throw new Error("classify exploded");
-      },
-    });
-    const scheduler = new SwarmScheduler(specsOf(2), h.deps, SLOW);
-    const p = scheduler.run();
-    await flush(0);
-    h.rateLimit(1);
-    await flush(0);
-
-    const snap = scheduler.snapshot();
-    expect(snap.globalRetryIntervalMs).toBe(3000); // 轻罚；若按重罚会翻倍成 6000
-    expect(snap.nextRateLimitLaunchAt).toBe(Date.now() + 3000);
-
-    await drain(h, p);
-    const results = await p;
-    expect(results[0]?.result).toContain("host callback failed: classify exploded");
-  });
 });
 
 // ───────────────────────── 死锁防护 ─────────────────────────

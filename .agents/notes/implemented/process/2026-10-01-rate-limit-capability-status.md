@@ -180,3 +180,43 @@ fake-timer 实测（2026-10-01 代码审查）：
 - 开启前的实机验收（缺一不可）：① 真实触发 429，确认 `turn/end` 的 `reason.error.code` 取值；
   ② 插件级 `session/event` 监听确实收到子会话事件（DSH 只文档化了 agent 作用域监听的过滤语义）；
   ③ 子会话 id 等于 `run.id`；④ 按 429 分布校准 `maxRetries`。
+
+## 2026-10-01 第四轮：删除重罚档位（first-request-blocked）与 classify 依赖（决策演进，并入本笔记）
+
+> 触发：外部评审指出「调度器的重罚机制在生产接线下永久不可达，但带着完整测试与节奏契约
+> 被列为特性」——僵尸子系统。第三轮已在宿主侧一律轻罚，本轮把死掉的另一半从调度器里删掉。
+
+### Decision
+
+1. 删除 `types.ts` 的 `SwarmRateLimitClass` 类型与 `SwarmSchedulerDeps.classify` 依赖；
+   `scheduler.ts` 的 `#requeueRateLimited` 简化为一律轻罚（只推 retryBaseMs），
+   `#classifyRateLimit` 方法删除；`batch-run.ts` 的 `classifyRateLimit` 接线移除。
+2. `markReady` 保留：它的剩余语义（`state` 的 started 判定、中断时对未 ready 成员的放弃路径、
+   限流模式下重新锚定放量时刻）与限流档位无关，注释已改写。
+3. 测试同步：删「classify 对照」「classify 抛错」两条用例；「ready 前限流翻倍 6000ms」改写为
+   钉住删除后行为（一律 3000ms）；harness 的 `rateLimitClass` 旋钮拆除。
+4. `spec.md` 一期清单第 3 条的重罚条目以删除线废弃，交付状态段回写。
+
+### Alternatives considered
+
+- **保留契约、只在文档标注「预留」**：否决。上一轮「保留整条限流实现」的理由是它是上游行为的
+  保真实现且接入方式已调研清楚；重罚档不同——它不是保真，是**超出**上游可观测面的推测性设计，
+  宿主侧永远给不出输入。留着等于继续让测试为永不可达的路径背书。
+- **连同 `globalRetryIntervalMs` 字段一起删掉**：否决（本轮）。删除翻倍分支后该字段恒等于
+  `retryBaseMs`，但它仍是放量间隔的具名载体（snapshot 契约、`#enterRateLimitMode`、
+  markReady 重锚定都在用），拍平它是纯机械重构，与本次「删僵尸」的行为变更分开更安全。
+
+### Consequences
+
+- 收益：调度器不再存在「测试全绿但生产永不可达」的分支；337 条测试（-2 删 +1 客户端新增）
+  每一条都对应可触达行为。
+- 代价：未来若上游暴露了「首个请求未发出」的可观测信号，需要重新加回档位——
+  恢复成本就是 revert 本轮变更，代价明确且低。
+- 行为变化：仅理论可达性——生产接线下 classify 恒返回轻罚，删除前后运行时行为逐字节一致。
+
+### Confirmation
+
+- `pnpm typecheck` exit 0；`pnpm test` 337/337 绿（含改写后的「ready 前限流也只推 3000ms」
+  与「markReady 重新锚定放量时刻」两条钉住删除后语义的用例）。
+- 若未来重新引入档位，验收标准：宿主必须能给出「首个请求未发出」的真实信号来源，
+  否则不得加回。

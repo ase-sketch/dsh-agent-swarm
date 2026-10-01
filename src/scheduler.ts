@@ -10,7 +10,8 @@
  *   退避       第 n 次限流重排队 → retryBaseMs * retryFactor^(n-1)（无抖动）
  *   收缩       每次限流容量 -1，非强制收缩有 capacityShrinkDebounceMs 防抖，下限 1
  *   恢复       距最近一次限流满 capacityRecoveryIntervalMs 后容量 +1
- *   重罚/轻罚  首请求未发出就限流 → 全局间隔翻倍；已发出（ready）→ 只推 retryBaseMs
+ *   轻罚       限流重排队一律只推 retryBaseMs（2026-10-01 起不再有"首请求未发出"的重罚
+ *             翻倍档：宿主无法观测该状态，档位在生产接线下永不可达，已删除）
  *   死锁防护   判死条件是**双重（or）**，两条各自独立成立即判 failed、不再无限重排队：
  *             ① 单成员尾部：只剩它一个未完成 且 它已退避重试过（retryCount>=1）仍限流；
  *             ② per-task 上限：它自己的 retryCount 已达 config.maxRateLimitRetries。
@@ -30,7 +31,7 @@
  *   4. 容量恢复后把 nextRateLimitLaunchAt 拉回 now（与上游一致），
  *      因此"何时重试"是容量、全局节流、退避就绪时间三者共同决定的复合结果——
  *      测试断言退避公式时应以 onSuspended 回传的 retryReadyAt 为准，而不是墙钟时刻。
- *   5. 宿主注入的函数（onSuspended / onAbandoned / classify）抛错不再逃逸：就地收下并
+ *   5. 宿主注入的函数（onSuspended / onAbandoned）抛错不再逃逸：就地收下并
  *      **并进该成员的结果文案**，调度继续跑完整批。上游未描述该情形；但逃逸的代价是整批
  *      静默停摆，且错误从"该成员的结果"里彻底消失（既未处理 rejection、又没落任何文案）。
  *   6. 限流模式下"有 pending 且未结束"时**必然**留下一个未来的唤醒定时器：唤醒候选时刻
@@ -42,7 +43,6 @@ import {
   DEFAULT_SWARM_SCHEDULER_CONFIG,
   type SwarmAttemptContext,
   type SwarmAttemptResult,
-  type SwarmRateLimitClass,
   type SwarmSchedulerConfig,
   type SwarmSchedulerDeps,
   type SwarmState,
@@ -701,15 +701,11 @@ export class SwarmScheduler {
 
     this.#enterRateLimitMode(now);
 
-    const classified = this.#classifyRateLimit(state, outcome.error);
-    if (!attempt.ready && classified === "first-request-blocked") {
-      // 重罚：连首个请求都没发出去 → 全局间隔翻倍
-      this.#globalRetryIntervalMs = Math.max(this.#globalRetryIntervalMs * 2, retryDelay);
-      this.#nextRateLimitLaunchAt = Math.max(this.#nextRateLimitLaunchAt, now + this.#globalRetryIntervalMs);
-    } else {
-      // 轻罚：请求已发出，运行中才被限流 → 只推 retryBaseMs
-      this.#nextRateLimitLaunchAt = Math.max(this.#nextRateLimitLaunchAt, now + this.#config.retryBaseMs);
-    }
+    // 一律轻罚：只推 retryBaseMs。曾有"首个请求未发出 → 全局间隔翻倍"的重罚档，
+    // 但 DSH 的 start() 成功即意味着子代理已开始首轮，该状态没有可观测对应物——
+    // 生产接线下永不可达的档位 + 全套测试 = 僵尸代码，2026-10-01 删除
+    // （决策演进见 .agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md）。
+    this.#nextRateLimitLaunchAt = Math.max(this.#nextRateLimitLaunchAt, now + this.#config.retryBaseMs);
   }
 
   // ───────────────────────── 结果构造 ─────────────────────────
@@ -746,19 +742,6 @@ export class SwarmScheduler {
       call();
     } catch (thrown) {
       state.hostFailures.push(`${this.#describeThrown(thrown)} (from ${source})`);
-    }
-  }
-
-  /**
-   * 取限流档位；`deps.classify` 抛错时按契约里的安全默认继续（轻罚），并记录告警。
-   * 默认值依据 types.ts 的契约说明："执行函数无法区分时返回 in-flight-limited（轻罚，安全默认）"。
-   */
-  #classifyRateLimit(state: TaskState, error: unknown): SwarmRateLimitClass {
-    try {
-      return this.#deps.classify(error);
-    } catch (thrown) {
-      state.hostFailures.push(`${this.#describeThrown(thrown)} (from classify)`);
-      return "in-flight-limited";
     }
   }
 

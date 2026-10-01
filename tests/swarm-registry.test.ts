@@ -378,7 +378,6 @@ describe("中断后 registry 与调度器结论一致", () => {
       },
       signal: controller.signal,
       isRateLimitError: () => false,
-      classify: () => "in-flight-limited",
       onAbandoned: (event) => {
         registry.markSettled(
           swarmId,
