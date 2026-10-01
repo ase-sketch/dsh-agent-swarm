@@ -278,6 +278,15 @@ describe("A. 插件声明形态", () => {
     expect(resolve({ retryFactor: 1.5 }).retryFactor).toBe(1.5);
   });
 
+  it("maxDepth：缺省保持 undefined（跟随宿主设置），接受自然数与 \"provider-managed\"", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve().maxDepth).toBeUndefined();
+    expect(resolve({ maxDepth: 2 }).maxDepth).toBe(2);
+    expect(resolve({ maxDepth: "provider-managed" }).maxDepth).toBe("provider-managed");
+    expect(() => resolve({ maxDepth: -1 })).toThrow(/maxDepth/);
+    expect(() => resolve({ maxDepth: "unbounded" })).toThrow(/maxDepth/);
+  });
+
   it("绕过 schema 传入非法调度配置时，apply 在任何副作用之前 fail-fast", () => {
     const ctx = new Context() as unknown as Context & Record<string, unknown>;
     let registered = false;
@@ -330,8 +339,8 @@ describe("B. defineTool 注册形态", () => {
     expect(description).toMatch(/6\. every item must be a string with at least one non-whitespace character/);
     // 与单个 subagent 工具的分工
     expect(description).toMatch(/single-subagent tool/i);
-    // 禁止嵌套
-    expect(description).toMatch(/depth is capped at 1/i);
+    // 禁止嵌套：描述指向宿主的深度限制（真实生效，见 K 组），不再写死一个代码里不存在的上限
+    expect(description).toMatch(/host's subagent depth limit/i);
     expect(description).toMatch(/[Nn]esting a swarm/);
   });
 
@@ -1399,5 +1408,100 @@ describe("J. per-call 模型路由（白名单权威）", () => {
     await harness.definition.execute(validArgs(), makeExec() as never);
     expect(harness.startCalls.length).toBeGreaterThan(0);
     expect("agentOptions" in (harness.startCalls[0]?.request ?? {})).toBe(false);
+  });
+});
+
+// ───────────────────────── K. 委派深度上限（成员嵌套 swarm 的真实闸门）─────────────────────────
+
+describe("K. 委派深度上限", () => {
+  /** spawn 风格的 provider：声明 depthLimit 能力（DSH spawn provider 的五项能力之一）。 */
+  const DEPTH_CAPABLE = { capabilities: { depthLimit: true } };
+
+  /** 位于指定委派深度的父 agent（口径同 DSH delegationDepthOf：会话头与运行期选项取大）。 */
+  function agentAtDepth(depth: number): Record<string, unknown> {
+    return { id: `agent-depth-${String(depth)}`, session: { id: "session-under-test", header: { delegationDepth: depth } } };
+  }
+
+  function execAs(agent: Record<string, unknown>): Record<string, unknown> {
+    return { callId: "call-depth", name: "agent_swarm", signal: new AbortController().signal, agent };
+  }
+
+  it("顶层调用：start 收到宿主解析出的 maxDepth（此前不传，DSH 因此不做任何深度检查）", async () => {
+    const resolveMaxDepth = vi.fn((configured?: number | "provider-managed") => (configured === undefined ? 1 : configured));
+    const harness = createHarness({ subagents: { resolveMaxDepth, getProvider: () => DEPTH_CAPABLE } });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(0)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    for (const call of harness.startCalls) expect(call.request.maxDepth).toBe(1);
+    // 缺省配置把 undefined 交给宿主解析——跟随设置页的实时取值，而不是插件自带一个默认值。
+    expect(resolveMaxDepth).toHaveBeenCalledWith(undefined);
+  });
+
+  it("成员里再调 agent_swarm（父深度 1、上限 1）：DELEGATION_DEPTH_EXCEEDED，零派发、不登记批次", async () => {
+    const harness = createHarness({
+      subagents: { resolveMaxDepth: () => 1, getProvider: () => DEPTH_CAPABLE },
+    });
+    const error = (await harness.definition
+      .execute(validArgs(), execAs(agentAtDepth(1)) as never)
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error & { swarmErrorCode?: string; swarmErrorDetails?: unknown };
+    expect(error.swarmErrorCode).toBe("DELEGATION_DEPTH_EXCEEDED");
+    expect(error.swarmErrorDetails).toEqual({ parentDepth: 1, memberDepth: 2, maxDepth: 1 });
+    expect(error.message).toMatch(/^\[DELEGATION_DEPTH_EXCEEDED\] /);
+    expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
+  });
+
+  it("运行期选项 subagentDepth 同样计入（取会话头与选项的较大者）", async () => {
+    const harness = createHarness({
+      subagents: { resolveMaxDepth: () => 2, getProvider: () => DEPTH_CAPABLE },
+    });
+    const agent = { ...agentAtDepth(0), options: { subagentDepth: 2 } };
+    await expect(harness.definition.execute(validArgs(), execAs(agent) as never)).rejects.toMatchObject({
+      swarmErrorCode: "DELEGATION_DEPTH_EXCEEDED",
+    });
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("显式上限放宽到 2 时，深度 1 的成员可以再开一层", async () => {
+    const harness = createHarness({
+      config: { ...defaultConfig(), maxDepth: 2 },
+      subagents: { resolveMaxDepth: (c?: number | "provider-managed") => c, getProvider: () => DEPTH_CAPABLE },
+    });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(1)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    expect((harness.startCalls[0] as StartCall).request.maxDepth).toBe(2);
+  });
+
+  it("\"provider-managed\"：不传上限、不做预检（深度由 provider 自管）", async () => {
+    const resolveMaxDepth = vi.fn(() => 1);
+    const harness = createHarness({
+      config: { ...defaultConfig(), maxDepth: "provider-managed" },
+      subagents: { resolveMaxDepth, getProvider: () => DEPTH_CAPABLE },
+    });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(5)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    expect((harness.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
+    expect(resolveMaxDepth).not.toHaveBeenCalled();
+  });
+
+  it("provider 未声明 depthLimit 能力（进程外 provider）：不传 maxDepth，避免 start 整批被拒（不回归）", async () => {
+    const harness = createHarness({
+      subagents: { resolveMaxDepth: () => 1, getProvider: () => ({ capabilities: { depthLimit: false } }) },
+    });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(3)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    expect((harness.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
+  });
+
+  it("旧宿主没有 resolveMaxDepth：显式数值照常透传；未配置则保持旧行为（不传）", async () => {
+    const explicit = createHarness({ config: { ...defaultConfig(), maxDepth: 1 } });
+    await explicit.definition.execute(validArgs(), execAs(agentAtDepth(0)) as never);
+    expect((explicit.startCalls[0] as StartCall).request.maxDepth).toBe(1);
+
+    const legacy = createHarness();
+    await legacy.definition.execute(validArgs(), makeExec() as never);
+    expect((legacy.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
   });
 });

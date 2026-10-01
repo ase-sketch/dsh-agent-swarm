@@ -64,7 +64,7 @@ export function buildToolDescription(effectiveMax: number): string {
     "How to choose between this tool and a single-subagent tool:",
     "- Use this tool for several independent, same-shaped tasks that benefit from running at the same time.",
     "- Use a single-subagent tool when the work is one cohesive task, or when a later step depends on an earlier step's result — swarm members cannot see each other or your intermediate work.",
-    "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported (delegation depth is capped at 1); call it from your own turn instead.",
+    "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported: members run under the host's subagent depth limit (1 by default), and a call that would exceed it is rejected before any subagent starts. Call it from your own turn instead.",
     "",
     "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
     "",

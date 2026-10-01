@@ -130,6 +130,8 @@ interface MemberDispatch {
   parent: SwarmParentAgent;
   /** 本批次的生效路由覆盖（缺省 = 继承父 agent）。 */
   agentOptions: SwarmAgentOptions | undefined;
+  /** 透传给 start 的委派深度上限（undefined = 不传）。 */
+  maxDepth: number | undefined;
   registry: SwarmRegistry;
   swarmId: string;
   /** 批次级信号（exec.signal）：只判"批次是否被中断"，不判单个成员的信号。 */
@@ -182,6 +184,7 @@ async function runMember(
       label: memberLabel(spec, dispatch.total),
       signal: attempt.signal,
       ...(dispatch.agentOptions === undefined ? {} : { agentOptions: dispatch.agentOptions }),
+      ...(dispatch.maxDepth === undefined ? {} : { maxDepth: dispatch.maxDepth }),
     });
   } catch (error) {
     const detail = `Subagent could not be started: ${error instanceof Error ? error.message : String(error)}`;
@@ -241,6 +244,7 @@ export async function runSwarmBatch(
     provider: plan.provider,
     parent: plan.parent,
     agentOptions: plan.agentOptions,
+    maxDepth: plan.maxDepth,
     registry,
     swarmId,
     batchSignal,

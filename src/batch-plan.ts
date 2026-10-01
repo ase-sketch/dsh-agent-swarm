@@ -45,11 +45,14 @@ export interface SwarmBatchPlan {
   agentOptions: SwarmAgentOptions | undefined;
   /** 面板展示的批次路由标签；读不到时为 undefined（面板留空不猜）。 */
   routeLabel: string | undefined;
+  /** 透传给 start() 的委派深度上限；undefined = 不传（provider 自管深度，或宿主无此能力）。 */
+  maxDepth: number | undefined;
 }
 
 /**
  * 规划一批任务。检查顺序即报错优先级：
- *   ① 六道硬校验 + 展开 + 宿主策略上限；② per-call 模型路由（白名单）；③ 父 Agent 与会话。
+ *   ① 六道硬校验 + 展开 + 宿主策略上限；② per-call 模型路由（白名单）；
+ *   ③ 父 Agent 与会话；④ 委派深度上限（父 agent 的成员是否会超出宿主深度限制）。
  */
 export function planSwarmBatch(
   args: SwarmExecuteArgs,
@@ -60,14 +63,18 @@ export function planSwarmBatch(
   const specs = resolveSwarmSpecs(args, config);
   const agentOptions = resolveBatchAgentOptions(args, config, ctx);
   const { parent, sessionId } = resolveSwarmContext(exec);
+  const provider = config.provider;
+  const maxDepth = resolveMemberMaxDepth(ctx, config, provider);
+  assertDelegationDepth(parent, maxDepth);
   return {
     specs,
     parent,
     sessionId,
     description: args.description,
-    provider: config.provider,
+    provider,
     agentOptions,
     routeLabel: describeBatchRoute(agentOptions, parent),
+    maxDepth,
   };
 }
 
@@ -202,6 +209,73 @@ function describeBatchRoute(
   const provider = header?.provider ?? options?.provider;
   const model = header?.model ?? options?.model;
   return provider !== undefined && model !== undefined ? `${provider}/${model}` : undefined;
+}
+
+// ───────────────────────── ④ 委派深度上限 ─────────────────────────
+
+/** 本文件真正用到的子代理服务消费面（全部可选：旧宿主可能没有它们）。 */
+interface SubagentDepthFace {
+  resolveMaxDepth?(configured?: number | "provider-managed"): number | undefined;
+  getProvider?(name: string): { capabilities?: { depthLimit?: boolean } } | undefined;
+}
+
+/**
+ * 成员的委派深度上限（透传给 start 的 `maxDepth`）。
+ *
+ * 为什么必须由本插件透传：DSH 的 `start()` **只在请求带了 maxDepth 时**才校验深度；
+ * 服务配置里的默认值（1）要靠工具自己经 `resolveMaxDepth()` 取出再传（官方 dsh-tool-subagent
+ * 就是这么做的）。此前本插件不传，于是成员的委派深度**没有任何上限**——
+ * 工具描述里"depth is capped at 1"只是一句没有代码支撑的文案。
+ *
+ * 不传（undefined）的三种情形：
+ *   - 配置为 "provider-managed"；
+ *   - 所选 provider 未声明 depthLimit 能力（进程外 provider）：对它传 maxDepth 会被 start 直接拒绝，
+ *     而它的深度本就由 provider 自管——与官方工具的 'provider-managed' 语义一致，避免这类部署回归；
+ *   - 宿主没有 resolveMaxDepth 且配置未给数值（旧宿主，保持旧行为）。
+ */
+function resolveMemberMaxDepth(
+  ctx: Context,
+  config: SwarmPluginConfig,
+  providerName: string,
+): number | undefined {
+  if (config.maxDepth === "provider-managed") return undefined;
+  const subagents = ctx.subagents as unknown as SubagentDepthFace;
+  const provider = typeof subagents.getProvider === "function" ? subagents.getProvider(providerName) : undefined;
+  if (provider !== undefined && provider.capabilities?.depthLimit !== true) return undefined;
+  if (typeof subagents.resolveMaxDepth === "function") return subagents.resolveMaxDepth(config.maxDepth);
+  return config.maxDepth;
+}
+
+/**
+ * 读取父 agent 的委派深度（顶层 agent 为 0）。
+ *
+ * 口径与 DSH `delegationDepthOf` 一致（取持久化会话头与运行期选项的较大者），但刻意**宽松**：
+ * 读不到或形状不符一律按 0 处理。这里只是"开批次之前提前整体拒绝"的快速路径——
+ * 真正的权威检查仍在 DSH 的 start()（因为我们透传了 maxDepth），所以宽松读取最坏只是
+ * 退化成"每个成员各自在 start 处被拒"，不会放过越界的委派。
+ * 不 import DSH 的 delegationDepthOf，是为了不给运行时新增一条宿主包依赖。
+ */
+function delegationDepthOfParent(parent: SwarmParentAgent): number {
+  const probe = parent as {
+    session?: { header?: { delegationDepth?: unknown } };
+    options?: { subagentDepth?: unknown };
+  };
+  const depthOf = (value: unknown): number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  return Math.max(depthOf(probe.session?.header?.delegationDepth), depthOf(probe.options?.subagentDepth));
+}
+
+/** 成员深度 = 父深度 + 1；超出上限即整体拒绝（零派发、不登记批次）。 */
+function assertDelegationDepth(parent: SwarmParentAgent, maxDepth: number | undefined): void {
+  if (maxDepth === undefined) return;
+  const parentDepth = delegationDepthOfParent(parent);
+  const memberDepth = parentDepth + 1;
+  if (memberDepth <= maxDepth) return;
+  throw toThrownSwarmError({
+    code: SWARM_ERROR_CODES.DELEGATION_DEPTH_EXCEEDED,
+    message: `agent_swarm was called at delegation depth ${String(parentDepth)}, so its members would run at depth ${String(memberDepth)}, beyond this host's subagent depth limit of ${String(maxDepth)}. Do the work directly in this turn instead of starting another swarm.`,
+    details: { parentDepth, memberDepth, maxDepth },
+  });
 }
 
 // ───────────────────────── ③ 父 Agent 与会话 ─────────────────────────

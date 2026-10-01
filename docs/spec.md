@@ -56,7 +56,7 @@
 ## 非目标
 
 - 任何 Kimi UI 复刻；不做独立渲染卡片
-- swarm 成员嵌套 swarm（DSH maxDepth 默认 1，工具描述中明示禁止）
+- swarm 成员嵌套 swarm（DSH maxDepth 默认 1）。**2026-10-01 第三轮订正**：此前插件不向 start() 透传 `maxDepth`，而 DSH 只在请求带了它时才校验深度——"禁止嵌套"实际只是一句文案。现由 `batch-plan.ts` 经 `ctx.subagents.resolveMaxDepth()` 取宿主上限透传给每个成员，并在开批次前预检（`DELEGATION_DEPTH_EXCEEDED`，零派发）；Config 新增 `maxDepth`（缺省跟随宿主设置 / 自然数 / `"provider-managed"`）
 - 一期不做跨会话的 swarm 状态持久化
 
 ## 验收

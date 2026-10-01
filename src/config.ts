@@ -43,6 +43,14 @@ export const Config = Schema.object({
    */
   maxItems: Schema.natural().default(SWARM_MAX_SUBAGENTS),
   /**
+   * 成员的委派深度上限（语义与官方 dsh-tool-subagent 的同名配置一致）：
+   *   - 缺省 → 取宿主子代理服务的设置值（`ctx.subagents.resolveMaxDepth()`，DSH 默认 1）；
+   *   - 自然数 → 显式上限；
+   *   - "provider-managed" → 不传上限，由 provider 自己管深度（进程外 provider 的常见形态）。
+   * 不给 .default()：缺省必须保持 undefined，才能跟随宿主设置页的实时取值（Volatile）。
+   */
+  maxDepth: Schema.union([Schema.natural(), Schema.const("provider-managed" as const)]),
+  /**
    * 子代理 LLM 路由（写死，不开 modelSelectionSettings，避免命中会话白名单拒绝）。
    * 不传 → 子代理自动继承父 agent 的 provider/model/effort/maxTokens。
    * 传了 → 需要 provider 声明 capabilities.agentOptions。
@@ -73,6 +81,8 @@ export interface SwarmPluginConfig {
   taskTimeoutMs: number;
   /** 宿主策略上限；生效值 = min(maxItems, SWARM_MAX_SUBAGENTS)，见 tool-spec.ts 的 effectiveMaxItems。 */
   maxItems: number;
+  /** 成员委派深度上限；缺省跟随宿主设置，见 Config.maxDepth。 */
+  maxDepth?: number | "provider-managed";
   /** 见上方 SwarmAgentOptions：品牌化的路由覆盖，缺省则继承父 agent。 */
   agentOptions?: SwarmAgentOptions;
 }

@@ -80,6 +80,12 @@ export const SWARM_ERROR_CODES = {
   MODEL_NOT_ALLOWED: "MODEL_NOT_ALLOWED",
   /** 裸 model id 命中多个 provider 的路由，必须改写成 `provider/model` 精确式。 */
   MODEL_AMBIGUOUS: "MODEL_AMBIGUOUS",
+  /**
+   * 调用方 agent 已处在委派深度上限：它的成员会超出宿主的子代理深度限制（默认 1）。
+   * 典型场景是 swarm 成员自己又调 agent_swarm（嵌套 swarm）。在开批次之前整体拒绝，
+   * 而不是让每个成员各自在 start() 处撞上 DSH 的深度检查。
+   */
+  DELEGATION_DEPTH_EXCEEDED: "DELEGATION_DEPTH_EXCEEDED",
 } as const;
 
 export type SwarmErrorCode = (typeof SWARM_ERROR_CODES)[keyof typeof SWARM_ERROR_CODES];
