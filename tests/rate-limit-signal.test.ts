@@ -88,3 +88,27 @@ describe("RateLimitWatchRouter：按子会话 id 路由事件", () => {
     expect(watch.assess("error").rateLimited).toBe(false);
   });
 });
+
+describe("ChildRunWatch：只看收场那一轮（独立审查回归）", () => {
+  function turnEndCompleted() {
+    return { type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } };
+  }
+  function turnEndErrorNoCode() {
+    return { type: "turn/end", data: { turn: 2, reason: { kind: "error", error: { message: "x" } } } };
+  }
+
+  it("前一轮里已恢复的限流重试，不会把后一轮无关的失败染成限流", () => {
+    const watch = new ChildRunWatch(CONFIG);
+    watch.observe(retry("RATE_LIMIT")); // 第 1 轮：限流后重试成功
+    watch.observe(turnEndCompleted());
+    watch.observe(turnEndErrorNoCode()); // 第 2 轮：无码失败
+    expect(watch.assess("error").rateLimited).toBe(false);
+  });
+
+  it("同一轮内：轮末缺码时取该轮最后一次重试的码", () => {
+    const watch = new ChildRunWatch(CONFIG);
+    watch.observe(retry("RATE_LIMIT"));
+    watch.observe(turnEndErrorNoCode());
+    expect(watch.assess("error")).toMatchObject({ rateLimited: true, failureCode: "RATE_LIMIT" });
+  });
+});

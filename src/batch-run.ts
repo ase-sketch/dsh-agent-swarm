@@ -219,6 +219,8 @@ async function runMember(
   // 子会话 id 即 run.id（spike：in-process driver 以 childId 作为 run.id；待实机验证）。
   const childSessionId = String(run.id);
   const watch = dispatch.rateLimit?.watch(childSessionId);
+  /** 被判为限流时的失败说明；用于 dispose 之后的中断补账（见 finally）。 */
+  let rateLimitedDetail: string | undefined;
   attempt.setAgentId(run.id);
   registry.setAgentId(swarmId, spec.index, run.id);
   attempt.markReady();
@@ -244,7 +246,9 @@ async function runMember(
     // 收场成 aborted，而 XML 侧对这条路径打的是 failed。详见 settleOutcomeAfter。
     throw new SwarmTaskFailure(detail);
   } catch (error) {
-    if (!(error instanceof SwarmRateLimitedFailure)) {
+    if (error instanceof SwarmRateLimitedFailure) {
+      rateLimitedDetail = error.message;
+    } else {
       registry.markSettled(
         swarmId,
         spec.index,
@@ -257,6 +261,13 @@ async function runMember(
     dispatch.rateLimit?.release(childSessionId);
     // 幂等 dispose；即使 await run.result 抛错也必须走到这里。
     await run.dispose();
+    // 限流路径不在 catch 里落终态，指望调度器推进相位；但若批次恰好在 dispose 期间被中断，
+    // 调度器已经收尾、会丢弃这次结局，成员就会永远停在 running（面板徽标常亮）。
+    // abort 只可能由宏任务触发，插不进"finally 结束 → 调度器收到 rejection"之间的微任务，
+    // 所以在这里检查批次信号是可靠的；markSettled 粘性，重复落定无害。
+    if (rateLimitedDetail !== undefined && batchSignal.aborted) {
+      registry.markSettled(swarmId, spec.index, "aborted", rateLimitedDetail);
+    }
   }
 }
 

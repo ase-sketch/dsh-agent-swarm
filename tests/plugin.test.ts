@@ -23,6 +23,7 @@ import {
   SWARM_MIN_ITEMS,
 } from "../src/types.js";
 import type { SwarmBatch, SwarmPhase, SwarmRegistry } from "../src/swarm-registry.js";
+import { RateLimitWatchRouter } from "../src/rate-limit-signal.js";
 
 // ───────────────────────── mock Context ─────────────────────────
 
@@ -1595,10 +1596,19 @@ describe("L. 限流退避接线", () => {
   });
 
   it("开启：被限流拖死的成员交给调度器退避重排队，重试成功后落 completed", async () => {
+    const watchSpy = vi.spyOn(RateLimitWatchRouter.prototype, "watch");
+    const releaseSpy = vi.spyOn(RateLimitWatchRouter.prototype, "release");
     const harness = scriptedHarness({ enabled: true }, (member, attempt) =>
       member === 1 && attempt === 1 ? rateLimitedEnd() : completedEnd,
     );
     const xml = await run(harness);
+    // 每个观察窗都被释放（否则路由表随批次只增不减）
+    expect(watchSpy.mock.calls.map((call) => call[0]).sort()).toEqual(
+      releaseSpy.mock.calls.map((call) => call[0]).sort(),
+    );
+    expect(watchSpy).toHaveBeenCalledTimes(4);
+    watchSpy.mockRestore();
+    releaseSpy.mockRestore();
     expect(xml).toContain("<summary>completed: 3</summary>");
     expect(harness.startCalls).toHaveLength(4); // 成员 1 重派一次
     // 面板：该成员经历过一次限流重试（markSuspended 记录的 retryCount），最终 completed
@@ -1625,6 +1635,63 @@ describe("L. 限流退避接线", () => {
     const xml = await run(harness);
     expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
     expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("默认关闭时根本不订阅 session/event（关闭 = 与接线前逐字节一致）", () => {
+    const harness = scriptedHarness(undefined, () => completedEnd);
+    const hooks = (harness.ctx as unknown as { events: { _hooks: Record<string, unknown[]> } }).events._hooks;
+    expect(hooks["session/event"] ?? []).toHaveLength(0);
+  });
+
+  it("开启：限流成员的 dispose 尚未完成时批次被中断 → 成员落 aborted，不会永远停在 running", async () => {
+    let releaseDispose: (() => void) | undefined;
+    let disposeEntered: (() => void) | undefined;
+    const disposeStarted = new Promise<void>((resolve) => {
+      disposeEntered = resolve;
+    });
+    let ctxRef: Context | undefined;
+    const harness = createHarness({
+      config: { ...defaultConfig(), releaseIntervalMs: 1, backoffInitialMs: 60_000, rateLimit: { enabled: true, failureCodes: ["RATE_LIMIT"], maxRetries: 3 } },
+      runFactory: ({ request, index }) => {
+        const id = `child-${String(index)}`;
+        const limited = String(request.label).startsWith("1/");
+        return Promise.resolve({
+          id,
+          result: limited
+            ? (async () => {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                const bus = ctxRef as unknown as { emit(name: string, ...args: unknown[]): void };
+                for (const event of rateLimitedEnd().events) bus.emit("session/event", { id }, event);
+                return { output: [], stopReason: "error" };
+              })()
+            : settleOnAbort(request.signal as AbortSignal, (resolve) => {
+                resolve({ output: [], stopReason: "aborted" });
+              }),
+          dispose: limited
+            ? () =>
+                new Promise<void>((resolve) => {
+                  releaseDispose = resolve;
+                  disposeEntered?.();
+                })
+            : () => Promise.resolve(),
+        });
+      },
+    });
+    ctxRef = harness.ctx;
+    const controller = new AbortController();
+    const pending = harness.definition.execute(validArgs(), makeExec(controller.signal) as never) as Promise<{
+      xml: string;
+    }>;
+    await disposeStarted; // 限流成员已判定、正卡在 dispose
+    controller.abort();
+    const { xml } = await pending;
+    expect(xml).toContain("<summary>aborted: 3</summary>");
+    releaseDispose?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const batch = latestBatchOf(harness.ctx);
+    // 修复前：调度器已收尾、丢弃了这次限流结局，成员 1 永远停在 running，徽标常亮
+    expect(batch?.members.get(1)?.phase).toBe("aborted");
+    expect(batch?.status).toBe("aborted");
   });
 
   it("开启后 disposer 解除 session/event 订阅（ctx 副作用可逆）", async () => {
@@ -1681,6 +1748,7 @@ describe("M. context: \"fork\"", () => {
     const error = await errorOf(harness, { context: "fork", model: "p/m" });
     expect(error?.swarmErrorCode).toBe("FORK_MODEL_CONFLICT");
     expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined(); // 整体拒绝发生在登记批次之前
   });
 
   it("fork provider 未挂载：FORK_UNAVAILABLE，零派发", async () => {
@@ -1689,6 +1757,7 @@ describe("M. context: \"fork\"", () => {
     expect(error?.swarmErrorCode).toBe("FORK_UNAVAILABLE");
     expect(error?.message).toContain("dsh-subagent-fork-in-process");
     expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
   });
 
   it("fork 批次单独封顶：超过 maxForkItems 报 TOO_MANY_SUBAGENTS（details 注明 fork），描述写的是同一个数", async () => {
@@ -1697,6 +1766,7 @@ describe("M. context: \"fork\"", () => {
     expect(error?.swarmErrorCode).toBe("TOO_MANY_SUBAGENTS");
     expect(error?.swarmErrorDetails).toEqual({ total: 3, max: 2, context: "fork" });
     expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
     expect(harness.definition.description).toContain("A fork batch accepts at most 2 entries");
     // 非 fork 批次不受 fork 上限约束
     await harness.definition.execute(validArgs(), makeExec() as never);
@@ -1713,5 +1783,6 @@ describe("M. context: \"fork\"", () => {
     const error = await errorOf(harness, { context: "share" });
     expect(error?.swarmErrorCode).toBe("CONTEXT_MODE_INVALID");
     expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
   });
 });

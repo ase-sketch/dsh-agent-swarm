@@ -10,7 +10,7 @@
  * 本模块按子会话 id 收集这两类事件，并在子代理以 error 收场时判定"是不是限流把它拖死的"。
  *
  * 判定口径：stopReason === "error" 且最终失败码属于限流码集合（默认 ["RATE_LIMIT"]）；
- * 拿不到最终失败码时，退而看最后一次 llm/retry 的失败码。
+ * 拿不到最终失败码时，退而看**收场那一轮**最后一次 llm/retry 的失败码（不跨轮沿用）。
  *
  * ⚠️ 待实机验证（M3 / spike R1）：失败码的实际取值、事件 data 形状、插件级 `session/event`
  * 监听能否收到子会话事件、子会话 id 是否等于 run.id。因此宿主侧默认**关闭**（config.rateLimit.enabled），
@@ -55,10 +55,12 @@ function stringAt(value: unknown, ...path: string[]): string | undefined {
   return typeof current === "string" ? current : undefined;
 }
 
-/** 单个子代理运行的观察窗：只累计判定所需的三个量。 */
+/** 单个子代理运行的观察窗：只累计判定所需的量。 */
 export class ChildRunWatch {
   private retryCount = 0;
-  private lastRetryCode: string | undefined;
+  /** **当前轮**最后一次重试的失败码；每到 turn/end 清空，绝不跨轮沿用。 */
+  private turnRetryCode: string | undefined;
+  /** 最近一次轮末的失败码（该轮以 error 收场时）；轮末缺码时取该轮最后一次重试的码。 */
   private finalFailureCode: string | undefined;
 
   constructor(private readonly config: RateLimitSignalConfig) {}
@@ -66,17 +68,23 @@ export class ChildRunWatch {
   observe(event: ChildSessionEventLike): void {
     if (event.type === "llm/retry") {
       const code = stringAt(event.data, "failure", "code");
-      this.lastRetryCode = code;
+      this.turnRetryCode = code;
       if (code !== undefined && this.config.failureCodes.includes(code)) this.retryCount += 1;
       return;
     }
-    if (event.type === "turn/end" && stringAt(event.data, "reason", "kind") === "error") {
-      this.finalFailureCode = stringAt(event.data, "reason", "error", "code");
+    if (event.type === "turn/end") {
+      // 只看**收场那一轮**：前面某轮里已经恢复了的限流重试，不能把后面一轮无关的失败染成"限流"。
+      this.finalFailureCode =
+        stringAt(event.data, "reason", "kind") === "error"
+          ? (stringAt(event.data, "reason", "error", "code") ?? this.turnRetryCode)
+          : undefined;
+      this.turnRetryCode = undefined;
     }
   }
 
   assess(stopReason: string): RateLimitAssessment {
-    const failureCode = this.finalFailureCode ?? this.lastRetryCode;
+    // 没有收到轮末事件（例如宿主没送达）时，退而看当前轮最后一次重试的码。
+    const failureCode = this.finalFailureCode ?? this.turnRetryCode;
     return {
       rateLimited:
         stopReason === "error" && failureCode !== undefined && this.config.failureCodes.includes(failureCode),
