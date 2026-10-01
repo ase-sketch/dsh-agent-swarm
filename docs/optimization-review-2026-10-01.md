@@ -135,4 +135,11 @@
 1 条（中断时 batch.status 早于成员落定）属既有问题，一并以「收尾后重算」修复。所有新增护栏用例均做过变异验证（撤回修复即变红）。
 
 **行为快照对比（基线 → 最终）**：9 个执行场景的 XML 逐字节一致；12 个校验/路由错误场景的错误码全部不变、仅 message 增加 `[CODE]` 与 Details；
-start 请求仅 label 折叠空白；工具描述与参数为有意的文案变更（第六道校验、深度上限、fork、context 参数）。
+start 请求仅 label 变化：item 部分折叠空白并截断到 80 码元（`MEMBER_LABEL_ITEM_MAX_CHARS`，截断点不劈开代理对）——
+快照场景的 item 都短于 80，所以快照里只体现为折叠空白（PR #1 评审第 2 条订正：原句只写了折叠空白，漏了截断）；
+工具描述与参数为有意的文案变更（第六道校验、深度上限、fork、context 参数）。
+
+**PR #1 第一轮评审（维护者）**：两条均已修复——
+① [中] 多处 `.slice()` 截断可劈开 UTF-16 代理对、Details JSON 截断可切碎转义序列 → 新增纯函数 `src/text-clip.ts` 作为全仓唯一截断出口，
+四处使用点（swarm-error / validate / batch-run label / swarm-registry 视图）全部改用，另补面板 agentId 一处（`edf3fb3`，测试 327 → 338）；
+② [低] 本节上一段的口径订正（本笔）。
