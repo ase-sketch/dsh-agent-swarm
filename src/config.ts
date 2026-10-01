@@ -32,8 +32,9 @@ export const Config = Schema.object({
   /** 容量恢复检查间隔（默认 180s 恢复 +1）。 */
   recoverIntervalMs: Schema.natural().default(DEFAULT_SWARM_SCHEDULER_CONFIG.capacityRecoveryIntervalMs),
   /**
-   * 单任务超时，默认 {@link DEFAULT_TASK_TIMEOUT_MS}（2h）；<=0 = 不超时。
-   * start() 无 timeout 字段，超时信号由 AbortSignal.timeout 自建。
+   * 单任务超时，默认 {@link DEFAULT_TASK_TIMEOUT_MS}（2h）；0 = 不超时（schema 不接受负数）。
+   * start() 无 timeout 字段：由调度器的超时闸门在到点时 abort 成员信号（即传给 start 的 signal），
+   * 同一闸门同时落 "Subagent timed out." 文案——取消与文案单一来源。
    */
   taskTimeoutMs: Schema.natural().default(DEFAULT_TASK_TIMEOUT_MS),
   /**
@@ -79,7 +80,8 @@ export interface SwarmPluginConfig {
 /**
  * 插件配置 → 调度器配置的**唯一**映射点（字段改名都在这里对齐，不在调用处散落）。
  *
- * timeoutMs：调度器自己的超时闸门。命中后该成员落 "Subagent timed out." 文案（failed）。
+ * timeoutMs：调度器自己的超时闸门。它是单任务超时的**唯一**来源：到点 abort 成员信号
+ * （子代理据此被取消），并让该成员落 "Subagent timed out." 文案（failed）。
  */
 export function toSchedulerConfig(config: SwarmPluginConfig): Partial<SwarmSchedulerConfig> {
   return {

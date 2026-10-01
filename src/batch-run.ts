@@ -7,7 +7,7 @@
  * 不变量（缺一不可）：
  *   1. start() **成功后**必须有配对 dispose()（spike Q2.3；start 抛错时无 run 可 dispose）
  *   2. stopReason "aborted" 归取消/超时，绝不当限流（spike Q5）
- *   3. 不向 start 传它不支持的字段（如 timeout）
+ *   3. 不向 start 传它不支持的字段（如 timeout）；单任务超时由调度器的超时闸门 abort 成员信号实现
  *   4. parent 传 exec.agent，子代理沙箱档位据此自动继承（spike Q9）
  *   5. 成员终态由**批次信号**归属，不是成员信号（见 settleOutcomeAfter）
  *   6. **失败必须用 throw 表达**：调度器把 executor 的 resolve 一律当作 completed
@@ -130,7 +130,6 @@ interface MemberDispatch {
   parent: SwarmParentAgent;
   /** 本批次的生效路由覆盖（缺省 = 继承父 agent）。 */
   agentOptions: SwarmAgentOptions | undefined;
-  taskTimeoutMs: number;
   registry: SwarmRegistry;
   swarmId: string;
   /** 批次级信号（exec.signal）：只判"批次是否被中断"，不判单个成员的信号。 */
@@ -173,17 +172,15 @@ async function runMember(
   try {
     registry.markStarting(swarmId, spec.index);
 
-    const timeoutMs = dispatch.taskTimeoutMs;
-    const signal =
-      timeoutMs > 0
-        ? AbortSignal.any([attempt.signal, AbortSignal.timeout(timeoutMs)])
-        : attempt.signal;
-
+    // 成员信号就是调度器的 attempt.signal：它同时承载批次中断（exec.signal 级联）与单任务超时
+    // （调度器 #linkAttemptSignals 的超时闸门以 "Subagent timed out." 为原因 abort 它）。
+    // 这里**不再**另拼 AbortSignal.timeout：两个同时长计时器会竞速，超时文案的确定性
+    // 只能靠"恰好谁先创建"；单一来源后，超时的取消与文案出自同一个闸门。
     run = await ctx.subagents.start(dispatch.provider, {
       parent: dispatch.parent,
       prompt: [{ type: "text", text: spec.prompt }],
       label: memberLabel(spec, dispatch.total),
-      signal,
+      signal: attempt.signal,
       ...(dispatch.agentOptions === undefined ? {} : { agentOptions: dispatch.agentOptions }),
     });
   } catch (error) {
@@ -244,7 +241,6 @@ export async function runSwarmBatch(
     provider: plan.provider,
     parent: plan.parent,
     agentOptions: plan.agentOptions,
-    taskTimeoutMs: config.taskTimeoutMs,
     registry,
     swarmId,
     batchSignal,

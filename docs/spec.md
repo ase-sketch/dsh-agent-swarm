@@ -17,7 +17,7 @@
 2. 六道硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同；item 元素必须是非空字符串（第六道，2026-10-01 审查后补）
 3. 并发调度器：首波 5 并发、之后每 700ms 放 1 个、限流指数退避（3000ms×2ⁿ）、容量收缩防抖 2000ms、每 180s 恢复 +1（下限 1）、最后任务持续限流判 failed（死锁防护）、首个请求未发出的限流重罚
    —— **交付态修正（2026-10-01）**：本条前半（首波/放量/超时/中断/结果落位）已交付；**限流相关的后半（退避、容量收缩恢复、死锁防护、重罚）在交付态无触发路径**，详见下「交付状态」。
-4. 每任务超时（默认 2h 可配，**自建** `AbortSignal.any([父signal, AbortSignal.timeout])`——start() 无 timeout 字段）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
+4. 每任务超时（默认 2h 可配；start() 无 timeout 字段，由**调度器的超时闸门**到点 abort 成员信号——该信号同时级联用户中断，取消与超时文案单一来源；2026-10-01 第三轮去掉了重复的 `AbortSignal.timeout`）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
 5. 结果汇总：`<agent_swarm_result>` XML，**body 转义**、编号一致（规避 Kimi 已核实缺陷 D13/D14）
 6. 插件 config：并发/节奏/超时参数；**自动批准无需声明**（spike Q8：无 approvalRule 机制，不调 ctx.approval 即不弹窗）；子代理沙箱档位经 `parent: exec.agent` 自动继承
 7. 测试三层：纯函数单测 + mock Context 契约测试 + 真实 Loader 加载测试

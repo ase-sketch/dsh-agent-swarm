@@ -549,7 +549,7 @@ describe("D. 派发红线", () => {
     expect(result.xml).toContain('outcome="failed"');
   });
 
-  it("单任务超时信号 = AbortSignal.any([批次信号, 超时])，父中断能级联到成员", async () => {
+  it("成员信号承载批次中断：父中断能级联到成员", async () => {
     const controller = new AbortController();
     const harness = createHarness();
     const pending = harness.definition.execute(validArgs(), makeExec(controller.signal) as never);
@@ -627,6 +627,25 @@ describe("D. 派发红线", () => {
     const result = (await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string };
     expect(result.xml).toContain("Subagent timed out.");
     expect(result.xml).toContain('<summary>failed: 3</summary>');
+    // 子代理被取消的原因就是调度器超时闸门的原因（单一来源），而不是另一个计时器的 TimeoutError。
+    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
+    expect(memberSignal.reason).toBeInstanceOf(Error);
+    expect((memberSignal.reason as Error).message).toBe("Subagent timed out.");
+  });
+
+  it("超时只有一个来源：宿主不再另建 AbortSignal.timeout（两个同时长计时器会竞速）", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    const anySpy = vi.spyOn(AbortSignal, "any");
+    try {
+      const harness = createHarness({ config: { ...defaultConfig(), taskTimeoutMs: 60_000 } });
+      await harness.definition.execute(validArgs(), makeExec() as never);
+      expect(harness.startCalls).toHaveLength(3);
+      expect(timeoutSpy).not.toHaveBeenCalled();
+      expect(anySpy).not.toHaveBeenCalled();
+    } finally {
+      timeoutSpy.mockRestore();
+      anySpy.mockRestore();
+    }
   });
 
   it("stopReason=aborted 归取消，绝不触发限流重排队", async () => {
