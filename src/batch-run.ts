@@ -28,27 +28,48 @@ import type {
 } from "./types.js";
 import { runSwarm } from "./scheduler.js";
 import type { SwarmRegistry } from "./swarm-registry.js";
+import type { RateLimitWatchRouter } from "./rate-limit-signal.js";
 import { toSchedulerConfig, type SwarmAgentOptions, type SwarmPluginConfig } from "./config.js";
 import type { SwarmBatchPlan, SwarmParentAgent } from "./batch-plan.js";
 
-// ───────────────────────── 限流判定（一期：不判）─────────────────────────
-
-/**
- * 一期限流判定（M3 实机验证前的保守实现）：**不猜**，结果级一律不判限流。
- *
- * 为什么不能按错误码判：in-process（spawn）路径下，子代理结果只有 stopReason，
- * **没有** diagnostic / failure.code（spike Q6：429 在子代理内部的重试层被吃掉）。
- *
- * ⚠️ 恒返回 false 意味着调度器的整条限流分支（退避、容量收缩与恢复、`retrying` 相位、
- * 面板退避 UI）**当前完全不触发**。能力状态与启用前置条件见 docs/spec.md「交付状态」与
- * .agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md。
- */
-function isRateLimitErrorPhaseOne(_error: unknown): boolean {
-  return false;
+/** 插件实例级的宿主装配（apply 期确定，跨批次共享）。 */
+export interface SwarmHost {
+  ctx: Context;
+  config: SwarmPluginConfig;
+  /** 面板数据源。 */
+  registry: SwarmRegistry;
+  /** 限流信号路由；限流接线关闭时为 undefined。 */
+  rateLimit: RateLimitWatchRouter | undefined;
 }
 
-/** 一期不判限流，此处仅为注入点保留语义（执行层无法区分 → 按"运行中被限流"轻罚）。 */
-function classifyRateLimitPhaseOne(_error: unknown): SwarmRateLimitClass {
+// ───────────────────────── 限流判定 ─────────────────────────
+
+/**
+ * 被限流拖死的单次尝试。带品牌，是调度器"应重排队退避而不是落 failed"的**唯一**信号。
+ *
+ * 只有限流接线开启（config.rateLimit.enabled）时 runMember 才会抛出它；关闭时它永不出现，
+ * isRateLimitError 恒假，调度器的整条限流分支（退避、容量收缩与恢复、`retrying` 相位、面板退避 UI）
+ * 不触发——与接线前的行为逐字节一致。判定依据见 rate-limit-signal.ts。
+ */
+class SwarmRateLimitedFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SwarmRateLimitedFailure";
+  }
+}
+
+function isRateLimitError(error: unknown): boolean {
+  return error instanceof SwarmRateLimitedFailure;
+}
+
+/**
+ * 限流档位：一律按"运行中被限流"（轻罚）。
+ *
+ * 理由：DSH 的 start() 成功即意味着子代理已发布并开始首轮，限流只可能发生在子代理自己的请求上；
+ * "首个请求还没发出就被限流"（重罚）在 DSH 里没有可观测的对应物——它要求在子代理首个成功步骤之前
+ * 就把调度判定为未就绪，而那需要上游机制文档对"ready"的精确定义。保持 types.ts 契约里的安全默认。
+ */
+function classifyRateLimit(_error: unknown): SwarmRateLimitClass {
   return "in-flight-limited";
 }
 
@@ -133,6 +154,8 @@ interface MemberDispatch {
   /** 透传给 start 的委派深度上限（undefined = 不传）。 */
   maxDepth: number | undefined;
   registry: SwarmRegistry;
+  /** 限流信号路由；关闭时为 undefined（不观察、不判限流）。 */
+  rateLimit: RateLimitWatchRouter | undefined;
   swarmId: string;
   /** 批次级信号（exec.signal）：只判"批次是否被中断"，不判单个成员的信号。 */
   batchSignal: AbortSignal;
@@ -193,6 +216,9 @@ async function runMember(
   }
 
   // start 已成功：从这一刻起 run 存在，**必须**配对 dispose。
+  // 子会话 id 即 run.id（spike：in-process driver 以 childId 作为 run.id；待实机验证）。
+  const childSessionId = String(run.id);
+  const watch = dispatch.rateLimit?.watch(childSessionId);
   attempt.setAgentId(run.id);
   registry.setAgentId(swarmId, spec.index, run.id);
   attempt.markReady();
@@ -204,19 +230,31 @@ async function runMember(
       registry.markSettled(swarmId, spec.index, toSettledPhase(result.stopReason));
       return { result: joinContentBlocks(result.output), stopReason: result.stopReason };
     }
+    const detail = failureDetail(result);
+    const assessment = watch?.assess(result.stopReason);
+    if (assessment?.rateLimited === true) {
+      // 交给调度器退避重排队；成员相位由 onSuspended（retrying）或判死后的 onAbandoned（failed）推进，
+      // 这里不落终态——markSettled 是粘性的，提前落 failed 会让后续的 retrying 永远显示不出来。
+      throw new SwarmRateLimitedFailure(
+        `${detail}; rate limited (${String(assessment.failureCode)}) after ${String(assessment.rateLimitRetries)} retries inside the subagent`,
+      );
+    }
     // 落终态与 catch 用同一条判据（批次信号），不用子代理自报的 stopReason：
     // 子代理自报 "aborted" 只说明它被取消，不说明**批次**被打断——单任务超时同样会让成员优雅
     // 收场成 aborted，而 XML 侧对这条路径打的是 failed。详见 settleOutcomeAfter。
-    throw new SwarmTaskFailure(failureDetail(result));
+    throw new SwarmTaskFailure(detail);
   } catch (error) {
-    registry.markSettled(
-      swarmId,
-      spec.index,
-      settleOutcomeAfter(batchSignal),
-      error instanceof Error ? error.message : String(error),
-    );
+    if (!(error instanceof SwarmRateLimitedFailure)) {
+      registry.markSettled(
+        swarmId,
+        spec.index,
+        settleOutcomeAfter(batchSignal),
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     throw error;
   } finally {
+    dispatch.rateLimit?.release(childSessionId);
     // 幂等 dispose；即使 await run.result 抛错也必须走到这里。
     await run.dispose();
   }
@@ -231,12 +269,11 @@ async function runMember(
  * 否则会话面板会永远停在 running（成员相位还留在 pending）。
  */
 export async function runSwarmBatch(
-  ctx: Context,
-  config: SwarmPluginConfig,
+  host: SwarmHost,
   plan: SwarmBatchPlan,
-  registry: SwarmRegistry,
   batchSignal: AbortSignal,
 ): Promise<readonly SwarmTaskResult[]> {
+  const { ctx, config, registry } = host;
   const { specs } = plan;
   const swarmId = registry.beginBatch(plan.sessionId, plan.description, specs, Date.now(), plan.routeLabel);
   const dispatch: MemberDispatch = {
@@ -246,6 +283,7 @@ export async function runSwarmBatch(
     agentOptions: plan.agentOptions,
     maxDepth: plan.maxDepth,
     registry,
+    rateLimit: host.rateLimit,
     swarmId,
     batchSignal,
     total: specs.length,
@@ -261,8 +299,8 @@ export async function runSwarmBatch(
           clearTimeout(handle as ReturnType<typeof setTimeout>);
         },
         signal: batchSignal,
-        isRateLimitError: isRateLimitErrorPhaseOne,
-        classify: classifyRateLimitPhaseOne,
+        isRateLimitError,
+        classify: classifyRateLimit,
         onSuspended: (event) => {
           registry.markSuspended(swarmId, event.spec.index, event.retryCount, event.retryReadyAt, event.reason);
         },

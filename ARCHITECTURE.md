@@ -14,15 +14,18 @@ src/
   scheduler.ts           纯逻辑调度器：首波/放量/退避/容量收缩恢复；执行函数、限流判定、时钟全部注入
   swarm-registry.ts      纯逻辑状态机：成员七态生命周期 + 100ms 合帧 roster 广播（面板的数据源）
   tool-spec.ts           纯函数：面向模型的工具名/描述/参数映射/输出契约 + 生效上限（描述与校验同一口径）
-  swarm-error.ts         纯函数：结构化校验错误 → 可抛出 Error 的唯一出口
+  swarm-error.ts         纯函数：结构化校验错误 → 可抛出 Error 的唯一出口（code + details 渲染进模型可见的 message）
+  rate-limit-signal.ts   纯逻辑：按子会话 id 收集 llm/retry 与 turn/end，判定子代理是否被限流拖死（限流接线，默认关闭）
   remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符
   ── 宿主集成层（依赖 DSH 运行时或其类型）──
   config.ts              插件 Config schema（schemastery）+ 解析后配置形状 + 插件配置→调度器配置的唯一映射
   batch-plan.ts          批次规划：校验/策略上限/模型路由（读 ctx.subagentModelSelection 白名单）/父 agent 与会话
                          → 批次计划。**所有整体拒绝都在这里，发生在任何子代理启动与批次登记之前**
-  batch-run.ts           批次执行：开批次 → 装配调度器 → 逐成员 ctx.subagents.start（start/dispose 配对）→ 收批次
+  batch-run.ts           批次执行：开批次 → 装配调度器 → 逐成员 ctx.subagents.start（start/dispose 配对）→ 收批次；
+                         限流接线开启时，子代理以 error 收场且被判限流 → 抛品牌错误交给调度器退避重排队
   remote.ts              host 半 Remote 服务：TypertRemoteService 以 stream 暴露 swarm/roster
-  index.ts               插件入口：name / inject / Config / apply——只做装配（plan → run → render）
+  index.ts               插件入口：name / inject / Config / apply——只做装配（plan → run → render）；
+                         限流接线开启时订阅 session/event 交给 rate-limit-signal 路由（disposer 解除）
   client/                同包 client 半（由 scripts/build-client.mjs 单独打包，不进 tsc 产物）
     index.ts               client 入口 apply(ctx)：**父 fiber** 只做 $mount Remote（提供 remote.swarm 命名空间），
                        随后用 ctx.plugin 载入**子 fiber**（inject 声明 remote.swarm）注册槽位与字典
@@ -41,7 +44,8 @@ docs/                      spec.md、code-quality-review 报告、spike 笔记
 
 host 半：`index.ts` 是唯一装配点 → `batch-plan.ts`、`batch-run.ts`、`result-xml.ts`、`tool-spec.ts`、`swarm-registry.ts`、`remote.ts`；
 `batch-plan.ts` → `validate.ts`、`swarm-error.ts`、`tool-spec.ts`、`config.ts`；
-`batch-run.ts` → `scheduler.ts`、`config.ts`（以及 `batch-plan.ts` / `swarm-registry.ts` 的**类型**）；
+`batch-run.ts` → `scheduler.ts`、`config.ts`（以及 `batch-plan.ts` / `swarm-registry.ts` / `rate-limit-signal.ts` 的**类型**）；
+`index.ts` → `rate-limit-signal.ts`（构造路由器）；
 `remote.ts` → `swarm-registry.ts`；纯逻辑层内部只依赖 `types.ts`
 （`scheduler.ts`、`validate.ts`、`result-xml.ts` **互不依赖**；`tool-spec.ts`、`swarm-error.ts` 同样只依赖 `types.ts`）。
 
@@ -51,7 +55,7 @@ host 半：`index.ts` 是唯一装配点 → `batch-plan.ts`、`batch-run.ts`、
 client 半：`client/index.ts` → `client/model.ts`、`client/service.ts`、`SwarmHeaderAction.tsx`、`../remote-descriptor.ts`（其中 `remote-descriptor` 是值引用）。
 client 半的模块之间**只有类型引用**（`import type`）：模型实例经槽位 `inject` 注入到组件与服务，不存在运行时模块耦合。
 
-纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / tool-spec / swarm-error / remote-descriptor）
+纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / tool-spec / swarm-error / rate-limit-signal / remote-descriptor）
 **零 DSH 运行时依赖**，可脱离宿主单测；`remote.ts` 依赖 `@deepseek-ai/dsh-typert-protocol`，是 host 半里唯一的协议层依赖；
 `config.ts` 依赖 `@deepseek-ai/schemastery`，`index.ts` 依赖 `@deepseek-ai/dsh-tools`（defineTool）。
 

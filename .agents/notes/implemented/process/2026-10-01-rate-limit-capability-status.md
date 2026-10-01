@@ -135,3 +135,48 @@ fake-timer 实测（2026-10-01 代码审查）：
   ② 同一场景 + `maxRateLimitRetries` 未设 → 断言维持旧行为（不静默改语义）；
   ③ 构造期校验：`maxRateLimitRetries` 传 0 / 负数 / 非整数 → 抛错。
 - 启用时的验收条件（在上文两条之外新增第三条）：③ 实机校准 `maxRateLimitRetries` 取值并在 `src/index.ts` 接线。
+
+## 2026-10-01 第三轮：接线就绪、默认关闭（演进记录，并入本笔记）
+
+### Problem
+
+前两轮把能力状态对齐成「未交付」，启用前置条件里的调度器缺口（互锁、回调停摆、多成员判死）已修完，
+剩下的只有「接线」本身与实机验证。接线若继续拖到 M3 实机时才写，实机窗口里要同时排查代码与环境两类问题。
+
+### Decision
+
+现在写完接线，但**默认关闭**（`config.rateLimit.enabled = false`）：
+
+1. 纯逻辑 `src/rate-limit-signal.ts`：按子会话 id 收集 `llm/retry`（data.failure.code）与 `turn/end`
+   （失败收场时 data.reason = { kind: "error", error: failure }，已对照 dsh-agent-loop 构建产物核实）；
+   以 error 收场且**最终**失败码属于限流码集合时判限流（拿不到最终码时退看最后一次重试的码）。
+2. 读事件走 `ctx.on("session/event")`：DSH 已把 `Session.ownEvents/snapshotEvents/eventAt` 全部标为
+   deprecated（"new calls are prohibited"），追加事件流是唯一受支持的读法。订阅只在开启时建立，disposer 解除。
+3. 判为限流时抛 `SwarmRateLimitedFailure`（品牌错误），`isRateLimitError` 按品牌判定；
+   该路径不在宿主侧落终态（markSettled 粘性，提前落 failed 会让 retrying 永远显示不出来），
+   相位由调度器的 onSuspended / onAbandoned 推进。
+4. `rateLimit.maxRetries`（默认 3）只在开启时透传为 `maxRateLimitRetries`——关闭时保持 undefined，
+   与本笔记「不在默认表里放行为值」的约定一致。
+
+### Alternatives considered
+
+- **事后读子会话日志（ownEvents）**：实现最简单、无需全局监听；否决——API 已废弃且明文禁止新调用。
+- **继续不接线、等 M3**：否决——见 Problem；接线代码本身可以离线测透（L 组 5 条 + 单测 9 条），
+  实机窗口只该验证环境事实。
+- **在途背压**（看到 RATE_LIMIT 重试事件就收缩容量、暂停放量，但不重排队）：本轮不做。
+  它能覆盖 provider 配成 always 重试模式时「子代理永不失败、重排队永不触发」的情形，
+  但需要给调度器新增入口，且收益依赖实机的 429 分布——登记为开启后的候选项。
+- **重罚档位映射**（first-request-blocked）：本轮一律轻罚。DSH 的 start() 成功即意味着子代理已开始首轮，
+  "首个请求还没发出就被限流"没有可观测对应物；精确映射需要上游机制文档对 ready 的定义。
+
+### Consequences
+
+- 关闭（默认）时运行时行为与接线前逐字节一致：全部既有用例原样通过，L 组守护用例断言不重试。
+- 开启后的新风险面：插件级 session/event 监听收到的是进程内所有会话的事件，入口先按事件类型丢弃（O(1)）。
+
+### Confirmation
+
+- 离线：`tests/rate-limit-signal.test.ts`（9 条）+ `tests/plugin.test.ts` L 组（5 条）。
+- 开启前的实机验收（缺一不可）：① 真实触发 429，确认 `turn/end` 的 `reason.error.code` 取值；
+  ② 插件级 `session/event` 监听确实收到子会话事件（DSH 只文档化了 agent 作用域监听的过滤语义）；
+  ③ 子会话 id 等于 `run.id`；④ 按 429 分布校准 `maxRetries`。

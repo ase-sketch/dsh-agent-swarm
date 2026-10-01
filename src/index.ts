@@ -17,10 +17,11 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
-import { toSchedulerConfig, type SwarmPluginConfig } from "./config.js";
+import { isRateLimitWiringEnabled, toSchedulerConfig, type SwarmPluginConfig } from "./config.js";
 import { validateSchedulerConfig } from "./scheduler.js";
 import { planSwarmBatch, type SwarmExecuteArgs } from "./batch-plan.js";
-import { runSwarmBatch } from "./batch-run.js";
+import { runSwarmBatch, type SwarmHost } from "./batch-run.js";
+import { RateLimitWatchRouter, type ChildSessionEventLike } from "./rate-limit-signal.js";
 import { renderSwarmResultSafely } from "./result-xml.js";
 import {
   SWARM_TOOL_NAME,
@@ -59,9 +60,29 @@ function acquireRegistry(ctx: Context): SwarmRegistry {
 }
 
 /**
- * 插件入口。有副作用的事只有两件：挂 SwarmRemote 服务（见 acquireRegistry）、注册工具。
- * 两者都可逆：前者随 fiber 卸载由 cordis 注销；后者由返回的 disposer 注销
- * （Cordis 把 apply 返回的函数登记为该 fiber 的 effect，卸载时自动调用）。
+ * 限流接线开启时，订阅 `session/event`（DSH 唯一受支持的会话事件读法）并交给路由器；
+ * 关闭时什么都不订阅，返回 undefined。返回的 disposer 解除订阅。
+ *
+ * ⚠️ 待实机验证：插件级（非 agent 作用域）监听能否收到子会话的事件——DSH 文档只说明
+ * agent 作用域的监听器只收到本 agent 的会话事件。
+ */
+function wireRateLimitSignal(
+  ctx: Context,
+  config: SwarmPluginConfig,
+): { router: RateLimitWatchRouter; dispose: () => void } | undefined {
+  if (!isRateLimitWiringEnabled(config) || config.rateLimit === undefined) return undefined;
+  const router = new RateLimitWatchRouter({ failureCodes: config.rateLimit.failureCodes });
+  const dispose = ctx.on("session/event", (session: { id: unknown }, event: ChildSessionEventLike) => {
+    router.dispatch(String(session.id), event);
+  });
+  return { router, dispose };
+}
+
+/**
+ * 插件入口。有副作用的事：挂 SwarmRemote 服务（见 acquireRegistry）、注册工具，
+ * 以及限流接线开启时的 `session/event` 订阅。三者都可逆：SwarmRemote 随 fiber 卸载由 cordis 注销；
+ * 工具与订阅由返回的 disposer 注销（Cordis 把 apply 返回的函数登记为该 fiber 的 effect，卸载时自动调用；
+ * ctx.on 本身也是 fiber 作用域的 effect）。
  *
  * 调度器配置在**任何副作用之前**先校验一遍（fail-fast）：Config schema 已挡住大部分非法值，
  * 这里兜住绕过 schema 直接传入的配置——否则非法配置要等到每一次工具调用才在调度器构造期抛错，
@@ -70,6 +91,8 @@ function acquireRegistry(ctx: Context): SwarmRegistry {
 export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
   validateSchedulerConfig(toSchedulerConfig(config));
   const registry = acquireRegistry(ctx);
+  const rateLimit = wireRateLimitSignal(ctx, config);
+  const host: SwarmHost = { ctx, config, registry, rateLimit: rateLimit?.router };
 
   // 描述在 apply 期按**生效上限**生成，不是模块级常量：宿主把 config.maxItems 调低后，
   // 模型收到的必须与 batch-plan 拒绝它时用的是同一个数。
@@ -86,11 +109,15 @@ export function apply(ctx: Context, config: SwarmPluginConfig): () => void {
       // ① 规划：全部整体拒绝都在这里，发生在任何子代理启动之前。
       const plan = planSwarmBatch(args, config, ctx, exec);
       // ② 执行：批次信号 = exec.signal（用户中断级联）。个别成员失败不拖垮整次调用。
-      const results = await runSwarmBatch(ctx, config, plan, registry, exec.signal);
+      const results = await runSwarmBatch(host, plan, exec.signal);
       // ③ 收齐全部结果后一次性渲染；失败与成功在 XML 里如实分列（spike Q7.4 末条）。
       return { xml: renderSwarmResultSafely(results) };
     },
   });
 
-  return ctx.tools.register(agentSwarm);
+  const unregister = ctx.tools.register(agentSwarm);
+  return () => {
+    rateLimit?.dispose();
+    unregister();
+  };
 }

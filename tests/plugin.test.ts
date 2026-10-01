@@ -278,6 +278,12 @@ describe("A. 插件声明形态", () => {
     expect(resolve({ retryFactor: 1.5 }).retryFactor).toBe(1.5);
   });
 
+  it("rateLimit：默认关闭，限流码默认 RATE_LIMIT、重排队上限默认 3", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve().rateLimit).toEqual({ enabled: false, failureCodes: ["RATE_LIMIT"], maxRetries: 3 });
+    expect(() => resolve({ rateLimit: { enabled: true, maxRetries: 0 } })).toThrow(/maxRetries/);
+  });
+
   it("maxDepth：缺省保持 undefined（跟随宿主设置），接受自然数与 \"provider-managed\"", () => {
     const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
     expect(resolve().maxDepth).toBeUndefined();
@@ -1503,5 +1509,129 @@ describe("K. 委派深度上限", () => {
     const legacy = createHarness();
     await legacy.definition.execute(validArgs(), makeExec() as never);
     expect((legacy.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
+  });
+});
+
+// ───────────────────────── L. 限流退避接线（默认关闭；开启前须 M3 实机验证）─────────────────────────
+
+describe("L. 限流退避接线", () => {
+  type ScriptedEnd = { events: { type: string; data: unknown }[]; stopReason: string };
+
+  /** 子会话里"被限流拖死"的事件序列：内部重试若干次后轮末以 code 失败。 */
+  function rateLimitedEnd(code = "RATE_LIMIT"): ScriptedEnd {
+    return {
+      events: [
+        { type: "llm/retry", data: { retry: 1, failure: { code } } },
+        { type: "llm/retry", data: { retry: 2, failure: { code } } },
+        { type: "turn/end", data: { turn: 1, reason: { kind: "error", error: { code, message: "429" } } } },
+      ],
+      stopReason: "error",
+    };
+  }
+
+  const completedEnd: ScriptedEnd = { events: [], stopReason: "completed" };
+
+  /**
+   * 脚本化的子代理桩：start 返回后，先经真实 cordis 事件总线（ctx.emit "session/event"）
+   * 在子会话里追加脚本事件，再以脚本给定的 stopReason 收场。子会话 id = run.id。
+   * 按 label 里的成员序号取脚本（重试会再次 start 同一成员）。
+   */
+  function scriptedHarness(
+    rateLimit: { enabled: boolean; failureCodes?: string[]; maxRetries?: number } | undefined,
+    scriptFor: (memberIndex: number, attempt: number) => ScriptedEnd,
+  ) {
+    let ctxRef: Context | undefined;
+    const attempts = new Map<number, number>();
+    const harness = createHarness({
+      config: {
+        ...defaultConfig(),
+        releaseIntervalMs: 1,
+        backoffInitialMs: 1,
+        shrinkDebounceMs: 0,
+        recoverIntervalMs: 5,
+        ...(rateLimit === undefined
+          ? {}
+          : { rateLimit: { failureCodes: ["RATE_LIMIT"], maxRetries: 3, ...rateLimit } }),
+      },
+      runFactory: ({ request, index }) => {
+        const memberIndex = Number(String(request.label).split("/")[0]);
+        const attempt = (attempts.get(memberIndex) ?? 0) + 1;
+        attempts.set(memberIndex, attempt);
+        const script = scriptFor(memberIndex, attempt);
+        const id = `child-${String(index)}`;
+        return Promise.resolve({
+          id,
+          result: (async () => {
+            // 与真实时序一致：子会话事件发生在 start() 返回之后
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const bus = ctxRef as unknown as { emit(name: string, ...args: unknown[]): void };
+            for (const event of script.events) bus.emit("session/event", { id }, event);
+            return { output: [{ type: "text", text: `out ${id}` }], stopReason: script.stopReason };
+          })(),
+          dispose: () => Promise.resolve(),
+        });
+      },
+    });
+    ctxRef = harness.ctx;
+    return harness;
+  }
+
+  async function run(harness: MockHarness): Promise<string> {
+    return ((await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string }).xml;
+  }
+
+  it("默认关闭：被限流拖死的成员照旧落 failed，不重试（与接线前逐字节一致）", async () => {
+    const harness = scriptedHarness(undefined, (member) => (member === 1 ? rateLimitedEnd() : completedEnd));
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
+    expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("开启：被限流拖死的成员交给调度器退避重排队，重试成功后落 completed", async () => {
+    const harness = scriptedHarness({ enabled: true }, (member, attempt) =>
+      member === 1 && attempt === 1 ? rateLimitedEnd() : completedEnd,
+    );
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 3</summary>");
+    expect(harness.startCalls).toHaveLength(4); // 成员 1 重派一次
+    // 面板：该成员经历过一次限流重试（markSuspended 记录的 retryCount），最终 completed
+    const member1 = latestBatchOf(harness.ctx)?.members.get(1);
+    expect(member1?.phase).toBe("completed");
+    expect(member1?.retryCount).toBe(1);
+  });
+
+  it("开启：持续限流到上限即判死（maxRetries），批次照常收尾", async () => {
+    const harness = scriptedHarness({ enabled: true, maxRetries: 1 }, (member) =>
+      member === 2 ? rateLimitedEnd() : completedEnd,
+    );
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
+    expect(xml).toMatch(/rate limited/);
+    expect(latestBatchOf(harness.ctx)?.members.get(2)?.phase).toBe("failed");
+    expect(latestBatchOf(harness.ctx)?.status).toBe("failed");
+  });
+
+  it("开启：非限流码的失败（如 SERVER）不重试，直接落 failed", async () => {
+    const harness = scriptedHarness({ enabled: true }, (member) =>
+      member === 3 ? rateLimitedEnd("SERVER") : completedEnd,
+    );
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
+    expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("开启后 disposer 解除 session/event 订阅（ctx 副作用可逆）", async () => {
+    const harness = scriptedHarness({ enabled: true }, () => completedEnd);
+    const bus = harness.ctx as unknown as { emit(name: string, ...args: unknown[]): void };
+    // 读 cordis 事件服务的内部钩子表：cordis 没有公开"某事件有几个监听者"的 API，
+    // 而"卸载后监听器确实被移除"正是红线「ctx 副作用必须可逆」要守的东西。
+    const listeners = (): number =>
+      ((harness.ctx as unknown as { events: { _hooks: Record<string, unknown[]> } }).events._hooks[
+        "session/event"
+      ] ?? []).length;
+    expect(listeners()).toBe(1);
+    harness.dispose();
+    expect(listeners()).toBe(0);
+    expect(() => bus.emit("session/event", { id: "x" }, { type: "turn/end" })).not.toThrow();
   });
 });

@@ -51,6 +51,21 @@ export const Config = Schema.object({
    */
   maxDepth: Schema.union([Schema.natural(), Schema.const("provider-managed" as const)]),
   /**
+   * 限流退避接线（**默认关闭**；开启前须完成 M3 实机验证，见 docs/spec.md「交付状态」）。
+   *
+   * 开启后：子代理以 error 收场、且其子会话 `turn/end` 记录的最终失败码属于 failureCodes 时，
+   * 该成员不落 failed，而是交给调度器既有的退避重排队（3000ms×2ⁿ、容量收缩/恢复），
+   * 单成员最多重排队 maxRetries 次（透传为调度器的 maxRateLimitRetries）后判死。
+   * 关闭时不订阅任何事件，行为与引入前逐字节一致。
+   */
+  rateLimit: Schema.object({
+    enabled: Schema.boolean().default(false),
+    /** 判定为限流的失败码（待实机验证；DSH 的 DeepSeek 适配器把 429 映射为 "RATE_LIMIT"）。 */
+    failureCodes: Schema.array(Schema.string()).default(["RATE_LIMIT"]),
+    /** 单成员限流重排队上限（取值待实机按 429 分布校准）。 */
+    maxRetries: Schema.natural().min(1).default(3),
+  }).default({}),
+  /**
    * 子代理 LLM 路由（写死，不开 modelSelectionSettings，避免命中会话白名单拒绝）。
    * 不传 → 子代理自动继承父 agent 的 provider/model/effort/maxTokens。
    * 传了 → 需要 provider 声明 capabilities.agentOptions。
@@ -69,6 +84,18 @@ export const Config = Schema.object({
  */
 export type SwarmAgentOptions = NonNullable<SubagentStartRequest["agentOptions"]>;
 
+/** 限流退避接线配置（见 Config.rateLimit）。 */
+export interface SwarmRateLimitConfig {
+  enabled: boolean;
+  failureCodes: string[];
+  maxRetries: number;
+}
+
+/** 限流退避接线是否开启（缺省视同关闭）。 */
+export function isRateLimitWiringEnabled(config: SwarmPluginConfig): boolean {
+  return config.rateLimit?.enabled === true;
+}
+
 /** 插件配置解析后的形状（Config 已给全部字段默认值，apply 收到的就是完整配置）。 */
 export interface SwarmPluginConfig {
   provider: string;
@@ -83,6 +110,8 @@ export interface SwarmPluginConfig {
   maxItems: number;
   /** 成员委派深度上限；缺省跟随宿主设置，见 Config.maxDepth。 */
   maxDepth?: number | "provider-managed";
+  /** 限流退避接线；缺省（或 enabled=false）= 关闭，见 Config.rateLimit。 */
+  rateLimit?: SwarmRateLimitConfig;
   /** 见上方 SwarmAgentOptions：品牌化的路由覆盖，缺省则继承父 agent。 */
   agentOptions?: SwarmAgentOptions;
 }
@@ -102,5 +131,9 @@ export function toSchedulerConfig(config: SwarmPluginConfig): Partial<SwarmSched
     capacityShrinkDebounceMs: config.shrinkDebounceMs,
     capacityRecoveryIntervalMs: config.recoverIntervalMs,
     timeoutMs: config.taskTimeoutMs,
+    // 判死门槛只在限流接线开启时给出：关闭时保持 undefined（调度器旧行为，且限流分支本就不可达）。
+    ...(isRateLimitWiringEnabled(config) && config.rateLimit !== undefined
+      ? { maxRateLimitRetries: config.rateLimit.maxRetries }
+      : {}),
   };
 }

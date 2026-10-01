@@ -119,9 +119,9 @@
 
 - **限流判定尚未实机验证**（阻塞项）。in-process（`spawn`）路径下子代理结果只有 `stopReason`，
   没有 `diagnostic` / `failure.code`（见 `spike-dsh-api.md` Q6），因此结果级无法区分 429 与普通错误。
-  `index.ts` 中 `isRateLimitErrorPhaseOne` / `classifyRateLimitPhaseOne` 是**注入点**：
-  当前恒返回 false（不猜、不误判），M3 实机确认 `llm/retry` 事件的 `failure.code` 后替换该实现即可，
-  调度器无需改动。
+  2026-10-01 第三轮已按子会话事件（`llm/retry` / `turn/end` 的失败码）完成接线（`src/rate-limit-signal.ts`），
+  但 `config.rateLimit.enabled` **默认关闭**：关闭时行为与接线前一致（结果级一律不判限流）；
+  M3 实机确认失败码取值与事件可达性后开启即可，调度器无需改动。
 - **`resume` 运行时分支**（二期 backlog，见 `docs/spec.md`）。
   `types.ts` 中以注释标出扩展点，`validate.ts` 的校验 1 一期无豁免路径。
 - **成员可见性**：one-shot 子代理不进入官方智能体团队面板（`spike-dsh-api.md` Q10），

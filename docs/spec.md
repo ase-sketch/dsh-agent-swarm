@@ -37,7 +37,14 @@
 
 审查报告：`docs/code-quality-review-2026-10-01.md`。以下是与原规格不一致的交付事实，逐条回写：
 
-- **一期限流退避未交付（未收敛）**：`src/index.ts` 的 `isRateLimitErrorPhaseOne` 恒返回 false，
+- **一期限流退避：接线已就绪、默认关闭（2026-10-01 第三轮）**。`config.rateLimit.enabled`（默认 false）开启后：
+  插件订阅 `session/event`，按子会话 id 收集 `llm/retry` 与 `turn/end`（`src/rate-limit-signal.ts`，纯逻辑）；
+  子代理以 `error` 收场且 `turn/end` 记录的最终失败码属于 `rateLimit.failureCodes`（默认 `["RATE_LIMIT"]`）时，
+  抛出带品牌的 `SwarmRateLimitedFailure` 交给调度器既有的退避重排队，`rateLimit.maxRetries`（默认 3）透传为
+  `maxRateLimitRetries`。关闭时不订阅任何事件，行为与接线前逐字节一致（全部既有用例原样通过 + L 组守护用例）。
+  **开启前仍须实机确认**：① 失败码实际取值；② 插件级 `session/event` 监听能否收到子会话事件；
+  ③ 子会话 id 是否等于 `run.id`；④ `maxRetries` 取值。未做的「在途背压」与重罚档位映射见归属决策笔记。
+  以下为接线前的历史记录：原 `isRateLimitErrorPhaseOne` 恒返回 false，
   而它是调度器唯一的限流判定入口（`src/scheduler.ts` 中"限流结局"的唯一产出点）→ 退避、容量收缩/恢复、
   `retrying` 相位、面板退避 UI 全部不触发。**启用前置条件**（三条都满足才动手）：
   ① M3 实机确认子会话 `llm/retry` 事件的 `failure.code` 取值；
@@ -48,7 +55,10 @@
      但**生产未接线**、取值待 M3 实机校准——见 `.agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md`。
   原先列的"容量恢复无上界"经复核**判定不修**：`maxConcurrency` 是独立第二道闸门，已兜住"超过宿主设定"这一唯一实际风险；
   给容量加硬上限反而会在"早期限流"后把容量永久锁在 1，比无上界更糟（理由见归属决策笔记的「复核订正」）。
-- **`resume_agent_ids`（二期）的取值来源已补齐**：结果块此前丢弃 `agent_id` 属性，已修复；二期续跑不再被这一条卡住。
+- **`resume_agent_ids`（二期）**：结果块此前丢弃 `agent_id` 属性，已修复。**但 2026-10-01 第三轮订正**：
+  "二期续跑不再被卡住"的结论不成立——XML 里的 `agent_id` 是 **one-shot** run 的 id，而 DSH 对非 continuable
+  子代理一律抛 `NOT_RESUMABLE`（`@deepseek-ai/dsh-subagent` 续跑路径的 `descriptor.mode !== "continuable"` 判定）。
+  真正的前置条件与三条候选路线见 `.agents/notes/proposed/feature/2026-10-01-resume-agent-ids.md`。
 - **测试链改为先构建**：`pnpm test` 现在前置 `pnpm run build`，client 侧测试在内存里打包，host 侧 Loader 测试加载 `dist/index.js`
   （此前各测各的：client 测盘上旧产物、host 测源码命名空间、`dist/index.js` 无人验证）。
 - **clean-room 文案修正**：三条与上游逐字相同的文案/常量已改写为本仓自拟（见 `THIRD-PARTY-NOTICES.md`）。
