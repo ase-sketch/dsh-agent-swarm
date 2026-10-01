@@ -84,6 +84,55 @@
 - **E3 resume_agent_ids**：本轮只做 spike 与决策笔记。阻塞点见 M1。
 - **E4 模式状态机**：延后。已列出可用的 DSH 原语；具体语义需要 01-机制文档 的行为描述。
 
-## 执行记录
+## 执行记录（2026-10-01，分支 `optimize/round3`，每个提案一笔提交）
 
-（见下文，按提交逐条回写）
+| 提案 | 处置 | 提交 |
+|---|---|---|
+| 重构（含 P6） | `index.ts` 822 行按职责拆成 batch-plan / batch-run / config / tool-spec / swarm-error，`runOneTask` 改成参数对象，行为零变化（21 个场景的行为快照逐字节一致） | `4a5e9f7` |
+| P9 小清理 | 合并重复的判型函数；删除未用导入和死方法；开启 `noUnusedLocals` / `noUnusedParameters`；label 截断；工具描述补上第六道校验；`validateSchedulerConfig` 抽出为导出函数并补上 NaN 漏网 | `7029313` |
+| P7 测试 harness | 支持 runFactory 与 subagents 桩，三处手搭 ctx 的测试迁回 harness | `7d291e8` |
+| P3 超时单一来源 | 删除重复的 `AbortSignal.timeout`；新增护栏测试，确认不再调用 `AbortSignal.timeout` / `AbortSignal.any` | `f8565a1` |
+| P4 配置校验 | firstWave / retryFactor 在加载期就拒绝 < 1 的值；apply 在产生任何副作用之前 fail-fast | `6e15f25` |
+| P2 错误对模型可见 | message 渲染为 `[CODE] … Details: {json}`；所有回显的模型文本都做截断 | `55d2def` |
+| （附带）typecheck 不再依赖 dist | dist 改为运行期 URL 导入；干净检出（尚无 dist）时 typecheck 也能通过 | `708fcf4` |
+| P1 深度上限 | 透传 `resolveMaxDepth()`，并在开批次前预检（`DELEGATION_DEPTH_EXCEEDED`）；进程外 provider 不受影响、不回归 | `86e353d` |
+| P5 + P12 推流与并发批次 | 按会话唤醒、只发增量、截断视图、限制容量；并发批次同时可见（visibleSwarmIds），客户端可切换 | `0dad9c3` |
+| P8 NOTICES | 补登 DSH（MIT）来源，修正原先过于绝对的表述 | `676a7fa` |
+| E1 限流接线 | 默认关闭；监听 `session/event`，以 `turn/end` 的最终失败码判定是否限流；判定为限流时抛出品牌错误，交给调度器做退避 | `ba77db8` |
+| E3 resume | 只做文档：修正「前置条件已补齐」的结论，三条路线记入 proposed 笔记 | `ba77db8` |
+| P10 + P11 i18n 与渲染测试 | 组件改用框架注入的 `t`（与官方 jobs 面板同一机制）；新增 jsdom 与 Testing Library，补 7 条渲染测试 | `780ac87` |
+| E2 fork | `context: "fork"` 走 DSH 原生 fork provider；与 `model` 互斥；单独设上限（默认 16） | `b1978e4` |
+| E4 模式状态机 | 延后，DSH 可用原语记入 proposed 笔记 | `b1978e4` |
+| 独立审查修复（registry） | 消费方持帧期间的变化会丢失（高，本轮引入的回归）；按会话唤醒的用例原先不起守护作用；description 截断；收尾之后再重算批次状态 | `793daae` |
+| 独立审查修复（限流） | dispose 期间被中断的限流成员补落 aborted（中）；重试码只认收场那一轮；补三处护栏 | `16b4e40` |
+| 版本 | 0.3.6 → 0.4.0 | 最后一笔 |
+
+**验证**
+- D: 盘是 exFAT，用 hoisted 布局运行：`pnpm test` 从 250 条增至 327 条（7 个文件增至 10 个），`pnpm typecheck` 结果为 0。
+- 在 NTFS 上全新 clone 本分支，按 pnpm 默认隔离布局执行 frozen install：
+  - 移走 dist 后 typecheck 结果为 0；
+  - 测试全部通过（独立审查修复前为 319 条，修复后为 327 条）；
+  - `npm pack --dry-run` 共 46 个文件，`dist/client.js` 里不含测试依赖，也不含 host registry 代码。
+
+**未做与不做**
+- E1b「在途背压」：需要给调度器新增入口，收益依赖实机 429 的分布。
+- 重罚档位映射（first-request-blocked）：需要上游对 ready 的定义。
+- E3 / E4 的运行时实现。
+- peerDependencies 观察项：npm 7+ 会自动安装 peer 依赖，有装出第二份宿主包的风险，需实机评估。
+- L6 的 sessionId 兜底值：复核后结论是没有可见影响（面板按真实会话 id 订阅，兜底桶永远不会被显示），不改。
+
+**待实机验证（汇总）**
+1. 成员会话是否能看到 `agent_swarm`；用户 profile 中 maxDepth 的取值（P1）。
+2. 限流接线开启前需要确认四点（E1）：
+   - 实际的失败码取值；
+   - 插件级 `session/event` 能否收到子会话的事件；
+   - 子会话 id 是否等于 `run.id`；
+   - maxRetries 取多少合适。
+3. 真实客户端是否注入 `t`，以及切换语言的效果；多批次标签的观感（P10 / P12）。
+4. fork provider 是否已挂载及其 providerName；并行 fork 的成本（E2）。
+
+**独立审查**（fresh subagent，只读、脚本复现；父代理逐条回读源码复核后才改动）：7 条发现全部处置。其中 1 条高是本轮引入的推流丢更新回归；
+1 条（中断时 batch.status 早于成员落定）属既有问题，一并以「收尾后重算」修复。所有新增护栏用例均做过变异验证（撤回修复即变红）。
+
+**行为快照对比（基线 → 最终）**：9 个执行场景的 XML 逐字节一致；12 个校验/路由错误场景的错误码全部不变、仅 message 增加 `[CODE]` 与 Details；
+start 请求仅 label 折叠空白；工具描述与参数为有意的文案变更（第六道校验、深度上限、fork、context 参数）。
