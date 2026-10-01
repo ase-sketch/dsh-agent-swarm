@@ -2,7 +2,7 @@
 
 > [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）插件：把「一批同形子任务」打包成一个模型可调用的 `agent_swarm` 工具，一次调用展开为 N 个并行子代理，自带自适应限流调度与结果汇总，并附会话标题栏实时状态面板。
 >
-> 本实现为 clean-room 适配（行为参考 Kimi Code 桌面版的 swarm 功能机制描述；部分代码参考其 v1 MIT 许可源码，已在 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 逐一登记），不含任何 Kimi UI 复刻与提示词原文。
+> 本实现为 clean-room 重写：Kimi Code 桌面版的 swarm 功能**并未开源**，本仓依据逆向分析产出的机制文档（行为描述）重新实现，**未复制任何上游源码与提示词原文**，也不含 Kimi UI 复刻。功能原理与上游对齐，但不声称完整复刻——有意的行为偏离与溯源声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ## 功能一览
 
@@ -69,7 +69,7 @@ pnpm run build      # 编译 host 半 + 预构建 client 半到 dist/
 
 > A [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) plugin that turns a batch of same-shaped subtasks into a single model-callable `agent_swarm` tool: one call fans out into N parallel subagents with adaptive rate-limit scheduling, XML result aggregation, and a live status panel in the session header.
 >
-> Clean-room implementation (behavior derived from mechanism documentation of Kimi Code's swarm feature; some code adapted from its v1 MIT-licensed sources, itemized in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)). No Kimi UI replica, no copied prompt text.
+> Clean-room reimplementation: Kimi Code's swarm feature is **not open source**; this repo was rebuilt from behavior documentation produced by reverse analysis, with **no upstream source code or prompt text copied** and no Kimi UI replica. Functionally aligned in principle, but not claimed to be a complete replica — intentional deviations and provenance are documented in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Features
 
