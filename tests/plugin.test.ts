@@ -1330,6 +1330,41 @@ describe("J. per-call 模型路由（白名单权威）", () => {
     expect(harness.startCalls).toHaveLength(0);
   });
 
+  it("模型可见：报错文本自带错误码与候选清单（DSH 只把 message 交给模型，自定义字段不可见）", async () => {
+    const harness = createHarness({
+      modelSelection: {
+        enabled: true,
+        allowedModels: [
+          { provider: "google", model: "gemini-2.5-pro" },
+          { provider: "vertex", model: "gemini-2.5-pro" },
+        ],
+      },
+    });
+    const error = (await harness.definition
+      .execute(validArgs({ model: "gemini-2.5-pro" }), makeExec() as never)
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error;
+    // 修复前 message 只有一句 "is offered by 2 providers"，模型不知道该改成哪一条。
+    expect(error.message).toMatch(/^\[MODEL_AMBIGUOUS\] /);
+    expect(error.message).toContain("google/gemini-2.5-pro");
+    expect(error.message).toContain("vertex/gemini-2.5-pro");
+  });
+
+  it("模型可见：DUPLICATE_PROMPTS 的碰撞片段进入报错文本", async () => {
+    const harness = createHarness();
+    const error = (await harness.definition
+      .execute(validArgs({ items: ["alpha.md", "beta.md", "alpha.md"] }), makeExec() as never)
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error;
+    expect(error.message).toMatch(/^\[DUPLICATE_PROMPTS\] Items 1 and 3/);
+    expect(error.message).toContain('"itemSnippet":"alpha.md"');
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
   it("per-call model 覆盖 config 固定路由", async () => {
     const harness = createHarness({
       modelSelection: { enabled: true, allowedModels: ALLOWED },

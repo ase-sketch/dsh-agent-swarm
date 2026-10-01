@@ -182,6 +182,18 @@ describe("校验 3：item 元素必须是非空字符串", () => {
     }
   });
 
+  it("超长全空白 item：回显截断到片段上限，另给原长度（报错不能挤爆上下文）", () => {
+    const blank = "\n".repeat(50_000);
+    const r = validateSwarmInput(input({ items: ["ok", blank] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_EMPTY);
+      expect(r.error.message.length).toBeLessThan(DUPLICATE_SNIPPET_MAX_CHARS * 4);
+      expect(r.error.details).toMatchObject({ index: 2, receivedChars: 50_000 });
+      expect(String(r.error.details?.received).length).toBeLessThanOrEqual(DUPLICATE_SNIPPET_MAX_CHARS + 1);
+    }
+  });
+
   it("两个全空白 item 报 ITEM_EMPTY，而不是误导性的 DUPLICATE_PROMPTS", () => {
     const r = validateSwarmInput(input({ items: ["   ", "\t"] }));
     expect(r.ok).toBe(false);
@@ -519,6 +531,26 @@ describe("resolveSwarmModelRoute", () => {
     if (!r.ok) {
       expect(r.error.code).toBe(SWARM_ERROR_CODES.MODEL_AMBIGUOUS);
       expect(r.error.details?.candidates).toEqual(["google/gemini-2.5-pro", "vertex/gemini-2.5-pro"]);
+      expect(r.error.details?.candidateCount).toBe(2);
+    }
+  });
+
+  it("候选与回显同样封顶：候选超过上限时截断并给总数，超长 model 串只回显片段", () => {
+    const many = Array.from({ length: ALLOWED_ROUTES_DETAILS_CAP + 5 }, (_, i) => ({
+      provider: `p${String(i)}`,
+      model: "shared",
+    }));
+    const ambiguous = resolveSwarmModelRoute("shared", many);
+    expect(ambiguous.ok).toBe(false);
+    if (!ambiguous.ok) {
+      expect(ambiguous.error.details?.candidates).toHaveLength(ALLOWED_ROUTES_DETAILS_CAP);
+      expect(ambiguous.error.details?.candidateCount).toBe(ALLOWED_ROUTES_DETAILS_CAP + 5);
+    }
+    const longModel = "m".repeat(10_000);
+    const notAllowed = resolveSwarmModelRoute(longModel, many);
+    expect(notAllowed.ok).toBe(false);
+    if (!notAllowed.ok) {
+      expect(notAllowed.error.message.length).toBeLessThan(DUPLICATE_SNIPPET_MAX_CHARS * 3);
     }
   });
 
