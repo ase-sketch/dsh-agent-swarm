@@ -17,7 +17,7 @@
 2. 六道硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同；item 元素必须是非空字符串（第六道，2026-10-01 审查后补）
 3. 并发调度器：首波 5 并发、之后每 700ms 放 1 个、限流指数退避（3000ms×2ⁿ）、容量收缩防抖 2000ms、每 180s 恢复 +1（下限 1）、最后任务持续限流判 failed（死锁防护）、首个请求未发出的限流重罚
    —— **交付态修正（2026-10-01）**：本条前半（首波/放量/超时/中断/结果落位）已交付；**限流相关的后半（退避、容量收缩恢复、死锁防护、重罚）在交付态无触发路径**，详见下「交付状态」。
-4. 每任务超时（默认 2h 可配，**自建** `AbortSignal.any([父signal, AbortSignal.timeout])`——start() 无 timeout 字段）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
+4. 每任务超时（默认 2h 可配；start() 无 timeout 字段，由**调度器的超时闸门**到点 abort 成员信号——该信号同时级联用户中断，取消与超时文案单一来源；2026-10-01 第三轮去掉了重复的 `AbortSignal.timeout`）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
 5. 结果汇总：`<agent_swarm_result>` XML，**body 转义**、编号一致（规避 Kimi 已核实缺陷 D13/D14）
 6. 插件 config：并发/节奏/超时参数；**自动批准无需声明**（spike Q8：无 approvalRule 机制，不调 ctx.approval 即不弹窗）；子代理沙箱档位经 `parent: exec.agent` 自动继承
 7. 测试三层：纯函数单测 + mock Context 契约测试 + 真实 Loader 加载测试
@@ -25,6 +25,9 @@
 二期（本仓 backlog，另行 spike）：resume_agent_ids（continuable 续跑）、fork、模式状态机（enter/exit 提示词注入 + 轮末自动退出）、subagent_type 选择、团队面板整合（若自研面板后仍需要）。
 其中 `resume_agent_ids` 的前置条件（结果块需回传 `agent_id`）已于 2026-10-01 修复落地；
 `model`（按批次选模型）已于 2026-10-01 交付（见下「1.5 期」），`subagent_type` 因 DSH 无 agent profile 对应物仍留 backlog。
+**2026-10-01 第三轮**：`fork` 以 DSH 原生 fork provider 交付为可选参数 `context: "fork"`（见 `.agents/notes/implemented/feature/2026-10-01-fork-context.md`；
+与上游语义是否等价**未核实**，需 01-机制文档 的行为描述）；`resume_agent_ids` 订正为「阻塞于 one-shot 不可续跑」，
+改为先 spike（`.agents/notes/proposed/feature/2026-10-01-resume-agent-ids.md`）；模式状态机延后（`.agents/notes/proposed/feature/2026-10-01-swarm-mode-state-machine.md`）。
 
 ## 1.5 期（2026-10-01 交付）：per-call 模型路由 + 面板收纳
 
@@ -37,7 +40,14 @@
 
 审查报告：`docs/code-quality-review-2026-10-01.md`。以下是与原规格不一致的交付事实，逐条回写：
 
-- **一期限流退避未交付（未收敛）**：`src/index.ts` 的 `isRateLimitErrorPhaseOne` 恒返回 false，
+- **一期限流退避：接线已就绪、默认关闭（2026-10-01 第三轮）**。`config.rateLimit.enabled`（默认 false）开启后：
+  插件订阅 `session/event`，按子会话 id 收集 `llm/retry` 与 `turn/end`（`src/rate-limit-signal.ts`，纯逻辑）；
+  子代理以 `error` 收场且 `turn/end` 记录的最终失败码属于 `rateLimit.failureCodes`（默认 `["RATE_LIMIT"]`）时，
+  抛出带品牌的 `SwarmRateLimitedFailure` 交给调度器既有的退避重排队，`rateLimit.maxRetries`（默认 3）透传为
+  `maxRateLimitRetries`。关闭时不订阅任何事件，行为与接线前逐字节一致（全部既有用例原样通过 + L 组守护用例）。
+  **开启前仍须实机确认**：① 失败码实际取值；② 插件级 `session/event` 监听能否收到子会话事件；
+  ③ 子会话 id 是否等于 `run.id`；④ `maxRetries` 取值。未做的「在途背压」与重罚档位映射见归属决策笔记。
+  以下为接线前的历史记录：原 `isRateLimitErrorPhaseOne` 恒返回 false，
   而它是调度器唯一的限流判定入口（`src/scheduler.ts` 中"限流结局"的唯一产出点）→ 退避、容量收缩/恢复、
   `retrying` 相位、面板退避 UI 全部不触发。**启用前置条件**（三条都满足才动手）：
   ① M3 实机确认子会话 `llm/retry` 事件的 `failure.code` 取值；
@@ -48,7 +58,10 @@
      但**生产未接线**、取值待 M3 实机校准——见 `.agents/notes/implemented/process/2026-10-01-rate-limit-capability-status.md`。
   原先列的"容量恢复无上界"经复核**判定不修**：`maxConcurrency` 是独立第二道闸门，已兜住"超过宿主设定"这一唯一实际风险；
   给容量加硬上限反而会在"早期限流"后把容量永久锁在 1，比无上界更糟（理由见归属决策笔记的「复核订正」）。
-- **`resume_agent_ids`（二期）的取值来源已补齐**：结果块此前丢弃 `agent_id` 属性，已修复；二期续跑不再被这一条卡住。
+- **`resume_agent_ids`（二期）**：结果块此前丢弃 `agent_id` 属性，已修复。**但 2026-10-01 第三轮订正**：
+  "二期续跑不再被卡住"的结论不成立——XML 里的 `agent_id` 是 **one-shot** run 的 id，而 DSH 对非 continuable
+  子代理一律抛 `NOT_RESUMABLE`（`@deepseek-ai/dsh-subagent` 续跑路径的 `descriptor.mode !== "continuable"` 判定）。
+  真正的前置条件与三条候选路线见 `.agents/notes/proposed/feature/2026-10-01-resume-agent-ids.md`。
 - **测试链改为先构建**：`pnpm test` 现在前置 `pnpm run build`，client 侧测试在内存里打包，host 侧 Loader 测试加载 `dist/index.js`
   （此前各测各的：client 测盘上旧产物、host 测源码命名空间、`dist/index.js` 无人验证）。
 - **clean-room 文案修正**：三条与上游逐字相同的文案/常量已改写为本仓自拟（见 `THIRD-PARTY-NOTICES.md`）。
@@ -56,7 +69,7 @@
 ## 非目标
 
 - 任何 Kimi UI 复刻；不做独立渲染卡片
-- swarm 成员嵌套 swarm（DSH maxDepth 默认 1，工具描述中明示禁止）
+- swarm 成员嵌套 swarm（DSH maxDepth 默认 1）。**2026-10-01 第三轮订正**：此前插件不向 start() 透传 `maxDepth`，而 DSH 只在请求带了它时才校验深度——"禁止嵌套"实际只是一句文案。现由 `batch-plan.ts` 经 `ctx.subagents.resolveMaxDepth()` 取宿主上限透传给每个成员，并在开批次前预检（`DELEGATION_DEPTH_EXCEEDED`，零派发）；Config 新增 `maxDepth`（缺省跟随宿主设置 / 自然数 / `"provider-managed"`）
 - 一期不做跨会话的 swarm 状态持久化
 
 ## 验收

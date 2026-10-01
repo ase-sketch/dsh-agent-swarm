@@ -21,7 +21,7 @@ export interface SwarmRosterRequest {
 }
 
 export class SwarmRemote extends TypertRemoteService {
-  private registry: SwarmRegistry;
+  private readonly registry: SwarmRegistry;
 
   constructor(ctx: Context, registry: SwarmRegistry) {
     super(ctx, "swarmRemote", { namespace: "swarm" });
@@ -30,10 +30,6 @@ export class SwarmRemote extends TypertRemoteService {
 
   getRegistry(): SwarmRegistry {
     return this.registry;
-  }
-
-  setRegistry(registry: SwarmRegistry): void {
-    this.registry = registry;
   }
 
   @Remote({ mode: "stream" })

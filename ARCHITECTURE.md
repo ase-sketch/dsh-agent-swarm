@@ -7,24 +7,39 @@ DSH host 插件：把"批量子代理任务"包装成一个模型可调用的 `a
 
 ```
 src/
+  ── 纯逻辑层（零 DSH 运行时依赖，可脱离宿主单测）──
   types.ts               纯类型：任务规格、结果、调度器配置、错误码、默认调度参数
   validate.ts            纯函数：六道硬校验 + 模板展开（{{item}}）+ prompt 去重 + per-call 模型路由匹配（白名单）
-  result-xml.ts          纯函数：<agent_swarm_result> 渲染（属性/body 转义、编号一致）
+  result-xml.ts          纯函数：<agent_swarm_result> 渲染（属性/body 转义、编号一致）+ 生产用兜底渲染
   scheduler.ts           纯逻辑调度器：首波/放量/退避/容量收缩恢复；执行函数、限流判定、时钟全部注入
   swarm-registry.ts      纯逻辑状态机：成员七态生命周期 + 100ms 合帧 roster 广播（面板的数据源）
+  tool-spec.ts           纯函数：面向模型的工具名/描述/参数映射/输出契约 + 生效上限（描述与校验同一口径）
+  swarm-error.ts         纯函数：结构化校验错误 → 可抛出 Error 的唯一出口（code + details 渲染进模型可见的 message）
+  rate-limit-signal.ts   纯逻辑：按子会话 id 收集 llm/retry 与 turn/end，判定子代理是否被限流拖死（限流接线，默认关闭）
+  text-clip.ts           纯函数：全仓唯一的文本截断出口——不劈开 UTF-16 代理对、不切碎 JSON 转义序列
+  remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符
+  ── 宿主集成层（依赖 DSH 运行时或其类型）──
+  config.ts              插件 Config schema（schemastery）+ 解析后配置形状 + 插件配置→调度器配置的唯一映射
+  batch-plan.ts          批次规划：校验/策略上限/起始上下文（fork）/模型路由（读 ctx.subagentModelSelection 白名单）
+                         /父 agent 与会话/provider 可用性/委派深度上限 → 批次计划。
+                         **所有整体拒绝都在这里，发生在任何子代理启动与批次登记之前**
+  batch-run.ts           批次执行：开批次 → 装配调度器 → 逐成员 ctx.subagents.start（start/dispose 配对）→ 收批次；
+                         限流接线开启时，子代理以 error 收场且被判限流 → 抛品牌错误交给调度器退避重排队
   remote.ts              host 半 Remote 服务：TypertRemoteService 以 stream 暴露 swarm/roster
-  remote-descriptor.ts   纯数据：客户端 $mount 用的 TYPERT_REMOTE 描述符（零宿主依赖）
-  index.ts               插件入口 apply(ctx)：注册工具、接 ctx.subagents、装配调度器与 registry、
-                         按需读 ctx.subagentModelSelection 白名单（可选服务，per-call model 的唯一权威源）
+  index.ts               插件入口：name / inject / Config / apply——只做装配（plan → run → render）；
+                         限流接线开启时订阅 session/event 交给 rate-limit-signal 路由（disposer 解除）
   client/                同包 client 半（由 scripts/build-client.mjs 单独打包，不进 tsc 产物）
     index.ts               client 入口 apply(ctx)：**父 fiber** 只做 $mount Remote（提供 remote.swarm 命名空间），
                        随后用 ctx.plugin 载入**子 fiber**（inject 声明 remote.swarm）注册槽位与字典
                        —— 提供与消费必须分属两个 fiber，理由见决策笔记 2026-10-01-client-namespace-inject-isolation.md
-    model.ts               会话/成员视图的内存模型（useSwarm 的订阅源）
+    model.ts               会话视图（可见批次列表）的内存模型（useSwarm 的订阅源）+ 帧合并纯函数
     service.ts             按会话引用计数订阅 swarm/roster 流
-    SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式；成员按相位四组独立折叠、批次路由标签）
+    SwarmHeaderAction.tsx  标题栏动作与弹层组件（含内联样式；成员按相位四组独立折叠、批次路由标签、多批次切换）；
+                           文案全部经框架注入的 `t`（槽位声明 locale 后由 DSH 注入，同官方 jobs 面板），缺省回落中文
+    locales.ts             面板中英字典（键集合一致）+ `{name}` 插值 + 缺省翻译
 scripts/build-client.mjs   esbuild 预构建：src/client/index.ts → dist/client.js（__ModuleLoader__ 包）
 tests/                     vitest：纯函数单测 + mock Context 契约测试 + 真实 Loader 测试 + client 模型/服务
+                           + 组件渲染测试（client-render.test.tsx，jsdom + @testing-library/react）
 cordis.patch.yml           bundle 层：insert 唯一的 agent-swarm 行（name 自指本包）
 icon.svg                   插件管理页图标
 docs/                      spec.md、code-quality-review 报告、spike 笔记
@@ -32,29 +47,42 @@ docs/                      spec.md、code-quality-review 报告、spike 笔记
 
 ## 依赖方向
 
-host 半：`index.ts` 是唯一装配点，向下引用 `scheduler.ts`、`validate.ts`、`result-xml.ts`、`swarm-registry.ts`、`remote.ts`；
-`remote.ts` → `swarm-registry.ts`；`scheduler.ts`、`validate.ts`、`result-xml.ts` → `types.ts`（三者**互不依赖**）。
+host 半：`index.ts` 是唯一装配点 → `batch-plan.ts`、`batch-run.ts`、`result-xml.ts`、`tool-spec.ts`、`swarm-registry.ts`、`remote.ts`；
+`batch-plan.ts` → `validate.ts`、`swarm-error.ts`、`tool-spec.ts`、`config.ts`；
+`batch-run.ts` → `scheduler.ts`、`config.ts`（以及 `batch-plan.ts` / `swarm-registry.ts` / `rate-limit-signal.ts` 的**类型**）；
+`index.ts` → `rate-limit-signal.ts`（构造路由器）；
+`remote.ts` → `swarm-registry.ts`；纯逻辑层内部只依赖 `types.ts`
+（`scheduler.ts`、`validate.ts`、`result-xml.ts` **互不依赖**；`tool-spec.ts`、`swarm-error.ts` 同样只依赖 `types.ts`；
+`text-clip.ts` 无任何依赖，被 `validate.ts` / `swarm-error.ts` / `swarm-registry.ts` / `batch-run.ts` 共用）。
 
-**方向别读错**：`scheduler.ts` 不依赖 `validate.ts` / `result-xml.ts`——它们在 `index.ts` 的执行链里先后被调用（那是**数据流**，见下节），不是模块依赖。
+**方向别读错**：`scheduler.ts` 不依赖 `validate.ts` / `result-xml.ts`——它们在一次工具调用里先后被调用（那是**数据流**，见下节），不是模块依赖。
+纯逻辑层**绝不**反向依赖宿主集成层。
 
 client 半：`client/index.ts` → `client/model.ts`、`client/service.ts`、`SwarmHeaderAction.tsx`、`../remote-descriptor.ts`（其中 `remote-descriptor` 是值引用）。
 client 半的模块之间**只有类型引用**（`import type`）：模型实例经槽位 `inject` 注入到组件与服务，不存在运行时模块耦合。
 
-纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / remote-descriptor）**零 DSH 运行时依赖**，
-可脱离宿主单测；`remote.ts` 依赖 `@deepseek-ai/dsh-typert-protocol`，是 host 半里唯一的协议层依赖。
+纯逻辑层（types / validate / result-xml / scheduler / swarm-registry / tool-spec / swarm-error / rate-limit-signal / text-clip / remote-descriptor）
+**零 DSH 运行时依赖**，可脱离宿主单测；`remote.ts` 依赖 `@deepseek-ai/dsh-typert-protocol`，是 host 半里唯一的协议层依赖；
+`config.ts` 依赖 `@deepseek-ai/schemastery`，`index.ts` 依赖 `@deepseek-ai/dsh-tools`（defineTool）。
 
 ## 数据流
 
-模型调 `agent_swarm` → validate 展开任务 → per-call model 经宿主白名单解析为批次路由（缺省继承父 agent）
-→ scheduler 按节奏并发执行 → 每个任务经 `ctx.subagents.start("spawn", …)` 派发 one-shot 子代理
-→ 结果汇聚 → result-xml 渲染 → 工具结果返回模型。
+模型调 `agent_swarm` → **batch-plan**：validate 展开任务、宿主策略上限、per-call model 经宿主白名单解析为批次路由
+（缺省继承父 agent）、取父 agent 与会话 → **batch-run**：scheduler 按节奏并发执行，每个任务经
+`ctx.subagents.start("spawn", …)` 派发 one-shot 子代理 → 结果汇聚 → **result-xml** 渲染 → 工具结果返回模型。
 中断：AbortSignal 级联取消在跑任务并清空队列。
 
 ## host/client 双半数据流（面板）
 
-调度器相位变化 → 写入 `swarm-registry`（成员七态 + 批次路由标签）→ registry 100ms 合帧广播三类帧（opened / roster / closed）
+调度器相位变化 → 写入 `swarm-registry`（成员七态 + 批次路由标签；item/detail 只存显示摘要）
+→ registry **只唤醒发生变化的那个会话**的流，100ms 合帧后**只发版本变化了的批次**（opened / roster / closed 三类帧）
 → `remote.ts` 以 stream 下发 → client 的 `service.ts` 按会话引用计数订阅并写入 `model.ts`
 → `SwarmHeaderAction.tsx` 渲染标题栏徽标与弹层。
+
+**可见批次**：同一会话里一个批次保持可见，直到它结束之后又有新批次开始——同一条消息里并发的几次调用
+作为一组同时可见（弹层顶部可切换），下一次调用开始时整组换下。roster 帧携带 `visibleSwarmIds`，
+client 据此合并与清理（`model.ts` 的 `mergeRosterFrame`）。registry 的会话数与每会话批次数有上限，
+只淘汰已结束的批次。
 
 **权威口径：工具返回的 XML 是成员状态的唯一权威，面板只是过程可见性。** 两者不一致时以 XML 为准
 （2026-10-01 审查发现中断路径上 registry 与 XML 结论相反，已修复，见 `.agents/notes/implemented/bug-fix/`）。

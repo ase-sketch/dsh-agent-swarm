@@ -40,14 +40,12 @@
 
 import {
   DEFAULT_SWARM_SCHEDULER_CONFIG,
-  type SwarmAbandonedEvent,
   type SwarmAttemptContext,
   type SwarmAttemptResult,
   type SwarmRateLimitClass,
   type SwarmSchedulerConfig,
   type SwarmSchedulerDeps,
   type SwarmState,
-  type SwarmSuspendedEvent,
   type SwarmTaskResult,
   type SwarmTaskSpec,
   type SwarmTimerHandle,
@@ -140,9 +138,38 @@ function resolveConfig(config?: Partial<SwarmSchedulerConfig>): SwarmSchedulerCo
 }
 
 /**
+ * 调度器配置的**唯一**合法性判定（构造期调用；宿主也可在加载期提前调用以 fail-fast）。
+ * 非法即抛 Error，信息里带字段名与实际值。
+ *
+ * maxConcurrency / maxRateLimitRetries 是可选参数（undefined = 无上限），但**给定**就必须是 >= 1 的整数：
+ *   0  → `active.size >= 0` 恒真（maxConcurrency：静默不放量）/ 第一次限流就判死（maxRateLimitRetries）；
+ *   NaN → 与任何数比较都 false → 闸门形同虚设；
+ *   负数/小数 → 同上或语义不明。
+ * 它们都会把"非法 config 必然抛错"的契约变成静默失效，所以一并挡掉。
+ */
+export function validateSchedulerConfig(config?: Partial<SwarmSchedulerConfig>): void {
+  const resolved = resolveConfig(config);
+  if (!(resolved.initialLaunchLimit >= 1)) {
+    throw new Error(`initialLaunchLimit must be >= 1, got ${String(resolved.initialLaunchLimit)}.`);
+  }
+  if (!(resolved.retryBaseMs >= 0)) {
+    throw new Error(`retryBaseMs must be >= 0, got ${String(resolved.retryBaseMs)}.`);
+  }
+  if (!(resolved.retryFactor >= 1)) {
+    throw new Error(`retryFactor must be >= 1, got ${String(resolved.retryFactor)}.`);
+  }
+  for (const field of ["maxConcurrency", "maxRateLimitRetries"] as const) {
+    const value = resolved[field];
+    if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
+      throw new Error(`${field} must be an integer >= 1 when set, got ${String(value)}.`);
+    }
+  }
+}
+
+/**
  * 按 spec 顺序把任务跑完，返回**与输入等长、按 index 落位**的结果数组。
- * 该 Promise 只会 resolve（批次级失败以 failed 结果的形式落位），
- * 唯一会 reject 的情况是调用方传入了非法的 config。
+ * run() 的 Promise 只会 resolve（批次级失败以 failed 结果的形式落位）；
+ * 非法 config 在**构造期同步抛错**（见 validateSchedulerConfig），根本走不到 run()。
  */
 export class SwarmScheduler {
   readonly #deps: SwarmSchedulerDeps;
@@ -177,38 +204,8 @@ export class SwarmScheduler {
   };
 
   constructor(specs: readonly SwarmTaskSpec[], deps: SwarmSchedulerDeps, config?: Partial<SwarmSchedulerConfig>) {
+    validateSchedulerConfig(config);
     this.#config = resolveConfig(config);
-    if (this.#config.initialLaunchLimit < 1) {
-      throw new Error(`initialLaunchLimit must be >= 1, got ${String(this.#config.initialLaunchLimit)}.`);
-    }
-    if (this.#config.retryBaseMs < 0) {
-      throw new Error(`retryBaseMs must be >= 0, got ${String(this.#config.retryBaseMs)}.`);
-    }
-    if (this.#config.retryFactor < 1) {
-      throw new Error(`retryFactor must be >= 1, got ${String(this.#config.retryFactor)}.`);
-    }
-    // maxConcurrency 是可选参数（undefined = 无上限），但**给定**就必须是 >= 1 的整数：
-    //   0  → `active.size >= 0` 恒真 → 限流模式静默不放量（且不装任何唤醒）；
-    //   NaN → 与任何数比较都 false → 闸门形同虚设；
-    //   负数/小数 → 同上或语义不明。
-    // 三者都会把"只有非法 config 才会抛"的契约变成静默失效，所以在构造期一并挡掉。
-    if (this.#config.maxConcurrency !== undefined) {
-      const maxConcurrency = this.#config.maxConcurrency;
-      if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
-        throw new Error(`maxConcurrency must be an integer >= 1 when set, got ${String(maxConcurrency)}.`);
-      }
-    }
-    // maxRateLimitRetries 同理：undefined = 无上限（向后兼容），给定就必须是 >= 1 的整数。
-    // 0 / NaN / 小数 / 负数分别会变成"第一次限流就判死"/"比较恒假"/"语义不明"/"第一次就判死"，
-    // 即把这条判死条件变成静默失效或语义漂移——与 maxConcurrency 同样在构造期挡掉。
-    if (this.#config.maxRateLimitRetries !== undefined) {
-      const maxRateLimitRetries = this.#config.maxRateLimitRetries;
-      if (!Number.isInteger(maxRateLimitRetries) || maxRateLimitRetries < 1) {
-        throw new Error(
-          `maxRateLimitRetries must be an integer >= 1 when set, got ${String(maxRateLimitRetries)}.`,
-        );
-      }
-    }
     this.#deps = deps;
     this.#globalRetryIntervalMs = this.#config.retryBaseMs;
     this.#states = specs.map((spec, i) => ({
@@ -780,25 +777,24 @@ export class SwarmScheduler {
   }
 
   #failedResult(state: TaskState, error: string): SwarmTaskResult {
-    const message = error;
     return this.#withHostFailures(state, {
       spec: state.spec,
       outcome: "failed",
       state: this.#startedOf(state),
       ...(state.agentId === undefined ? {} : { agentId: state.agentId }),
-      error: message,
+      error,
     });
   }
 
   #abortedResult(state: TaskState, agentId: string | undefined): SwarmTaskResult {
-    const started = state.started || state.agentId !== undefined;
+    const startedState = this.#startedOf(state);
     const id = agentId ?? state.agentId;
     return this.#withHostFailures(state, {
       spec: state.spec,
       outcome: "aborted",
-      state: this.#startedOf(state),
+      state: startedState,
       ...(id === undefined ? {} : { agentId: id }),
-      error: started ? ABORTED_WHILE_RUNNING : ABORTED_BEFORE_START,
+      error: startedState === "started" ? ABORTED_WHILE_RUNNING : ABORTED_BEFORE_START,
     });
   }
 

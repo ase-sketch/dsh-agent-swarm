@@ -23,12 +23,27 @@ import {
   SWARM_MIN_ITEMS,
 } from "../src/types.js";
 import type { SwarmBatch, SwarmPhase, SwarmRegistry } from "../src/swarm-registry.js";
+import { RateLimitWatchRouter } from "../src/rate-limit-signal.js";
+import { hasLoneSurrogate } from "./helpers/surrogates.js";
 
 // ───────────────────────── mock Context ─────────────────────────
 
 interface StartCall {
   provider: string;
   request: Record<string, unknown>;
+}
+
+/** 交给自定义 run 工厂的一次 start 调用（index 为 0-based 调用序号）。 */
+interface StartInvocation extends StartCall {
+  index: number;
+}
+
+/** start() 返回的 run 句柄桩（形状对齐 SubagentRun 中本插件用到的字段）。 */
+interface MockRun {
+  id: string;
+  localAgent?: unknown;
+  result: Promise<unknown>;
+  dispose: () => Promise<void>;
 }
 
 interface MockContextOptions {
@@ -45,6 +60,13 @@ interface MockContextOptions {
    * 走真实 ctx.provide 注册——插件经 ctx.get 读取，与生产同一条路径。
    */
   modelSelection?: { enabled: boolean; allowedModels: { provider: string; model: string }[] };
+  /**
+   * 完全接管 run 的构造（信号驱动、事件驱动、可控 result 等场景）。
+   * 给了它，stopReasons / failStartAt / rejectResultAt 都不再生效；dispose 计数仍由 harness 统计。
+   */
+  runFactory?: (call: StartInvocation) => Promise<MockRun>;
+  /** ctx.subagents 上 start 之外的桩方法（resolveMaxDepth / getProvider 等）。 */
+  subagents?: Record<string, unknown>;
 }
 
 interface MockHarness {
@@ -89,10 +111,20 @@ function createHarness(options: MockContextOptions = {}): MockHarness {
   Object.defineProperty(ctx, "subagents", {
     configurable: true,
     value: {
+      ...options.subagents,
       start: (provider: string, request: Record<string, unknown>) => {
         const current = callIndex;
         callIndex += 1;
         startCalls.push({ provider, request });
+        if (options.runFactory !== undefined) {
+          return options.runFactory({ provider, request, index: current }).then((run) => ({
+            ...run,
+            dispose: () => {
+              disposeCount += 1;
+              return run.dispose();
+            },
+          }));
+        }
         if (failStartAt.has(current)) {
           return Promise.reject(new Error(`provider "${String(provider)}" refused to start`));
         }
@@ -157,6 +189,38 @@ function defaultConfig(): Parameters<typeof plugin.apply>[1] {
   };
 }
 
+/**
+ * run.result 一直挂着，直到成员信号 abort 才按 `onAbort` 收场——这是真实 provider 被取消后的行为
+ * （spike Q5：发布后 abort → settle 为 aborted）。用于观察"成员已在跑、随后被中断/超时"的时序。
+ */
+function settleOnAbort(
+  signal: AbortSignal,
+  onAbort: (resolve: (value: unknown) => void, reject: (reason: unknown) => void) => void,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const settle = (): void => {
+      onAbort(resolve, reject);
+    };
+    if (signal.aborted) {
+      settle();
+      return;
+    }
+    signal.addEventListener("abort", settle, { once: true });
+  });
+}
+
+/**
+ * 运行期加载真实构建产物 dist/index.js。
+ *
+ * 刻意用运行期 URL 而不是字面量 `import("../dist/index.js")`：字面量会让 `tsc --noEmit`
+ * 静态解析 dist 的 .d.ts——干净检出（还没构建）时 typecheck 直接报 TS2307，
+ * 改了 src 未重建时又拿**过期**的 dist 类型去和 src 比对。这里要测的是运行期产物本身，
+ * 类型由调用处显式断言。
+ */
+function importDistEntry(): Promise<unknown> {
+  return import(new URL("../dist/index.js", import.meta.url).href) as Promise<unknown>;
+}
+
 /** 最小可用的执行上下文。 */
 function makeExec(signal = new AbortController().signal): Record<string, unknown> {
   return { callId: "call-1", name: "agent_swarm", signal, agent: FAKE_AGENT };
@@ -205,6 +269,51 @@ describe("A. 插件声明形态", () => {
     expect("timeoutMs" in DEFAULT_SWARM_SCHEDULER_CONFIG).toBe(false);
     expect(DEFAULT_SWARM_SCHEDULER_CONFIG.timeoutMs).toBeUndefined();
   });
+
+  it("Config 在加载期拒绝调度器必拒的值（firstWave/retryFactor < 1），并接受小数因子", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    // 此前 natural() 放行 0：之后每次 agent_swarm 调用都在调度器构造期失败（且发生在批次登记之后）。
+    expect(() => resolve({ firstWave: 0 })).toThrow(/firstWave/);
+    expect(() => resolve({ retryFactor: 0 })).toThrow(/retryFactor/);
+    expect(() => resolve({ retryFactor: 0.5 })).toThrow(/retryFactor/);
+    // 调度器支持 >= 1 的实数因子；此前 natural() 会把 1.5 拒掉。
+    expect(resolve({ retryFactor: 1.5 }).retryFactor).toBe(1.5);
+  });
+
+  it("fork：provider 默认 \"fork\"、fork 批次上限默认 16（且 >= 1）", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve()).toMatchObject({ forkProvider: "fork", maxForkItems: 16 });
+    expect(() => resolve({ maxForkItems: 0 })).toThrow(/maxForkItems/);
+  });
+
+  it("rateLimit：默认关闭，限流码默认 RATE_LIMIT、重排队上限默认 3", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve().rateLimit).toEqual({ enabled: false, failureCodes: ["RATE_LIMIT"], maxRetries: 3 });
+    expect(() => resolve({ rateLimit: { enabled: true, maxRetries: 0 } })).toThrow(/maxRetries/);
+  });
+
+  it("maxDepth：缺省保持 undefined（跟随宿主设置），接受自然数与 \"provider-managed\"", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve().maxDepth).toBeUndefined();
+    expect(resolve({ maxDepth: 2 }).maxDepth).toBe(2);
+    expect(resolve({ maxDepth: "provider-managed" }).maxDepth).toBe("provider-managed");
+    expect(() => resolve({ maxDepth: -1 })).toThrow(/maxDepth/);
+    expect(() => resolve({ maxDepth: "unbounded" })).toThrow(/maxDepth/);
+  });
+
+  it("绕过 schema 传入非法调度配置时，apply 在任何副作用之前 fail-fast", () => {
+    const ctx = new Context() as unknown as Context & Record<string, unknown>;
+    let registered = false;
+    Object.defineProperty(ctx, "tools", {
+      configurable: true,
+      value: { register: () => ((registered = true), () => undefined) },
+    });
+    Object.defineProperty(ctx, "subagents", { configurable: true, value: { start: () => Promise.reject() } });
+    expect(() => plugin.apply(ctx, { ...defaultConfig(), firstWave: 0 })).toThrow(/initialLaunchLimit/);
+    // 没有注册工具，也没有挂 swarmRemote 服务：失败不留下任何半装配状态。
+    expect(registered).toBe(false);
+    expect(ctx.get("swarmRemote")).toBeUndefined();
+  });
 });
 
 // ───────────────────────── B. defineTool 形态 ─────────────────────────
@@ -218,6 +327,7 @@ describe("B. defineTool 注册形态", () => {
       required?: string[];
     };
     expect(Object.keys(parameters.properties).sort()).toEqual([
+      "context",
       "description",
       "items",
       "model",
@@ -240,10 +350,12 @@ describe("B. defineTool 注册形态", () => {
     expect(description).toMatch(/at most \d+ entries/);
     expect(description).toMatch(/prompt_template/);
     expect(description).toMatch(/\{\{item\}\}/);
+    // 第六道：item 必须是非空字符串（此前描述只列五道，模型不知道这条）
+    expect(description).toMatch(/6\. every item must be a string with at least one non-whitespace character/);
     // 与单个 subagent 工具的分工
     expect(description).toMatch(/single-subagent tool/i);
-    // 禁止嵌套
-    expect(description).toMatch(/depth is capped at 1/i);
+    // 禁止嵌套：描述指向宿主的深度限制（真实生效，见 K 组），不再写死一个代码里不存在的上限
+    expect(description).toMatch(/host's subagent depth limit/i);
     expect(description).toMatch(/[Nn]esting a swarm/);
   });
 
@@ -454,10 +566,36 @@ describe("D. 派发红线", () => {
     expect(first.request.prompt).toEqual([
       { type: "text", text: "Review a.md and report findings." },
     ]);
-    expect(typeof first.request.label).toBe("string");
+    expect(first.request.label).toBe("1/3: a.md");
     expect(first.request.signal).toBeInstanceOf(AbortSignal);
     // start 请求没有 timeout 字段（spike Q2.2）
     expect(first.request).not.toHaveProperty("timeout");
+  });
+
+  it("label 只是显示摘要：长 item 截断、多行折叠成单行，完整 prompt 仍原样派发", async () => {
+    // label 会随 subagent/catalog 事件持久化进父会话日志：整份文件塞进 item 时不能原样复制过去。
+    const longItem = `${"x".repeat(200)}\nsecond line`;
+    const harness = createHarness();
+    await harness.definition.execute(
+      validArgs({ items: [longItem, "line one\n\tline two"] }),
+      makeExec() as never,
+    );
+    const [first, second] = harness.startCalls as [StartCall, StartCall];
+    expect(first.request.label).toBe(`1/2: ${"x".repeat(80)}…`);
+    expect(second.request.label).toBe("2/2: line one line two");
+    expect(first.request.prompt).toEqual([
+      { type: "text", text: `Review ${longItem} and report findings.` },
+    ]);
+  });
+
+  it("label 截断不劈开代理对（label 持久化进父会话日志，孤立代理会一直显示成乱码）", async () => {
+    // 第 80/81 个码元是一个 emoji 的代理对 → 旧实现截在两者之间
+    const item = `${"x".repeat(79)}🚀tail`;
+    const harness = createHarness();
+    await harness.definition.execute(validArgs({ items: [item, "other"] }), makeExec() as never);
+    const label = String((harness.startCalls[0] as StartCall).request.label);
+    expect(hasLoneSurrogate(label)).toBe(false);
+    expect(label).toBe(`1/2: ${"x".repeat(79)}…`);
   });
 
   it("每个 start 成功都配对一次 dispose", async () => {
@@ -481,7 +619,7 @@ describe("D. 派发红线", () => {
     expect(result.xml).toContain('outcome="failed"');
   });
 
-  it("单任务超时信号 = AbortSignal.any([批次信号, 超时])，父中断能级联到成员", async () => {
+  it("成员信号承载批次中断：父中断能级联到成员", async () => {
     const controller = new AbortController();
     const harness = createHarness();
     const pending = harness.definition.execute(validArgs(), makeExec(controller.signal) as never);
@@ -502,59 +640,33 @@ describe("D. 派发红线", () => {
     // 修复前：无条件 AbortSignal.timeout(0) 会在一个微任务后 abort，
     // 等于把每个成员秒杀成 aborted（配置成"不超时"反而全灭）。
     const controller = new AbortController();
-    const ctx = new Context() as unknown as Context & Record<string, unknown>;
-    let definition: ToolDefinition | undefined;
-    const startCalls: StartCall[] = [];
-    Object.defineProperty(ctx, "tools", {
-      configurable: true,
-      value: { register: (def: ToolDefinition) => void (definition = def) },
-    });
-    Object.defineProperty(ctx, "subagents", {
-      configurable: true,
-      value: {
-        start: (provider: string, request: Record<string, unknown>) => {
-          startCalls.push({ provider, request });
-          const signal = request.signal as AbortSignal;
-          return Promise.resolve({
-            id: `run-${String(startCalls.length)}`,
-            localAgent: undefined,
-            // 挂起直到被 abort，这样断言期间 attempt 仍存活，级联可观测。
-            // 时序本身就是回归证据：若修复前拼了 AbortSignal.timeout(0)，
-            // 每个成员会在一个微任务后被 abort，永远走不到 completed。
-            result: new Promise((resolve) => {
-              const finish = (): void => {
-                resolve({
-                  output: [{ type: "text", text: "ok" }],
-                  stopReason: signal.aborted ? "aborted" : "completed",
-                });
-              };
-              if (signal.aborted) {
-                finish();
-                return;
-              }
-              signal.addEventListener("abort", finish, { once: true });
-            }),
-            dispose: () => Promise.resolve(),
-          });
-        },
+    const harness = createHarness({
+      config: { ...defaultConfig(), taskTimeoutMs: 0 },
+      // 挂起直到被 abort，这样断言期间 attempt 仍存活，级联可观测。
+      // 时序本身就是回归证据：若拼了 AbortSignal.timeout(0)，
+      // 每个成员会在一个微任务后被 abort，永远走不到 completed。
+      runFactory: ({ request, index }) => {
+        const signal = request.signal as AbortSignal;
+        return Promise.resolve({
+          id: `run-${String(index + 1)}`,
+          result: settleOnAbort(signal, (resolve) => {
+            resolve({ output: [{ type: "text", text: "ok" }], stopReason: "aborted" });
+          }),
+          dispose: () => Promise.resolve(),
+        });
       },
     });
-    // taskTimeoutMs = 0 表示"不设单任务超时"
-    plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: 0 });
-    if (definition === undefined) throw new Error("not registered");
-    const pending = definition.execute(validArgs(), makeExec(controller.signal) as never) as Promise<{
+    const pending = harness.definition.execute(validArgs(), makeExec(controller.signal) as never) as Promise<{
       xml: string;
     }>;
 
     // 等所有成员真正派发出去（此时它们仍挂在 signal 上等待）
     await vi.waitFor(() => {
-      expect(startCalls).toHaveLength(3);
+      expect(harness.startCalls).toHaveLength(3);
     });
-    const memberSignal = (startCalls[0] as StartCall).request.signal as AbortSignal;
+    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
 
-    // 关键断言：signal 没有被自动 abort。
-    // 修复前无条件 AbortSignal.timeout(0) 会让信号在一��微任务后变 aborted，
-    // 配置成「不超时」反而把每个成员秒杀——这里就是那道护栏。
+    // 关键断言：signal 没有被自动 abort（配置成「不超时」不能把每个成员秒杀）。
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(memberSignal.aborted).toBe(false);
 
@@ -563,46 +675,47 @@ describe("D. 派发红线", () => {
     expect(memberSignal.aborted).toBe(true);
 
     // 三个成员都落在 aborted 档（批次级中断），而不是 completed。
-    // 这同时说明：它们是被我们**手动**中断的，而不是被一个 0ms 超时秒杀——
-    // 若修复前拼了 AbortSignal.timeout(0)，在 controller.abort() 之前它们早已 aborted。
     const result = await pending;
     expect(result.xml).toContain("<summary>aborted: 3</summary>");
   });
 
   it("回归 F2：taskTimeoutMs 透传给调度器，超时成员落 Subagent timed out. 文案", async () => {
     // 修复前：runSwarm 没接 timeoutMs，调度器永远不会打出这句文案。
-    const ctx = new Context() as unknown as Context & Record<string, unknown>;
-    let definition: ToolDefinition | undefined;
-    Object.defineProperty(ctx, "tools", {
-      configurable: true,
-      value: { register: (def: ToolDefinition) => void (definition = def) },
-    });
-    Object.defineProperty(ctx, "subagents", {
-      configurable: true,
-      value: {
-        start: (_provider: string, request: Record<string, unknown>) =>
-          Promise.resolve({
-            id: "run-timeout",
-            localAgent: undefined,
-            // 只有被 abort 才会 settle：真实 provider 在 signal 触发后返回 aborted。
-            // 修复前这里用永不 settle 的 Promise，会让用例超时而非验证文案。
-            result: new Promise((resolve) => {
-              (request.signal as AbortSignal).addEventListener(
-                "abort",
-                () => resolve({ output: [], stopReason: "aborted" }),
-                { once: true },
-              );
-            }),
-            dispose: () => Promise.resolve(),
+    const harness = createHarness({
+      // 很短的超时，让调度器的闸门先于任何真实完成触发
+      config: { ...defaultConfig(), taskTimeoutMs: 10 },
+      // 只有被 abort 才会 settle：真实 provider 在 signal 触发后返回 aborted。
+      runFactory: ({ request }) =>
+        Promise.resolve({
+          id: "run-timeout",
+          result: settleOnAbort(request.signal as AbortSignal, (resolve) => {
+            resolve({ output: [], stopReason: "aborted" });
           }),
-      },
+          dispose: () => Promise.resolve(),
+        }),
     });
-    // 很短的超时，让调度器的闸门先于任何真实完成触发
-    plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: 10 });
-    if (definition === undefined) throw new Error("not registered");
-    const result = (await definition.execute(validArgs(), makeExec() as never)) as { xml: string };
+    const result = (await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string };
     expect(result.xml).toContain("Subagent timed out.");
     expect(result.xml).toContain('<summary>failed: 3</summary>');
+    // 子代理被取消的原因就是调度器超时闸门的原因（单一来源），而不是另一个计时器的 TimeoutError。
+    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
+    expect(memberSignal.reason).toBeInstanceOf(Error);
+    expect((memberSignal.reason as Error).message).toBe("Subagent timed out.");
+  });
+
+  it("超时只有一个来源：宿主不再另建 AbortSignal.timeout（两个同时长计时器会竞速）", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+    const anySpy = vi.spyOn(AbortSignal, "any");
+    try {
+      const harness = createHarness({ config: { ...defaultConfig(), taskTimeoutMs: 60_000 } });
+      await harness.definition.execute(validArgs(), makeExec() as never);
+      expect(harness.startCalls).toHaveLength(3);
+      expect(timeoutSpy).not.toHaveBeenCalled();
+      expect(anySpy).not.toHaveBeenCalled();
+    } finally {
+      timeoutSpy.mockRestore();
+      anySpy.mockRestore();
+    }
   });
 
   it("stopReason=aborted 归取消，绝不触发限流重排队", async () => {
@@ -792,7 +905,7 @@ describe("F. 真实 Loader 加载路径", () => {
     // 引用）。真实运行时每个 entry 是一次全新 import，拿到全新模块实例与其全新
     // apply；同进程内我们无法复刻"全新模块实例"，于是保留这层最小薄包装
     // 转发调用来造出全新 apply 引用——export 本身取自真实 dist/index.js。
-    const dist = (await import("../dist/index.js")) as typeof plugin;
+    const dist = (await importDistEntry()) as typeof plugin;
     (loader as { internal: unknown }).internal = {
       import: async () => ({
         name: dist.name,
@@ -852,7 +965,7 @@ describe("F. 真实 Loader 加载路径", () => {
   it("真实构建产物 dist/index.js 同样只用具名导出，绝不 export default（红线）", async () => {
     // 直接守 AGENTS.md 红线：生产实际加载的 dist/index.js 若出现 default 导出，
     // Loader 会走 unwrapExports 分支掩盖真实缺陷。这里对构建产物断言。
-    const dist = (await import("../dist/index.js")) as Record<string, unknown>;
+    const dist = (await importDistEntry()) as Record<string, unknown>;
     expect("default" in dist).toBe(false);
     expect(dist.name).toBe("agent-swarm");
     expect(typeof dist.apply).toBe("function");
@@ -898,58 +1011,30 @@ function createSignalDrivenHarness(options: {
   /** 首个成员不等待信号、立刻因自身原因失败（用于"先失败、后中断"的到达顺序）。 */
   firstFailsImmediately?: boolean;
 }): { ctx: Context; definition: ToolDefinition; memberSignals: AbortSignal[] } {
-  const ctx = new Context() as unknown as Context & Record<string, unknown>;
   const memberSignals: AbortSignal[] = [];
-  let definition: ToolDefinition | undefined;
-
-  Object.defineProperty(ctx, "tools", {
-    configurable: true,
-    value: {
-      register: (def: ToolDefinition) => {
-        definition = def;
-        return () => {
-          definition = undefined;
-        };
-      },
-    },
-  });
-
-  Object.defineProperty(ctx, "subagents", {
-    configurable: true,
-    value: {
-      start: (_provider: string, request: Record<string, unknown>) => {
-        const signal = request.signal as AbortSignal;
-        memberSignals.push(signal);
-        return Promise.resolve({
-          id: "run-" + String(memberSignals.length),
-          localAgent: undefined,
-          result: new Promise((resolve, reject) => {
-            if (options.firstFailsImmediately === true && memberSignals.length === 1) {
-              reject(new Error("member 1 failed on its own before any interrupt"));
-              return;
-            }
-            const settle = (): void => {
+  const harness = createHarness({
+    config: { ...defaultConfig(), taskTimeoutMs: options.taskTimeoutMs },
+    runFactory: ({ request }) => {
+      const signal = request.signal as AbortSignal;
+      memberSignals.push(signal);
+      const result =
+        options.firstFailsImmediately === true && memberSignals.length === 1
+          ? Promise.reject(new Error("member 1 failed on its own before any interrupt"))
+          : settleOnAbort(signal, (resolve, reject) => {
               if (options.settle === "resolve-aborted") {
                 resolve({ output: [], stopReason: "aborted" });
                 return;
               }
               reject(new Error("run.result rejected after the swarm was interrupted"));
-            };
-            if (signal.aborted) {
-              settle();
-              return;
-            }
-            signal.addEventListener("abort", settle, { once: true });
-          }),
-          dispose: () => Promise.resolve(),
-        });
-      },
+            });
+      return Promise.resolve({
+        id: "run-" + String(memberSignals.length),
+        result,
+        dispose: () => Promise.resolve(),
+      });
     },
   });
-
-  plugin.apply(ctx, { ...defaultConfig(), taskTimeoutMs: options.taskTimeoutMs });
-  if (definition === undefined) throw new Error("apply() did not register a tool");
-  return { ctx, definition, memberSignals };
+  return { ctx: harness.ctx, definition: harness.definition, memberSignals };
 }
 
 describe("G. WP-C2：中断 / 失败 / 超时三类收场的结论一致性", () => {
@@ -1291,6 +1376,41 @@ describe("J. per-call 模型路由（白名单权威）", () => {
     expect(harness.startCalls).toHaveLength(0);
   });
 
+  it("模型可见：报错文本自带错误码与候选清单（DSH 只把 message 交给模型，自定义字段不可见）", async () => {
+    const harness = createHarness({
+      modelSelection: {
+        enabled: true,
+        allowedModels: [
+          { provider: "google", model: "gemini-2.5-pro" },
+          { provider: "vertex", model: "gemini-2.5-pro" },
+        ],
+      },
+    });
+    const error = (await harness.definition
+      .execute(validArgs({ model: "gemini-2.5-pro" }), makeExec() as never)
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error;
+    // 修复前 message 只有一句 "is offered by 2 providers"，模型不知道该改成哪一条。
+    expect(error.message).toMatch(/^\[MODEL_AMBIGUOUS\] /);
+    expect(error.message).toContain("google/gemini-2.5-pro");
+    expect(error.message).toContain("vertex/gemini-2.5-pro");
+  });
+
+  it("模型可见：DUPLICATE_PROMPTS 的碰撞片段进入报错文本", async () => {
+    const harness = createHarness();
+    const error = (await harness.definition
+      .execute(validArgs({ items: ["alpha.md", "beta.md", "alpha.md"] }), makeExec() as never)
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error;
+    expect(error.message).toMatch(/^\[DUPLICATE_PROMPTS\] Items 1 and 3/);
+    expect(error.message).toContain('"itemSnippet":"alpha.md"');
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
   it("per-call model 覆盖 config 固定路由", async () => {
     const harness = createHarness({
       modelSelection: { enabled: true, allowedModels: ALLOWED },
@@ -1313,5 +1433,367 @@ describe("J. per-call 模型路由（白名单权威）", () => {
     await harness.definition.execute(validArgs(), makeExec() as never);
     expect(harness.startCalls.length).toBeGreaterThan(0);
     expect("agentOptions" in (harness.startCalls[0]?.request ?? {})).toBe(false);
+  });
+});
+
+// ───────────────────────── K. 委派深度上限（成员嵌套 swarm 的真实闸门）─────────────────────────
+
+describe("K. 委派深度上限", () => {
+  /** spawn 风格的 provider：声明 depthLimit 能力（DSH spawn provider 的五项能力之一）。 */
+  const DEPTH_CAPABLE = { capabilities: { depthLimit: true } };
+
+  /** 位于指定委派深度的父 agent（口径同 DSH delegationDepthOf：会话头与运行期选项取大）。 */
+  function agentAtDepth(depth: number): Record<string, unknown> {
+    return { id: `agent-depth-${String(depth)}`, session: { id: "session-under-test", header: { delegationDepth: depth } } };
+  }
+
+  function execAs(agent: Record<string, unknown>): Record<string, unknown> {
+    return { callId: "call-depth", name: "agent_swarm", signal: new AbortController().signal, agent };
+  }
+
+  it("顶层调用：start 收到宿主解析出的 maxDepth（此前不传，DSH 因此不做任何深度检查）", async () => {
+    const resolveMaxDepth = vi.fn((configured?: number | "provider-managed") => (configured === undefined ? 1 : configured));
+    const harness = createHarness({ subagents: { resolveMaxDepth, getProvider: () => DEPTH_CAPABLE } });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(0)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    for (const call of harness.startCalls) expect(call.request.maxDepth).toBe(1);
+    // 缺省配置把 undefined 交给宿主解析——跟随设置页的实时取值，而不是插件自带一个默认值。
+    expect(resolveMaxDepth).toHaveBeenCalledWith(undefined);
+  });
+
+  it("成员里再调 agent_swarm（父深度 1、上限 1）：DELEGATION_DEPTH_EXCEEDED，零派发、不登记批次", async () => {
+    const harness = createHarness({
+      subagents: { resolveMaxDepth: () => 1, getProvider: () => DEPTH_CAPABLE },
+    });
+    const error = (await harness.definition
+      .execute(validArgs(), execAs(agentAtDepth(1)) as never)
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error & { swarmErrorCode?: string; swarmErrorDetails?: unknown };
+    expect(error.swarmErrorCode).toBe("DELEGATION_DEPTH_EXCEEDED");
+    expect(error.swarmErrorDetails).toEqual({ parentDepth: 1, memberDepth: 2, maxDepth: 1 });
+    expect(error.message).toMatch(/^\[DELEGATION_DEPTH_EXCEEDED\] /);
+    expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
+  });
+
+  it("运行期选项 subagentDepth 同样计入（取会话头与选项的较大者）", async () => {
+    const harness = createHarness({
+      subagents: { resolveMaxDepth: () => 2, getProvider: () => DEPTH_CAPABLE },
+    });
+    const agent = { ...agentAtDepth(0), options: { subagentDepth: 2 } };
+    await expect(harness.definition.execute(validArgs(), execAs(agent) as never)).rejects.toMatchObject({
+      swarmErrorCode: "DELEGATION_DEPTH_EXCEEDED",
+    });
+    expect(harness.startCalls).toHaveLength(0);
+  });
+
+  it("显式上限放宽到 2 时，深度 1 的成员可以再开一层", async () => {
+    const harness = createHarness({
+      config: { ...defaultConfig(), maxDepth: 2 },
+      subagents: { resolveMaxDepth: (c?: number | "provider-managed") => c, getProvider: () => DEPTH_CAPABLE },
+    });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(1)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    expect((harness.startCalls[0] as StartCall).request.maxDepth).toBe(2);
+  });
+
+  it("\"provider-managed\"：不传上限、不做预检（深度由 provider 自管）", async () => {
+    const resolveMaxDepth = vi.fn(() => 1);
+    const harness = createHarness({
+      config: { ...defaultConfig(), maxDepth: "provider-managed" },
+      subagents: { resolveMaxDepth, getProvider: () => DEPTH_CAPABLE },
+    });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(5)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    expect((harness.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
+    expect(resolveMaxDepth).not.toHaveBeenCalled();
+  });
+
+  it("provider 未声明 depthLimit 能力（进程外 provider）：不传 maxDepth，避免 start 整批被拒（不回归）", async () => {
+    const harness = createHarness({
+      subagents: { resolveMaxDepth: () => 1, getProvider: () => ({ capabilities: { depthLimit: false } }) },
+    });
+    await harness.definition.execute(validArgs(), execAs(agentAtDepth(3)) as never);
+    expect(harness.startCalls).toHaveLength(3);
+    expect((harness.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
+  });
+
+  it("旧宿主没有 resolveMaxDepth：显式数值照常透传；未配置则保持旧行为（不传）", async () => {
+    const explicit = createHarness({ config: { ...defaultConfig(), maxDepth: 1 } });
+    await explicit.definition.execute(validArgs(), execAs(agentAtDepth(0)) as never);
+    expect((explicit.startCalls[0] as StartCall).request.maxDepth).toBe(1);
+
+    const legacy = createHarness();
+    await legacy.definition.execute(validArgs(), makeExec() as never);
+    expect((legacy.startCalls[0] as StartCall).request).not.toHaveProperty("maxDepth");
+  });
+});
+
+// ───────────────────────── L. 限流退避接线（默认关闭；开启前须 M3 实机验证）─────────────────────────
+
+describe("L. 限流退避接线", () => {
+  type ScriptedEnd = { events: { type: string; data: unknown }[]; stopReason: string };
+
+  /** 子会话里"被限流拖死"的事件序列：内部重试若干次后轮末以 code 失败。 */
+  function rateLimitedEnd(code = "RATE_LIMIT"): ScriptedEnd {
+    return {
+      events: [
+        { type: "llm/retry", data: { retry: 1, failure: { code } } },
+        { type: "llm/retry", data: { retry: 2, failure: { code } } },
+        { type: "turn/end", data: { turn: 1, reason: { kind: "error", error: { code, message: "429" } } } },
+      ],
+      stopReason: "error",
+    };
+  }
+
+  const completedEnd: ScriptedEnd = { events: [], stopReason: "completed" };
+
+  /**
+   * 脚本化的子代理桩：start 返回后，先经真实 cordis 事件总线（ctx.emit "session/event"）
+   * 在子会话里追加脚本事件，再以脚本给定的 stopReason 收场。子会话 id = run.id。
+   * 按 label 里的成员序号取脚本（重试会再次 start 同一成员）。
+   */
+  function scriptedHarness(
+    rateLimit: { enabled: boolean; failureCodes?: string[]; maxRetries?: number } | undefined,
+    scriptFor: (memberIndex: number, attempt: number) => ScriptedEnd,
+  ) {
+    let ctxRef: Context | undefined;
+    const attempts = new Map<number, number>();
+    const harness = createHarness({
+      config: {
+        ...defaultConfig(),
+        releaseIntervalMs: 1,
+        backoffInitialMs: 1,
+        shrinkDebounceMs: 0,
+        recoverIntervalMs: 5,
+        ...(rateLimit === undefined
+          ? {}
+          : { rateLimit: { failureCodes: ["RATE_LIMIT"], maxRetries: 3, ...rateLimit } }),
+      },
+      runFactory: ({ request, index }) => {
+        const memberIndex = Number(String(request.label).split("/")[0]);
+        const attempt = (attempts.get(memberIndex) ?? 0) + 1;
+        attempts.set(memberIndex, attempt);
+        const script = scriptFor(memberIndex, attempt);
+        const id = `child-${String(index)}`;
+        return Promise.resolve({
+          id,
+          result: (async () => {
+            // 与真实时序一致：子会话事件发生在 start() 返回之后
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const bus = ctxRef as unknown as { emit(name: string, ...args: unknown[]): void };
+            for (const event of script.events) bus.emit("session/event", { id }, event);
+            return { output: [{ type: "text", text: `out ${id}` }], stopReason: script.stopReason };
+          })(),
+          dispose: () => Promise.resolve(),
+        });
+      },
+    });
+    ctxRef = harness.ctx;
+    return harness;
+  }
+
+  async function run(harness: MockHarness): Promise<string> {
+    return ((await harness.definition.execute(validArgs(), makeExec() as never)) as { xml: string }).xml;
+  }
+
+  it("默认关闭：被限流拖死的成员照旧落 failed，不重试（与接线前逐字节一致）", async () => {
+    const harness = scriptedHarness(undefined, (member) => (member === 1 ? rateLimitedEnd() : completedEnd));
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
+    expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("开启：被限流拖死的成员交给调度器退避重排队，重试成功后落 completed", async () => {
+    const watchSpy = vi.spyOn(RateLimitWatchRouter.prototype, "watch");
+    const releaseSpy = vi.spyOn(RateLimitWatchRouter.prototype, "release");
+    const harness = scriptedHarness({ enabled: true }, (member, attempt) =>
+      member === 1 && attempt === 1 ? rateLimitedEnd() : completedEnd,
+    );
+    const xml = await run(harness);
+    // 每个观察窗都被释放（否则路由表随批次只增不减）
+    expect(watchSpy.mock.calls.map((call) => call[0]).sort()).toEqual(
+      releaseSpy.mock.calls.map((call) => call[0]).sort(),
+    );
+    expect(watchSpy).toHaveBeenCalledTimes(4);
+    watchSpy.mockRestore();
+    releaseSpy.mockRestore();
+    expect(xml).toContain("<summary>completed: 3</summary>");
+    expect(harness.startCalls).toHaveLength(4); // 成员 1 重派一次
+    // 面板：该成员经历过一次限流重试（markSuspended 记录的 retryCount），最终 completed
+    const member1 = latestBatchOf(harness.ctx)?.members.get(1);
+    expect(member1?.phase).toBe("completed");
+    expect(member1?.retryCount).toBe(1);
+  });
+
+  it("开启：持续限流到上限即判死（maxRetries），批次照常收尾", async () => {
+    const harness = scriptedHarness({ enabled: true, maxRetries: 1 }, (member) =>
+      member === 2 ? rateLimitedEnd() : completedEnd,
+    );
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
+    expect(xml).toMatch(/rate limited/);
+    expect(latestBatchOf(harness.ctx)?.members.get(2)?.phase).toBe("failed");
+    expect(latestBatchOf(harness.ctx)?.status).toBe("failed");
+  });
+
+  it("开启：非限流码的失败（如 SERVER）不重试，直接落 failed", async () => {
+    const harness = scriptedHarness({ enabled: true }, (member) =>
+      member === 3 ? rateLimitedEnd("SERVER") : completedEnd,
+    );
+    const xml = await run(harness);
+    expect(xml).toContain("<summary>completed: 2, failed: 1</summary>");
+    expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("默认关闭时根本不订阅 session/event（关闭 = 与接线前逐字节一致）", () => {
+    const harness = scriptedHarness(undefined, () => completedEnd);
+    const hooks = (harness.ctx as unknown as { events: { _hooks: Record<string, unknown[]> } }).events._hooks;
+    expect(hooks["session/event"] ?? []).toHaveLength(0);
+  });
+
+  it("开启：限流成员的 dispose 尚未完成时批次被中断 → 成员落 aborted，不会永远停在 running", async () => {
+    let releaseDispose: (() => void) | undefined;
+    let disposeEntered: (() => void) | undefined;
+    const disposeStarted = new Promise<void>((resolve) => {
+      disposeEntered = resolve;
+    });
+    let ctxRef: Context | undefined;
+    const harness = createHarness({
+      config: { ...defaultConfig(), releaseIntervalMs: 1, backoffInitialMs: 60_000, rateLimit: { enabled: true, failureCodes: ["RATE_LIMIT"], maxRetries: 3 } },
+      runFactory: ({ request, index }) => {
+        const id = `child-${String(index)}`;
+        const limited = String(request.label).startsWith("1/");
+        return Promise.resolve({
+          id,
+          result: limited
+            ? (async () => {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                const bus = ctxRef as unknown as { emit(name: string, ...args: unknown[]): void };
+                for (const event of rateLimitedEnd().events) bus.emit("session/event", { id }, event);
+                return { output: [], stopReason: "error" };
+              })()
+            : settleOnAbort(request.signal as AbortSignal, (resolve) => {
+                resolve({ output: [], stopReason: "aborted" });
+              }),
+          dispose: limited
+            ? () =>
+                new Promise<void>((resolve) => {
+                  releaseDispose = resolve;
+                  disposeEntered?.();
+                })
+            : () => Promise.resolve(),
+        });
+      },
+    });
+    ctxRef = harness.ctx;
+    const controller = new AbortController();
+    const pending = harness.definition.execute(validArgs(), makeExec(controller.signal) as never) as Promise<{
+      xml: string;
+    }>;
+    await disposeStarted; // 限流成员已判定、正卡在 dispose
+    controller.abort();
+    const { xml } = await pending;
+    expect(xml).toContain("<summary>aborted: 3</summary>");
+    releaseDispose?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const batch = latestBatchOf(harness.ctx);
+    // 修复前：调度器已收尾、丢弃了这次限流结局，成员 1 永远停在 running，徽标常亮
+    expect(batch?.members.get(1)?.phase).toBe("aborted");
+    expect(batch?.status).toBe("aborted");
+  });
+
+  it("开启后 disposer 解除 session/event 订阅（ctx 副作用可逆）", async () => {
+    const harness = scriptedHarness({ enabled: true }, () => completedEnd);
+    const bus = harness.ctx as unknown as { emit(name: string, ...args: unknown[]): void };
+    // 读 cordis 事件服务的内部钩子表：cordis 没有公开"某事件有几个监听者"的 API，
+    // 而"卸载后监听器确实被移除"正是红线「ctx 副作用必须可逆」要守的东西。
+    const listeners = (): number =>
+      ((harness.ctx as unknown as { events: { _hooks: Record<string, unknown[]> } }).events._hooks[
+        "session/event"
+      ] ?? []).length;
+    expect(listeners()).toBe(1);
+    harness.dispose();
+    expect(listeners()).toBe(0);
+    expect(() => bus.emit("session/event", { id: "x" }, { type: "turn/end" })).not.toThrow();
+  });
+});
+
+// ───────────────────────── M. 成员起始上下文：fork（DSH 原生 fork provider）─────────────────────────
+
+describe("M. context: \"fork\"", () => {
+  const MOUNTED = { capabilities: { depthLimit: true } };
+
+  function forkHarness(options: { mounted?: boolean; config?: Partial<ReturnType<typeof defaultConfig>> } = {}) {
+    return createHarness({
+      config: { ...defaultConfig(), ...options.config },
+      subagents: {
+        getProvider: (name: string) => (name === "fork" && options.mounted !== false ? MOUNTED : name === "spawn" ? MOUNTED : undefined),
+      },
+    });
+  }
+
+  async function errorOf(harness: MockHarness, args: Record<string, unknown>) {
+    return (await harness.definition.execute(validArgs(args), makeExec() as never).then(
+      () => undefined,
+      (e: unknown) => e,
+    )) as (Error & { swarmErrorCode?: string; swarmErrorDetails?: Record<string, unknown> }) | undefined;
+  }
+
+  it("缺省 context：照旧走 spawn provider（回归）", async () => {
+    const harness = forkHarness();
+    await harness.definition.execute(validArgs(), makeExec() as never);
+    expect(harness.startCalls.map((call) => call.provider)).toEqual(["spawn", "spawn", "spawn"]);
+  });
+
+  it("context \"fork\"：全部成员经 fork provider 派发（以调用方会话已完成的轮次为种子）", async () => {
+    const harness = forkHarness();
+    await harness.definition.execute(validArgs({ context: "fork" }), makeExec() as never);
+    expect(harness.startCalls.map((call) => call.provider)).toEqual(["fork", "fork", "fork"]);
+  });
+
+  it("fork 与 model 互斥：FORK_MODEL_CONFLICT，零派发", async () => {
+    const harness = forkHarness();
+    const error = await errorOf(harness, { context: "fork", model: "p/m" });
+    expect(error?.swarmErrorCode).toBe("FORK_MODEL_CONFLICT");
+    expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined(); // 整体拒绝发生在登记批次之前
+  });
+
+  it("fork provider 未挂载：FORK_UNAVAILABLE，零派发", async () => {
+    const harness = forkHarness({ mounted: false });
+    const error = await errorOf(harness, { context: "fork" });
+    expect(error?.swarmErrorCode).toBe("FORK_UNAVAILABLE");
+    expect(error?.message).toContain("dsh-subagent-fork-in-process");
+    expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
+  });
+
+  it("fork 批次单独封顶：超过 maxForkItems 报 TOO_MANY_SUBAGENTS（details 注明 fork），描述写的是同一个数", async () => {
+    const harness = forkHarness({ config: { maxForkItems: 2 } });
+    const error = await errorOf(harness, { context: "fork" });
+    expect(error?.swarmErrorCode).toBe("TOO_MANY_SUBAGENTS");
+    expect(error?.swarmErrorDetails).toEqual({ total: 3, max: 2, context: "fork" });
+    expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
+    expect(harness.definition.description).toContain("A fork batch accepts at most 2 entries");
+    // 非 fork 批次不受 fork 上限约束
+    await harness.definition.execute(validArgs(), makeExec() as never);
+    expect(harness.startCalls).toHaveLength(3);
+  });
+
+  it("fork 上限不会超过通用生效上限（maxItems 更小时取 maxItems）", () => {
+    const harness = forkHarness({ config: { maxItems: 4, maxForkItems: 16 } });
+    expect(harness.definition.description).toContain("A fork batch accepts at most 4 entries");
+  });
+
+  it("非法 context：CONTEXT_MODE_INVALID，零派发", async () => {
+    const harness = forkHarness();
+    const error = await errorOf(harness, { context: "share" });
+    expect(error?.swarmErrorCode).toBe("CONTEXT_MODE_INVALID");
+    expect(harness.startCalls).toHaveLength(0);
+    expect(latestBatchOf(harness.ctx)).toBeUndefined();
   });
 });

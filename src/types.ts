@@ -80,6 +80,21 @@ export const SWARM_ERROR_CODES = {
   MODEL_NOT_ALLOWED: "MODEL_NOT_ALLOWED",
   /** 裸 model id 命中多个 provider 的路由，必须改写成 `provider/model` 精确式。 */
   MODEL_AMBIGUOUS: "MODEL_AMBIGUOUS",
+  /**
+   * 调用方 agent 已处在委派深度上限：它的成员会超出宿主的子代理深度限制（默认 1）。
+   * 典型场景是 swarm 成员自己又调 agent_swarm（嵌套 swarm）。在开批次之前整体拒绝，
+   * 而不是让每个成员各自在 start() 处撞上 DSH 的深度检查。
+   */
+  DELEGATION_DEPTH_EXCEEDED: "DELEGATION_DEPTH_EXCEEDED",
+  /** `context` 参数不是受支持的取值（"fresh" | "fork"）。 */
+  CONTEXT_MODE_INVALID: "CONTEXT_MODE_INVALID",
+  /** 要求 fork 上下文，但宿主没有挂载 fork 子代理 provider。 */
+  FORK_UNAVAILABLE: "FORK_UNAVAILABLE",
+  /**
+   * fork 与 per-call `model` 同时出现。fork 的价值在于子代理复用父会话的 KV cache 前缀，
+   * 换路由会让继承的历史在新模型上整段重算；DSH 官方 fork 工具同样不开放路由选择。
+   */
+  FORK_MODEL_CONFLICT: "FORK_MODEL_CONFLICT",
 } as const;
 
 export type SwarmErrorCode = (typeof SWARM_ERROR_CODES)[keyof typeof SWARM_ERROR_CODES];
@@ -104,7 +119,16 @@ export interface SwarmRequestInput {
    * 缺省 = 沿用插件 config 的固定路由，再缺省 = 继承父 agent 路由。
    */
   model?: string;
+  /** 成员的起始上下文（缺省 "fresh"），见 {@link SwarmContextMode}。 */
+  context?: string;
 }
+
+/**
+ * 成员的起始上下文：
+ *   - "fresh"：全新子代理，只看到自己的 prompt（默认；DSH spawn provider）；
+ *   - "fork"：以调用方会话**已完成的轮次**为种子（DSH fork provider；当前进行中的轮次不含在内）。
+ */
+export type SwarmContextMode = "fresh" | "fork";
 
 /** 一条精确的 provider/model 路由（宿主白名单的元素形状）。 */
 export interface SwarmModelRoute {

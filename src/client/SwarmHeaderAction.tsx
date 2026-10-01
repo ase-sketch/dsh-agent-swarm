@@ -3,8 +3,9 @@
  */
 
 import { useState, useEffect, useRef, useMemo } from "react";
-import type { SwarmMemberView, SwarmPhase } from "../swarm-registry.js";
+import type { SwarmMemberView, SwarmPhase, SwarmRosterFrame } from "../swarm-registry.js";
 import type { SwarmClientState } from "./model.js";
+import { fallbackTranslate, type SwarmLocaleKey, type SwarmTranslate } from "./locales.js";
 
 const CSS_TAG_ID = "dsh-agent-swarm/style.css";
 
@@ -178,6 +179,38 @@ const CSS_CONTENT = `
 
 .dsh-swarm-group-arrow.open {
   transform: rotate(90deg);
+}
+
+.dsh-swarm-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.06));
+  flex: none;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.dsh-swarm-tab {
+  flex: none;
+  max-width: 180px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #94a3b8);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dsh-swarm-tab.active {
+  background: var(--dsw-alias-fill-l2, rgba(255, 255, 255, 0.08));
+  color: var(--dsw-alias-label-primary, #f1f5f9);
 }
 
 .dsh-swarm-stats {
@@ -417,14 +450,44 @@ export class RetryTicker {
   }
 }
 
-const PHASE_CONFIG: Record<SwarmPhase, { label: string; bg: string; color: string }> = {
-  pending: { label: "等待中", bg: "rgba(148, 163, 184, 0.15)", color: "#94a3b8" },
-  starting: { label: "启动中", bg: "rgba(56, 189, 248, 0.15)", color: "#38bdf8" },
-  running: { label: "执行中", bg: "rgba(14, 165, 233, 0.25)", color: "#0ea5e9" },
-  retrying: { label: "限流退避", bg: "rgba(245, 158, 11, 0.2)", color: "#f59e0b" },
-  completed: { label: "已完成", bg: "rgba(16, 185, 129, 0.2)", color: "#10b981" },
-  failed: { label: "失败", bg: "rgba(239, 68, 68, 0.2)", color: "#ef4444" },
-  aborted: { label: "取消", bg: "rgba(100, 116, 139, 0.2)", color: "#94a3b8" },
+// ───────────────────────── 多批次（同一会话并发的几次调用）─────────────────────────
+
+/** 选中的批次；未选或选中的已不可见时回到最新批次。 */
+export function selectBatch(
+  batches: readonly SwarmRosterFrame[],
+  selectedSwarmId: string | undefined,
+): SwarmRosterFrame | undefined {
+  return batches.find((batch) => batch.swarmId === selectedSwarmId) ?? batches[batches.length - 1];
+}
+
+/**
+ * 标题栏徽标：对**全部可见批次**聚合。
+ * 有成员在跑时显示 `在跑/总数` 并点亮；全部收场后显示 `已完成/总数`。
+ */
+export function summarizeBatches(batches: readonly SwarmRosterFrame[]): { badgeText: string; isLive: boolean } {
+  let total = 0;
+  let active = 0;
+  let completed = 0;
+  for (const batch of batches) {
+    total += batch.total;
+    active += batch.activeCount;
+    completed += batch.completedCount;
+  }
+  if (total === 0) return { badgeText: "0", isLive: false };
+  if (active > 0) return { badgeText: `${String(active)}/${String(total)}`, isLive: true };
+  return { badgeText: `${String(completed)}/${String(total)}`, isLive: false };
+}
+
+const EMPTY_BATCHES: readonly SwarmRosterFrame[] = [];
+
+const PHASE_CONFIG: Record<SwarmPhase, { label: SwarmLocaleKey; bg: string; color: string }> = {
+  pending: { label: "phase.pending", bg: "rgba(148, 163, 184, 0.15)", color: "#94a3b8" },
+  starting: { label: "phase.starting", bg: "rgba(56, 189, 248, 0.15)", color: "#38bdf8" },
+  running: { label: "phase.running", bg: "rgba(14, 165, 233, 0.25)", color: "#0ea5e9" },
+  retrying: { label: "phase.retrying", bg: "rgba(245, 158, 11, 0.2)", color: "#f59e0b" },
+  completed: { label: "phase.completed", bg: "rgba(16, 185, 129, 0.2)", color: "#10b981" },
+  failed: { label: "phase.failed", bg: "rgba(239, 68, 68, 0.2)", color: "#ef4444" },
+  aborted: { label: "phase.aborted", bg: "rgba(100, 116, 139, 0.2)", color: "#94a3b8" },
 };
 
 // ───────────────────────── 成员分组（收纳）─────────────────────────
@@ -433,7 +496,7 @@ type SwarmGroupKey = "active" | "failed" | "completed" | "aborted";
 
 interface SwarmGroupDef {
   key: SwarmGroupKey;
-  label: string;
+  label: SwarmLocaleKey;
   match: (phase: SwarmPhase) => boolean;
 }
 
@@ -441,12 +504,12 @@ interface SwarmGroupDef {
 const SWARM_GROUP_DEFS: readonly SwarmGroupDef[] = [
   {
     key: "active",
-    label: "进行中",
+    label: "group.active",
     match: (p) => p === "pending" || p === "starting" || p === "running" || p === "retrying",
   },
-  { key: "failed", label: "失败", match: (p) => p === "failed" },
-  { key: "completed", label: "已完成", match: (p) => p === "completed" },
-  { key: "aborted", label: "已取消", match: (p) => p === "aborted" },
+  { key: "failed", label: "group.failed", match: (p) => p === "failed" },
+  { key: "completed", label: "group.completed", match: (p) => p === "completed" },
+  { key: "aborted", label: "group.aborted", match: (p) => p === "aborted" },
 ];
 
 /** 默认展开态：需要关注的（进行中/失败）展开，已收场的（完成/取消）收起。 */
@@ -472,9 +535,15 @@ export interface SwarmHeaderActionProps {
   sessionId: string;
   useSwarm: <T>(selector: (state: SwarmClientState) => T) => T;
   watchSwarm: (sessionId: string) => () => void;
+  /**
+   * 框架按槽位声明的 `locale` 注入的翻译函数（与官方 jobs 面板同一机制）。
+   * 缺省时回落到内置中文字典——接线前的显示效果。
+   */
+  t?: SwarmTranslate;
 }
 
-export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHeaderActionProps) {
+export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm, t }: SwarmHeaderActionProps) {
+  const tr = t ?? fallbackTranslate;
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -540,9 +609,18 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
     };
   }, [open]);
 
-  // 从 Model 订阅当前会话数据与流失败态
-  const batch = useSwarm((state) => state.bySession[sessionId]);
+  // 从 Model 订阅当前会话的可见批次与流失败态
+  const view = useSwarm((state) => state.bySession[sessionId]);
   const streamFailure = useSwarm((state) => state.streamFailures[sessionId]);
+  const batches = view?.batches ?? EMPTY_BATCHES;
+
+  // 多个可见批次时可切换查看；有新批次出现（最新批次变了）就回到最新。
+  const [selectedSwarmId, setSelectedSwarmId] = useState<string | undefined>(undefined);
+  const latestSwarmId = batches[batches.length - 1]?.swarmId;
+  useEffect(() => {
+    setSelectedSwarmId(undefined);
+  }, [latestSwarmId]);
+  const batch = selectBatch(batches, selectedSwarmId);
 
   // 换了批次就重置折叠态：旧批次的展开选择不该泄漏到新批次
   const swarmId = batch?.swarmId;
@@ -551,7 +629,7 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
   }, [swarmId]);
 
   const hasBatch = Boolean(batch && batch.total > 0);
-  const isLive = Boolean(batch && batch.activeCount > 0);
+  const { badgeText, isLive } = useMemo(() => summarizeBatches(batches), [batches]);
 
   // 最近一次限流重试的发起时刻；没有待重试成员时为 null
   const retryDeadline = useMemo(() => earliestRetryAt(batch?.members), [batch]);
@@ -569,11 +647,6 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
     return () => ticker.stop();
   }, [retryDeadline]);
 
-  const badgeText = useMemo(() => {
-    if (!batch || batch.total === 0) return "0";
-    if (batch.activeCount > 0) return `${batch.activeCount}/${batch.total}`;
-    return `${batch.completedCount}/${batch.total}`;
-  }, [batch]);
 
   return (
     <div className="dsh-swarm-root" ref={rootRef}>
@@ -581,10 +654,10 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
         type="button"
         className={`dsh-swarm-trigger ${isLive ? "active" : ""} ${streamFailure ? "error" : ""}`}
         onClick={() => setOpen(!open)}
-        title={streamFailure ? `流连接中断：${streamFailure.message}` : "Swarm 智能体队列"}
+        title={streamFailure ? tr("stream.error", { message: streamFailure.message }) : tr("title")}
       >
         <SwarmIcon />
-        <span>Swarm</span>
+        <span>{tr("trigger.label")}</span>
         <span className={`dsh-swarm-badge ${isLive ? "live" : ""}`}>
           {badgeText}
         </span>
@@ -600,11 +673,11 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
             <div className="dsh-swarm-title-row">
               <span className="dsh-swarm-title">
                 <SwarmIcon />
-                Swarm 智能体队列
+                {tr("title")}
               </span>
               {batch && (
                 <span className="dsh-swarm-member-count">
-                  {batch.total} 个成员
+                  {tr("header.members", { count: batch.total })}
                 </span>
               )}
             </div>
@@ -613,31 +686,53 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
                 {batch.description}
               </div>
             ) : (
-              <div className="dsh-swarm-desc">会话级并发调度监控</div>
+              <div className="dsh-swarm-desc">{tr("header.descFallback")}</div>
             )}
             {batch?.routeLabel && (
               <span className="dsh-swarm-route" title={batch.routeLabel}>
-                模型: {batch.routeLabel}
+                {tr("header.route", { route: batch.routeLabel })}
               </span>
             )}
           </div>
 
+          {batches.length > 1 && (
+            <div className="dsh-swarm-tabs" role="tablist">
+              {batches.map((candidate, position) => {
+                const selected = candidate.swarmId === batch?.swarmId;
+                return (
+                  <button
+                    key={candidate.swarmId}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    className={`dsh-swarm-tab ${selected ? "active" : ""}`}
+                    title={candidate.description}
+                    onClick={() => setSelectedSwarmId(candidate.swarmId)}
+                  >
+                    #{position + 1} {candidate.description}
+                    {candidate.activeCount > 0 ? ` · ${String(candidate.activeCount)}/${String(candidate.total)}` : ""}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           {streamFailure && (
             <div className="dsh-swarm-stream-error" title={streamFailure.message}>
-              流连接中断：{streamFailure.message}
+              {tr("stream.error", { message: streamFailure.message })}
             </div>
           )}
 
           {hasBatch && batch ? (
             <>
               <div className="dsh-swarm-stats">
-                <span>运行中: <strong style={{ color: "#38bdf8" }}>{batch.activeCount}</strong></span>
-                <span>已完成: <strong style={{ color: "#10b981" }}>{batch.completedCount}</strong></span>
+                <span>{tr("stats.running")}: <strong style={{ color: "#38bdf8" }}>{batch.activeCount}</strong></span>
+                <span>{tr("stats.completed")}: <strong style={{ color: "#10b981" }}>{batch.completedCount}</strong></span>
                 {batch.failedCount > 0 && (
-                  <span>失败: <strong style={{ color: "#ef4444" }}>{batch.failedCount}</strong></span>
+                  <span>{tr("stats.failed")}: <strong style={{ color: "#ef4444" }}>{batch.failedCount}</strong></span>
                 )}
                 {batch.abortedCount > 0 && (
-                  <span>取消: <strong style={{ color: "#94a3b8" }}>{batch.abortedCount}</strong></span>
+                  <span>{tr("stats.aborted")}: <strong style={{ color: "#94a3b8" }}>{batch.abortedCount}</strong></span>
                 )}
               </div>
 
@@ -655,24 +750,30 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
                             className="dsh-swarm-phase-badge"
                             style={{ backgroundColor: cfg.bg, color: cfg.color }}
                           >
-                            {cfg.label}
+                            {tr(cfg.label)}
                           </span>
-                          <span className="dsh-swarm-row-item" title={m.item}>
+                          <span
+                            className="dsh-swarm-row-item"
+                            title={
+                              m.itemChars === undefined
+                                ? m.item
+                                : tr("item.truncated", { item: m.item, count: m.itemChars })
+                            }
+                          >
                             {m.item}
                           </span>
                           {m.agentId && (
                             <span className="dsh-swarm-agent-id" title={m.agentId}>
-                              {m.agentId.slice(0, 10)}
+                              {/* 按码点取前 10 个，不劈开代理对（client 不引 host 模块的值，故就地处理） */}
+                              {Array.from(m.agentId).slice(0, 10).join("")}
                             </span>
                           )}
                         </div>
 
                         {m.phase === "retrying" && (
                           <div className="dsh-swarm-detail">
-                            第 {m.retryCount} 次限流重试
-                            {secondsLeft > 0 ? (
-                              <span> · 约 {secondsLeft} 秒后发起</span>
-                            ) : null}
+                            {tr("retry.line", { count: m.retryCount })}
+                            {secondsLeft > 0 ? <span>{tr("retry.eta", { seconds: secondsLeft })}</span> : null}
                             {m.detail ? <span> ({m.detail})</span> : null}
                           </div>
                         )}
@@ -710,7 +811,7 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
                               }
                             >
                               <span className={`dsh-swarm-group-arrow ${isOpen ? "open" : ""}`}>▶</span>
-                              {group.label} {members.length} 个成员
+                              {tr("group.count", { label: tr(group.label), count: members.length })}
                             </button>
                             {isOpen && members.map(renderRow)}
                           </div>
@@ -723,7 +824,7 @@ export function SwarmHeaderAction({ sessionId, useSwarm, watchSwarm }: SwarmHead
             </>
           ) : (
             <div className="dsh-swarm-empty">
-              当前会话暂无运行中的 Swarm 任务
+              {tr("empty")}
             </div>
           )}
         </div>

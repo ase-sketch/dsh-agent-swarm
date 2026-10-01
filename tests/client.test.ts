@@ -10,13 +10,16 @@ import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, it, expect, vi } from "vitest";
-import { ClientSwarmModel } from "../src/client/model.js";
+import { ClientSwarmModel, latestBatchOf, mergeRosterFrame } from "../src/client/model.js";
+import { SWARM_DICTIONARIES, fallbackTranslate, interpolate } from "../src/client/locales.js";
 import { ClientSwarmService } from "../src/client/service.js";
 import {
   RetryTicker,
   earliestRetryAt,
   ensureCssInjected,
   retrySecondsLeft,
+  selectBatch,
+  summarizeBatches,
 } from "../src/client/SwarmHeaderAction.js";
 import type { SwarmMemberView, SwarmRosterFrame } from "../src/swarm-registry.js";
 
@@ -103,11 +106,77 @@ describe("ClientSwarmModel", () => {
 
     model.rosterReceived(frame);
     expect(listener).toHaveBeenCalledTimes(1);
-    expect(model.getSnapshot().bySession["sess-1"]).toBe(frame);
+    expect(model.getSnapshot().bySession["sess-1"]?.batches).toEqual([frame]);
+    expect(latestBatchOf(model.getSnapshot().bySession["sess-1"])).toBe(frame);
 
     unsub();
     model.rosterReceived({ ...frame, activeCount: 0, completedCount: 1 });
     expect(listener).toHaveBeenCalledTimes(1); // not called after unsub
+  });
+});
+
+describe("多批次合并（同一会话并发的几次调用）", () => {
+  it("带 visibleSwarmIds 的帧：按可见集合排序并清理退出的批次", () => {
+    const a = rosterFrame("s", { swarmId: "a" });
+    const b = rosterFrame("s", { swarmId: "b" });
+    let batches = mergeRosterFrame([], { ...a, visibleSwarmIds: ["a"] });
+    batches = mergeRosterFrame(batches, { ...b, visibleSwarmIds: ["a", "b"] });
+    expect(batches.map((x) => x.swarmId)).toEqual(["a", "b"]);
+    // a 的新帧原位替换，顺序不变
+    batches = mergeRosterFrame(batches, { ...a, completedCount: 9, visibleSwarmIds: ["a", "b"] });
+    expect(batches.map((x) => [x.swarmId, x.completedCount])).toEqual([
+      ["a", 9],
+      ["b", 1],
+    ]);
+    // 新一组开始：a、b 退出可见集合
+    const c = rosterFrame("s", { swarmId: "c", visibleSwarmIds: ["c"] });
+    expect(mergeRosterFrame(batches, c).map((x) => x.swarmId)).toEqual(["c"]);
+  });
+
+  it("尚未收到帧的可见批次暂缺，不凭空构造", () => {
+    const b = rosterFrame("s", { swarmId: "b", visibleSwarmIds: ["a", "b"] });
+    expect(mergeRosterFrame([], b).map((x) => x.swarmId)).toEqual(["b"]);
+  });
+
+  it("不带 visibleSwarmIds 的旧帧：按 swarmId 替换或追加，且有保留上限", () => {
+    let batches: ReturnType<typeof mergeRosterFrame> = [];
+    for (let i = 0; i < 12; i += 1) batches = mergeRosterFrame(batches, rosterFrame("s", { swarmId: `b${String(i)}` }));
+    expect(batches).toHaveLength(8);
+    expect(batches[batches.length - 1]?.swarmId).toBe("b11");
+  });
+
+  it("selectBatch：未选或已不可见时回到最新批次", () => {
+    const batches = [rosterFrame("s", { swarmId: "a" }), rosterFrame("s", { swarmId: "b" })];
+    expect(selectBatch(batches, undefined)?.swarmId).toBe("b");
+    expect(selectBatch(batches, "a")?.swarmId).toBe("a");
+    expect(selectBatch(batches, "gone")?.swarmId).toBe("b");
+    expect(selectBatch([], undefined)).toBeUndefined();
+  });
+
+  it("summarizeBatches：徽标对全部可见批次聚合（此前只看最新一个）", () => {
+    expect(summarizeBatches([])).toEqual({ badgeText: "0", isLive: false });
+    const running = rosterFrame("s", { swarmId: "a", total: 4, activeCount: 2, completedCount: 1 });
+    const done = rosterFrame("s", { swarmId: "b", total: 3, activeCount: 0, completedCount: 3 });
+    expect(summarizeBatches([running, done])).toEqual({ badgeText: "2/7", isLive: true });
+    expect(summarizeBatches([done, { ...running, activeCount: 0, completedCount: 4 }])).toEqual({
+      badgeText: "7/7",
+      isLive: false,
+    });
+  });
+});
+
+describe("面板字典", () => {
+  it("中英字典键集合完全一致（DSH 的 register 要求每个内置语言给齐全部键）", () => {
+    expect(Object.keys(SWARM_DICTIONARIES.en).sort()).toEqual(Object.keys(SWARM_DICTIONARIES.zh).sort());
+    for (const dict of Object.values(SWARM_DICTIONARIES)) {
+      for (const value of Object.values(dict)) expect(value.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("插值：{name} 占位符替换，未提供的占位符原样保留；缺省翻译为中文", () => {
+    expect(interpolate("{count} 个成员", { count: 3 })).toBe("3 个成员");
+    expect(interpolate("a {x} b {y}", { x: "1" })).toBe("a 1 b {y}");
+    expect(fallbackTranslate("header.route", { route: "p/m" })).toBe("模型: p/m");
   });
 });
 
@@ -189,7 +258,7 @@ describe("ClientSwarmService", () => {
 
     // Wait microtask for async loop to process frame
     await new Promise((r) => setTimeout(r, 10));
-    expect(model.getSnapshot().bySession["sess-svc"]?.total).toBe(1);
+    expect(latestBatchOf(model.getSnapshot().bySession["sess-svc"])?.total).toBe(1);
 
     // First unsubscribe does not dispose stream
     unsub1();
@@ -251,7 +320,7 @@ describe("ClientSwarmService 流异常可见性与重建", () => {
       const freshUnsub = service.watchSwarm("sess-z");
       expect(mockRemote.$stream).toHaveBeenCalledTimes(2);
       await flush();
-      expect(model.getSnapshot().bySession["sess-z"]?.sessionId).toBe("sess-z");
+      expect(latestBatchOf(model.getSnapshot().bySession["sess-z"])?.sessionId).toBe("sess-z");
 
       // ③ 新流恢复正常后失败标记被清除
       expect(model.getSnapshot().streamFailures["sess-z"]).toBeUndefined();
@@ -366,7 +435,7 @@ describe("ClientSwarmService 流异常可见性与重建", () => {
       await flush(); // 第一条流异常终止，条目被摘除
       const freshUnsub = service.watchSwarm("sess-s");
       await flush(); // 新流推送首帧后保持开启
-      expect(model.getSnapshot().bySession["sess-s"]?.sessionId).toBe("sess-s");
+      expect(latestBatchOf(model.getSnapshot().bySession["sess-s"])?.sessionId).toBe("sess-s");
 
       staleUnsub(); // 陈旧释放器只该作用于自己那条死流
       expect(disposers[1]).not.toHaveBeenCalled();

@@ -22,11 +22,13 @@ import {
   SWARM_MAX_SUBAGENTS,
   SWARM_MIN_ITEMS,
   SWARM_PROMPT_PLACEHOLDER,
+  type SwarmContextMode,
   type SwarmModelRoute,
   type SwarmRequestInput,
   type SwarmTaskSpec,
   type SwarmValidationError,
 } from "./types.js";
+import { clipText } from "./text-clip.js";
 
 export interface SwarmValidationSuccess {
   ok: true;
@@ -53,42 +55,45 @@ function normalizeOptionalString(value: string | undefined): string | undefined 
 }
 
 /**
- * 把非法 item 元素渲染成一段可安全放进 message / details 的描述。
+ * 把一个形状不合法的值（入参自身、item 元素、model 参数）渲染成可安全放进 message / details 的描述。
  *
  * 刻意不依赖对象自身的 toString / valueOf：入参来自模型，真实可能传入
  * `Object.create(null)` 这类没有原型的对象，直接拼接或 `String(value)` 会抛错——
- * 那又变成"校验函数自己抛 TypeError"，正是本次要消灭的行为。
+ * 那又变成"校验函数自己抛 TypeError"，正是本文件要消灭的行为。
  * 因此对象与函数只报类型；其余原始类型用 String() 显式转换（对 symbol 也安全）。
  */
-function describeInvalidItem(value: unknown): string {
+function describeInvalidValue(value: unknown): string {
   if (value === undefined) return "undefined";
   if (value === null) return "null";
   if (Array.isArray(value)) return "an array";
   const kind = typeof value;
   if (kind === "object") return "an object";
   if (kind === "function") return "a function";
-  return `${kind} ${String(value)}`;
+  // 原始值原文同样来自模型，长度不可信（整份文件当成入参传进来也是可能的），回显前截断。
+  return `${kind} ${snippetOf(String(value))}`;
 }
 
 /**
- * 碰撞信息里单侧文本片段的最大码元数。
+ * 报错里回显模型文本时，单段片段的最大码元数（碰撞片段、全空白 item、畸形入参、model 串共用）。
  *
- * 为什么必须截断：item 与 prompt 都是模型给的自由文本，prompt 还是"模板 + item"展开的结果；
- * 一条 item 完全可能是十几万字符（比如把整份文件塞进 item）。把原文整段放进 error.details，
+ * 为什么必须截断：item、prompt、model 都是模型给的自由文本，prompt 还是"模板 + item"展开的结果；
+ * 一条 item 完全可能是十几万字符（比如把整份文件塞进 item）。把原文整段放进报错，
  * 本意是帮模型自纠，实际会先用一条超长报错挤爆上下文——比不报还糟。
- * 120 是个折中：足以让模型认出重复的是哪段文本，人类一眼也能读完一行。
+ * 120 是个折中：足以让模型认出是哪段文本，人类一眼也能读完一行。
+ * （名字沿用最早的使用场景 DUPLICATE_PROMPTS；它已是本文件所有回显的统一上限。）
  */
 export const DUPLICATE_SNIPPET_MAX_CHARS = 120;
 
 /**
  * 取文本开头的定长片段：超出上限时截断并补一个省略号标记，未超出则原样返回（不留标记）。
+ * 定义在 describeInvalidValue 之后但被它调用——函数声明会提升，顺序不影响。
  *
  * 刻意不改写片段的空白/控制字符：片段的唯一用途是"让人认出是哪段文本"，
  * 任何重写都会让它在细节上与原文对不上号；长度信息由调用方另行给出（*Chars 字段）。
  */
 function snippetOf(value: string): string {
-  if (value.length <= DUPLICATE_SNIPPET_MAX_CHARS) return value;
-  return `${value.slice(0, DUPLICATE_SNIPPET_MAX_CHARS)}…`;
+  // 不劈开代理对（见 text-clip.ts）：截断点落在 emoji 中间会留下乱码 ``。
+  return clipText(value, DUPLICATE_SNIPPET_MAX_CHARS);
 }
 
 function fail(
@@ -99,21 +104,6 @@ function fail(
   return { ok: false, error: details === undefined ? { code, message } : { code, message, details } };
 }
 
-/**
- * 入参自身的判型描述（复用 item 元素的同一套口径，故措辞一致）。
- *
- * 刻意不碰 value 自身的方法：对 `Object.create(null)` 这类无原型对象取 `.trim` 会抛，
- * 而取 `typeof`/`Array.isArray` 不会——本函数的立意正是"绝不让入参形状把自己变成异常"。
- */
-function describeInvalidInput(value: unknown): string {
-  if (value === undefined) return "undefined";
-  if (value === null) return "null";
-  if (Array.isArray(value)) return "an array";
-  const kind = typeof value;
-  if (kind === "object") return "an object";
-  if (kind === "function") return "a function";
-  return `${kind} ${String(value)}`;
-}
 
 /**
  * 校验并入队。全部校验在任何子代理启动之前完成；本函数不产生任何副作用。
@@ -131,7 +121,7 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
   // 而调用方真正的问题是把 items 直接当成了整个入参，报条数是误导。
 
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    const received = describeInvalidInput(input);
+    const received = describeInvalidValue(input);
     return fail(
       SWARM_ERROR_CODES.INVALID_INPUT,
       `Swarm input must be an object with items and prompt_template; received ${received}.`,
@@ -171,7 +161,7 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
     const raw = rawItems[i];
     const position = i + 1;
     if (typeof raw !== "string") {
-      const received = describeInvalidItem(raw);
+      const received = describeInvalidValue(raw);
       return fail(
         SWARM_ERROR_CODES.ITEM_NOT_STRING,
         `Item at position ${String(position)} is not a string (received ${received}); items may only contain strings.`,
@@ -182,8 +172,8 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
     if (trimmed === "") {
       return fail(
         SWARM_ERROR_CODES.ITEM_EMPTY,
-        `Item at position ${String(position)} holds no non-whitespace character (received ${JSON.stringify(raw)}); each item needs at least one.`,
-        { index: position, received: raw },
+        `Item at position ${String(position)} holds no non-whitespace character (received ${JSON.stringify(snippetOf(raw))}); each item needs at least one.`,
+        { index: position, received: snippetOf(raw), receivedChars: raw.length },
       );
     }
     items.push(trimmed);
@@ -242,7 +232,6 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
   return { ok: true, specs };
 }
 
-
 // ───────────────────────── per-call 模型路由匹配（纯函数）─────────────────────────
 
 /**
@@ -284,7 +273,7 @@ export function resolveSwarmModelRoute(
   allowed: readonly SwarmModelRoute[],
 ): SwarmModelResolution {
   if (typeof requested !== "string" || requested.trim() === "") {
-    const received = describeInvalidItem(requested);
+    const received = describeInvalidValue(requested);
     return {
       ok: false,
       error: {
@@ -295,6 +284,8 @@ export function resolveSwarmModelRoute(
     };
   }
   const value = requested.trim();
+  // 回显用的片段：model 串同样由模型给出，长度不可信。
+  const shown = snippetOf(value);
 
   if (value.includes("/")) {
     const slash = value.indexOf("/");
@@ -305,8 +296,8 @@ export function resolveSwarmModelRoute(
         ok: false,
         error: {
           code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
-          message: `model "${value}" is not a valid route: "provider/model" needs non-empty provider and model ids.`,
-          details: { received: value },
+          message: `model "${shown}" is not a valid route: "provider/model" needs non-empty provider and model ids.`,
+          details: { received: shown },
         },
       };
     }
@@ -316,8 +307,8 @@ export function resolveSwarmModelRoute(
       ok: false,
       error: {
         code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
-        message: `Route "${provider}/${model}" is not in this deployment's allowed subagent models.`,
-        details: { requested: `${provider}/${model}`, ...allowedRoutesDetails(allowed) },
+        message: `Route "${shown}" is not in this deployment's allowed subagent models.`,
+        details: { requested: shown, ...allowedRoutesDetails(allowed) },
       },
     };
   }
@@ -332,8 +323,8 @@ export function resolveSwarmModelRoute(
       ok: false,
       error: {
         code: SWARM_ERROR_CODES.MODEL_NOT_ALLOWED,
-        message: `Model "${value}" is not in this deployment's allowed subagent models.`,
-        details: { requested: value, ...allowedRoutesDetails(allowed) },
+        message: `Model "${shown}" is not in this deployment's allowed subagent models.`,
+        details: { requested: shown, ...allowedRoutesDetails(allowed) },
       },
     };
   }
@@ -341,12 +332,44 @@ export function resolveSwarmModelRoute(
     ok: false,
     error: {
       code: SWARM_ERROR_CODES.MODEL_AMBIGUOUS,
-      message: `Model id "${value}" is offered by ${String(matches.length)} providers; pass it as "provider/model" instead.`,
+      message: `Model id "${shown}" is offered by ${String(matches.length)} providers; pass it as "provider/model" instead.`,
       details: {
-        requested: value,
-        candidates: matches.map((r) => `${r.provider}/${r.model}`),
+        requested: shown,
+        // 候选同样封顶（与 allowedRoutes 同一上限）；candidateCount 给出总数，读取方知道被截掉多少。
+        candidates: matches.slice(0, ALLOWED_ROUTES_DETAILS_CAP).map((r) => `${r.provider}/${r.model}`),
+        candidateCount: matches.length,
       },
     },
   };
 }
 
+
+// ───────────────────────── 成员起始上下文（纯函数）─────────────────────────
+
+export type SwarmContextModeResolution =
+  | { ok: true; mode: SwarmContextMode }
+  | { ok: false; error: SwarmValidationError };
+
+const CONTEXT_MODES: readonly SwarmContextMode[] = ["fresh", "fork"];
+
+/**
+ * 解析 `context` 参数。缺省或空白 = "fresh"（与 model 参数同一口径：空白串视同未提供）。
+ * 永不抛异常（与 validateSwarmInput 同一立意）。
+ */
+export function resolveSwarmContextMode(requested: unknown): SwarmContextModeResolution {
+  if (requested === undefined || (typeof requested === "string" && requested.trim() === "")) {
+    return { ok: true, mode: "fresh" };
+  }
+  const value = typeof requested === "string" ? requested.trim() : undefined;
+  const mode = CONTEXT_MODES.find((candidate) => candidate === value);
+  if (mode !== undefined) return { ok: true, mode };
+  const received = typeof requested === "string" ? `"${snippetOf(requested)}"` : describeInvalidValue(requested);
+  return {
+    ok: false,
+    error: {
+      code: SWARM_ERROR_CODES.CONTEXT_MODE_INVALID,
+      message: `context must be "fresh" or "fork"; received ${received}.`,
+      details: { received, allowed: [...CONTEXT_MODES] },
+    },
+  };
+}

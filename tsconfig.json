@@ -9,6 +9,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "exactOptionalPropertyTypes": false,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
@@ -25,6 +27,7 @@
   "include": [
     "src/**/*.ts",
     "tests/**/*.ts",
+    "tests/**/*.tsx",
     "src/**/*.tsx"
   ]
 }

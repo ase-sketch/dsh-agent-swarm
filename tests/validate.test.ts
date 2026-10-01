@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { hasLoneSurrogate } from "./helpers/surrogates.js";
 
 import {
   SWARM_ERROR_CODES,
@@ -11,6 +12,7 @@ import {
   ALLOWED_ROUTES_DETAILS_CAP,
   DUPLICATE_SNIPPET_MAX_CHARS,
   expandPromptTemplate,
+  resolveSwarmContextMode,
   resolveSwarmModelRoute,
   validateSwarmInput,
 } from "../src/validate.js";
@@ -179,6 +181,18 @@ describe("校验 3：item 元素必须是非空字符串", () => {
         expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_EMPTY);
         expect(r.error.details).toMatchObject({ index: 2, received: blank });
       }
+    }
+  });
+
+  it("超长全空白 item：回显截断到片段上限，另给原长度（报错不能挤爆上下文）", () => {
+    const blank = "\n".repeat(50_000);
+    const r = validateSwarmInput(input({ items: ["ok", blank] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.ITEM_EMPTY);
+      expect(r.error.message.length).toBeLessThan(DUPLICATE_SNIPPET_MAX_CHARS * 4);
+      expect(r.error.details).toMatchObject({ index: 2, receivedChars: 50_000 });
+      expect(String(r.error.details?.received).length).toBeLessThanOrEqual(DUPLICATE_SNIPPET_MAX_CHARS + 1);
     }
   });
 
@@ -519,6 +533,26 @@ describe("resolveSwarmModelRoute", () => {
     if (!r.ok) {
       expect(r.error.code).toBe(SWARM_ERROR_CODES.MODEL_AMBIGUOUS);
       expect(r.error.details?.candidates).toEqual(["google/gemini-2.5-pro", "vertex/gemini-2.5-pro"]);
+      expect(r.error.details?.candidateCount).toBe(2);
+    }
+  });
+
+  it("候选与回显同样封顶：候选超过上限时截断并给总数，超长 model 串只回显片段", () => {
+    const many = Array.from({ length: ALLOWED_ROUTES_DETAILS_CAP + 5 }, (_, i) => ({
+      provider: `p${String(i)}`,
+      model: "shared",
+    }));
+    const ambiguous = resolveSwarmModelRoute("shared", many);
+    expect(ambiguous.ok).toBe(false);
+    if (!ambiguous.ok) {
+      expect(ambiguous.error.details?.candidates).toHaveLength(ALLOWED_ROUTES_DETAILS_CAP);
+      expect(ambiguous.error.details?.candidateCount).toBe(ALLOWED_ROUTES_DETAILS_CAP + 5);
+    }
+    const longModel = "m".repeat(10_000);
+    const notAllowed = resolveSwarmModelRoute(longModel, many);
+    expect(notAllowed.ok).toBe(false);
+    if (!notAllowed.ok) {
+      expect(notAllowed.error.message.length).toBeLessThan(DUPLICATE_SNIPPET_MAX_CHARS * 3);
     }
   });
 
@@ -550,6 +584,41 @@ describe("resolveSwarmModelRoute", () => {
     if (!r.ok) {
       expect((r.error.details?.allowedRoutes as unknown[]).length).toBe(ALLOWED_ROUTES_DETAILS_CAP);
       expect(r.error.details?.allowedCount).toBe(big.length);
+    }
+  });
+});
+
+describe("回显截断不劈开代理对（评审第 1 条）", () => {
+  it("DUPLICATE_PROMPTS 的片段在 emoji 处截断时不残留孤立代理", () => {
+    // 前 119 个码元是 ASCII，第 120/121 个码元是一个 emoji 的代理对 → 旧实现截在两者之间
+    const item = `${"a".repeat(DUPLICATE_SNIPPET_MAX_CHARS - 1)}🚀tail`;
+    const r = validateSwarmInput(input({ items: [item, item] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const snippet = String(r.error.details?.itemSnippet);
+      expect(hasLoneSurrogate(snippet)).toBe(false);
+      expect(snippet).toBe(`${"a".repeat(DUPLICATE_SNIPPET_MAX_CHARS - 1)}…`);
+    }
+  });
+});
+
+describe("resolveSwarmContextMode", () => {
+  it("缺省 / 空白 → fresh；fresh / fork（允许首尾空白）→ 原值", () => {
+    for (const value of [undefined, "", "   "]) {
+      expect(resolveSwarmContextMode(value)).toEqual({ ok: true, mode: "fresh" });
+    }
+    expect(resolveSwarmContextMode("fresh")).toEqual({ ok: true, mode: "fresh" });
+    expect(resolveSwarmContextMode(" fork ")).toEqual({ ok: true, mode: "fork" });
+  });
+
+  it("其它取值一律 CONTEXT_MODE_INVALID，永不抛异常，回显截断", () => {
+    for (const value of ["Fork", "share", 1, null, {}, "x".repeat(10_000)]) {
+      const r = resolveSwarmContextMode(value);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe(SWARM_ERROR_CODES.CONTEXT_MODE_INVALID);
+        expect(r.error.message.length).toBeLessThan(DUPLICATE_SNIPPET_MAX_CHARS * 2);
+      }
     }
   });
 });
