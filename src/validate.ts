@@ -53,14 +53,14 @@ function normalizeOptionalString(value: string | undefined): string | undefined 
 }
 
 /**
- * 把非法 item 元素渲染成一段可安全放进 message / details 的描述。
+ * 把一个形状不合法的值（入参自身、item 元素、model 参数）渲染成可安全放进 message / details 的描述。
  *
  * 刻意不依赖对象自身的 toString / valueOf：入参来自模型，真实可能传入
  * `Object.create(null)` 这类没有原型的对象，直接拼接或 `String(value)` 会抛错——
- * 那又变成"校验函数自己抛 TypeError"，正是本次要消灭的行为。
+ * 那又变成"校验函数自己抛 TypeError"，正是本文件要消灭的行为。
  * 因此对象与函数只报类型；其余原始类型用 String() 显式转换（对 symbol 也安全）。
  */
-function describeInvalidItem(value: unknown): string {
+function describeInvalidValue(value: unknown): string {
   if (value === undefined) return "undefined";
   if (value === null) return "null";
   if (Array.isArray(value)) return "an array";
@@ -99,21 +99,6 @@ function fail(
   return { ok: false, error: details === undefined ? { code, message } : { code, message, details } };
 }
 
-/**
- * 入参自身的判型描述（复用 item 元素的同一套口径，故措辞一致）。
- *
- * 刻意不碰 value 自身的方法：对 `Object.create(null)` 这类无原型对象取 `.trim` 会抛，
- * 而取 `typeof`/`Array.isArray` 不会——本函数的立意正是"绝不让入参形状把自己变成异常"。
- */
-function describeInvalidInput(value: unknown): string {
-  if (value === undefined) return "undefined";
-  if (value === null) return "null";
-  if (Array.isArray(value)) return "an array";
-  const kind = typeof value;
-  if (kind === "object") return "an object";
-  if (kind === "function") return "a function";
-  return `${kind} ${String(value)}`;
-}
 
 /**
  * 校验并入队。全部校验在任何子代理启动之前完成；本函数不产生任何副作用。
@@ -131,7 +116,7 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
   // 而调用方真正的问题是把 items 直接当成了整个入参，报条数是误导。
 
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    const received = describeInvalidInput(input);
+    const received = describeInvalidValue(input);
     return fail(
       SWARM_ERROR_CODES.INVALID_INPUT,
       `Swarm input must be an object with items and prompt_template; received ${received}.`,
@@ -171,7 +156,7 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
     const raw = rawItems[i];
     const position = i + 1;
     if (typeof raw !== "string") {
-      const received = describeInvalidItem(raw);
+      const received = describeInvalidValue(raw);
       return fail(
         SWARM_ERROR_CODES.ITEM_NOT_STRING,
         `Item at position ${String(position)} is not a string (received ${received}); items may only contain strings.`,
@@ -242,7 +227,6 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
   return { ok: true, specs };
 }
 
-
 // ───────────────────────── per-call 模型路由匹配（纯函数）─────────────────────────
 
 /**
@@ -284,7 +268,7 @@ export function resolveSwarmModelRoute(
   allowed: readonly SwarmModelRoute[],
 ): SwarmModelResolution {
   if (typeof requested !== "string" || requested.trim() === "") {
-    const received = describeInvalidItem(requested);
+    const received = describeInvalidValue(requested);
     return {
       ok: false,
       error: {

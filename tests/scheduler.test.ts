@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { SwarmScheduler, runSwarm } from "../src/scheduler.js";
+import { SwarmScheduler, runSwarm, validateSchedulerConfig } from "../src/scheduler.js";
 import type {
   SwarmAttemptContext,
   SwarmAttemptResult,
@@ -1149,6 +1149,20 @@ describe("配置校验与自定义", () => {
     expect(() => new SwarmScheduler(specsOf(2), h.deps, { initialLaunchLimit: 0 })).toThrow(/initialLaunchLimit/);
     expect(() => new SwarmScheduler(specsOf(2), h.deps, { retryFactor: 0.5 })).toThrow(/retryFactor/);
     expect(() => new SwarmScheduler(specsOf(2), h.deps, { retryBaseMs: -1 })).toThrow(/retryBaseMs/);
+    // NaN 与任何数比较都为 false：旧写法 `x < 1` 会让 NaN 静默通过，现统一按"必须满足下界"判定。
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, { initialLaunchLimit: Number.NaN })).toThrow(
+      /initialLaunchLimit/,
+    );
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, { retryFactor: Number.NaN })).toThrow(/retryFactor/);
+    expect(() => new SwarmScheduler(specsOf(2), h.deps, { retryBaseMs: Number.NaN })).toThrow(/retryBaseMs/);
+  });
+
+  it("validateSchedulerConfig 与构造期校验同一口径，可供宿主在加载期提前 fail-fast", () => {
+    expect(() => validateSchedulerConfig({ initialLaunchLimit: 0 })).toThrow(/initialLaunchLimit/);
+    expect(() => validateSchedulerConfig({ maxRateLimitRetries: 0 })).toThrow(/maxRateLimitRetries/);
+    expect(() => validateSchedulerConfig({})).not.toThrow();
+    expect(() => validateSchedulerConfig(undefined)).not.toThrow();
+    expect(() => validateSchedulerConfig({ retryFactor: 1.5, maxConcurrency: 3 })).not.toThrow();
   });
 
   it("maxConcurrency 给定则必须是 >= 1 的整数，否则构造期抛错", () => {

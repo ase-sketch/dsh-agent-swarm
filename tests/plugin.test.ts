@@ -240,6 +240,8 @@ describe("B. defineTool 注册形态", () => {
     expect(description).toMatch(/at most \d+ entries/);
     expect(description).toMatch(/prompt_template/);
     expect(description).toMatch(/\{\{item\}\}/);
+    // 第六道：item 必须是非空字符串（此前描述只列五道，模型不知道这条）
+    expect(description).toMatch(/6\. every item must be a string with at least one non-whitespace character/);
     // 与单个 subagent 工具的分工
     expect(description).toMatch(/single-subagent tool/i);
     // 禁止嵌套
@@ -454,10 +456,26 @@ describe("D. 派发红线", () => {
     expect(first.request.prompt).toEqual([
       { type: "text", text: "Review a.md and report findings." },
     ]);
-    expect(typeof first.request.label).toBe("string");
+    expect(first.request.label).toBe("1/3: a.md");
     expect(first.request.signal).toBeInstanceOf(AbortSignal);
     // start 请求没有 timeout 字段（spike Q2.2）
     expect(first.request).not.toHaveProperty("timeout");
+  });
+
+  it("label 只是显示摘要：长 item 截断、多行折叠成单行，完整 prompt 仍原样派发", async () => {
+    // label 会随 subagent/catalog 事件持久化进父会话日志：整份文件塞进 item 时不能原样复制过去。
+    const longItem = `${"x".repeat(200)}\nsecond line`;
+    const harness = createHarness();
+    await harness.definition.execute(
+      validArgs({ items: [longItem, "line one\n\tline two"] }),
+      makeExec() as never,
+    );
+    const [first, second] = harness.startCalls as [StartCall, StartCall];
+    expect(first.request.label).toBe(`1/2: ${"x".repeat(80)}…`);
+    expect(second.request.label).toBe("2/2: line one line two");
+    expect(first.request.prompt).toEqual([
+      { type: "text", text: `Review ${longItem} and report findings.` },
+    ]);
   });
 
   it("每个 start 成功都配对一次 dispose", async () => {

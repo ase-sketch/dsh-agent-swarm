@@ -32,7 +32,7 @@ export function effectiveMaxItems(configuredMaxItems: number): number {
 
 /**
  * 工具描述：英文、面向模型、全部自拟（clean-room，未复制任何上游原文）。
- * 覆盖四块：用途 / 硬校验 / 与单个 subagent 工具的分工 / 禁止嵌套。
+ * 覆盖四块：用途 / 六道硬校验（与 validate.ts 一一对应）/ 与单个 subagent 工具的分工 / 禁止嵌套。
  *
  * 文案里的**上界一律取生效上限**，不是协议常量 128。
  * 理由：模型是照着这段说明去规划批量的——若宿主把 config.maxItems 调到 10，
@@ -57,6 +57,7 @@ export function buildToolDescription(effectiveMax: number): string {
     "3. if you provide items, you must also provide prompt_template.",
     "4. prompt_template must contain the {{item}} placeholder, which is replaced once per item.",
     "5. every item must expand to a distinct prompt; items that expand to the same prompt are rejected.",
+    "6. every item must be a string with at least one non-whitespace character.",
     "",
     `Item-count limit: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} entries and cannot be raised; the host can only lower it, and the effective limit on this deployment is ${String(effectiveMax)}. Plan and split your batch against the number stated in requirement 2 above — submitting more than the effective limit is rejected.`,
     "",

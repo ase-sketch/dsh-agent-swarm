@@ -139,9 +139,22 @@ interface MemberDispatch {
   total: number;
 }
 
-/** 子代理显示标签：`<序号>/<总数>: <item>`。 */
-function memberLabel(spec: SwarmTaskSpec, total: number): string {
-  return `${String(spec.index)}/${String(total)}: ${String(spec.item)}`;
+/** 子代理标签里 item 部分的最大码元数（超出截断并补 `…`）。 */
+export const MEMBER_LABEL_ITEM_MAX_CHARS = 80;
+
+/**
+ * 子代理显示标签：`<序号>/<总数>: <item 摘要>`。
+ *
+ * 为什么必须截断、折叠空白：label 会随 `subagent/catalog` 事件**持久化进父会话日志**
+ * 并显示在子代理目录里（spike Q2.2）。item 可以是整份文件——128 个 100KB 的 item 会把
+ * 十几 MB 原文复制进父会话日志；多行 item 也会把单行标签撑成多行。
+ * 成员的完整 prompt 仍原样派发，截断只影响显示标签。
+ */
+export function memberLabel(spec: SwarmTaskSpec, total: number): string {
+  const oneLine = String(spec.item).replace(/\s+/g, " ").trim();
+  const item =
+    oneLine.length > MEMBER_LABEL_ITEM_MAX_CHARS ? `${oneLine.slice(0, MEMBER_LABEL_ITEM_MAX_CHARS)}…` : oneLine;
+  return `${String(spec.index)}/${String(total)}: ${item}`;
 }
 
 /**
