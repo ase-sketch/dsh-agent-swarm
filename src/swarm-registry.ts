@@ -382,7 +382,7 @@ export class SwarmRegistry {
     // 终态**粘性**：落定之后不再改变（与 markSuspended 的终态守卫对称）。
     //
     // 为什么必须如此：批次中断时调度器的 #abandonSuspended 会先把"尚未 ready"的成员
-    // 通知成 aborted；而此刻可能仍有在飞的 ctx.subagents.start，它之后才 reject，
+    // 通知成 aborted；而此刻可能仍有在飞的 ctx.subagents.startActivation，它之后才 reject，
     // 宿主 catch 里会再调一次 markSettled("failed")。若允许覆写，这次"后到者"会把
     // 已落定的 aborted 改成 failed，批次又被 endBatch 推导成 failed，与 XML 侧
     // "全员 aborted"的结论重新矛盾——即 2026-10-01 审查 P1-2 的残余时序。

@@ -2,12 +2,12 @@
  * dsh-agent-swarm — 批次执行（宿主集成层）
  *
  * 职责：拿到 batch-plan.ts 产出的批次计划后，开批次 → 接好调度器 → 每个成员经
- * `ctx.subagents.start()` 派发 one-shot 子代理 → 收齐全部结果 → 收批次。
+ * `ctx.subagents.startActivation()` 派发 one-shot 子代理 → 收齐全部结果 → 收批次。
  *
  * 不变量（缺一不可）：
- *   1. start() **成功后**必须有配对 dispose()（spike Q2.3；start 抛错时无 run 可 dispose）
+ *   1. startActivation() **成功后**必须有配对 dispose()（startActivation 抛错时无 activation 可 dispose）
  *   2. stopReason "aborted" 归取消/超时，绝不当限流（spike Q5）
- *   3. 不向 start 传它不支持的字段（如 timeout）；单任务超时由调度器的超时闸门 abort 成员信号实现
+ *   3. 不向 startActivation 传它不支持的字段（如 timeout）；单任务超时由调度器的超时闸门 abort 成员信号实现
  *   4. parent 传 exec.agent，子代理沙箱档位据此自动继承（spike Q9）
  *   5. 成员终态由**批次信号**归属，不是成员信号（见 settleOutcomeAfter）
  *   6. **失败必须用 throw 表达**：调度器把 executor 的 resolve 一律当作 completed
@@ -181,7 +181,7 @@ async function runMember(
   attempt: SwarmAttemptContext,
 ): Promise<SwarmAttemptResult> {
   const { ctx, registry, swarmId, batchSignal } = dispatch;
-  let run;
+  let activation;
   try {
     registry.markStarting(swarmId, spec.index);
 
@@ -189,13 +189,17 @@ async function runMember(
     // （调度器 #linkAttemptSignals 的超时闸门以 "Subagent timed out." 为原因 abort 它）。
     // 这里**不再**另拼 AbortSignal.timeout：两个同时长计时器会竞速，超时文案的确定性
     // 只能靠"恰好谁先创建"；单一来源后，超时的取消与文案出自同一个闸门。
-    run = await ctx.subagents.start(dispatch.provider, {
-      parent: dispatch.parent,
-      prompt: [{ type: "text", text: spec.prompt }],
+    activation = await ctx.subagents.startActivation({
+      provider: dispatch.provider,
       label: memberLabel(spec, dispatch.total),
       signal: attempt.signal,
-      ...(dispatch.agentOptions === undefined ? {} : { agentOptions: dispatch.agentOptions }),
-      ...(dispatch.maxDepth === undefined ? {} : { maxDepth: dispatch.maxDepth }),
+      delivery: "caller",
+      request: {
+        parent: dispatch.parent,
+        prompt: [{ type: "text", text: spec.prompt }],
+        ...(dispatch.agentOptions === undefined ? {} : { agentOptions: dispatch.agentOptions }),
+        ...(dispatch.maxDepth === undefined ? {} : { maxDepth: dispatch.maxDepth }),
+      },
     });
   } catch (error) {
     const detail = `Subagent could not be started: ${error instanceof Error ? error.message : String(error)}`;
@@ -203,19 +207,18 @@ async function runMember(
     throw new SwarmTaskFailure(detail);
   }
 
-  // start 已成功：从这一刻起 run 存在，**必须**配对 dispose。
-  // 子会话 id 即 run.id（spike：in-process driver 以 childId 作为 run.id；待实机验证）。
-  const childSessionId = String(run.id);
+  // startActivation 已成功：从这一刻起 activation 存在，**必须**配对 dispose。
+  const childSessionId = String(activation.childId);
   const watch = dispatch.rateLimit?.watch(childSessionId);
   /** 被判为限流时的失败说明；用于 dispose 之后的中断补账（见 finally）。 */
   let rateLimitedDetail: string | undefined;
-  attempt.setAgentId(run.id);
-  registry.setAgentId(swarmId, spec.index, run.id);
+  attempt.setAgentId(activation.childId);
+  registry.setAgentId(swarmId, spec.index, activation.childId);
   attempt.markReady();
   registry.markReady(swarmId, spec.index);
 
   try {
-    const result = await run.result;
+    const result = await activation.result;
     if (result.stopReason === "completed") {
       registry.markSettled(swarmId, spec.index, toSettledPhase(result.stopReason));
       return { result: joinContentBlocks(result.output), stopReason: result.stopReason };
@@ -247,8 +250,8 @@ async function runMember(
     throw error;
   } finally {
     dispatch.rateLimit?.release(childSessionId);
-    // 幂等 dispose；即使 await run.result 抛错也必须走到这里。
-    await run.dispose();
+    // 幂等 dispose；即使 await activation.result 抛错也必须走到这里。
+    await activation.dispose();
     // 限流路径不在 catch 里落终态，指望调度器推进相位；但若批次恰好在 dispose 期间被中断，
     // 调度器已经收尾、会丢弃这次结局，成员就会永远停在 running（面板徽标常亮）。
     // abort 只可能由宏任务触发，插不进"finally 结束 → 调度器收到 rejection"之间的微任务，

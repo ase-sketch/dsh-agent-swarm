@@ -6,10 +6,10 @@
  *
  *   batch-plan.ts   规划：六道硬校验 + 宿主策略上限 + 模型路由 + 父 agent/会话 → 批次计划
  *                   （**所有整体拒绝都发生在这里**，在任何子代理启动、任何批次登记之前）
- *   batch-run.ts    执行：开批次 → 调度器（scheduler.ts）→ 逐成员 ctx.subagents.start → 收批次
+ *   batch-run.ts    执行：开批次 → 调度器（scheduler.ts）→ 逐成员 ctx.subagents.startActivation → 收批次
  *   result-xml.ts   渲染：renderSwarmResultSafely → <agent_swarm_result>（成员状态的唯一权威）
  *
- * 关键契约（docs/spike-dsh-api.md + 0.2.0-rc.2 实装类型双向核对）：
+ * 关键契约（docs/spike-dsh-api.md + 0.2.1-rc.5 实装类型双向核对）：
  *   - 命名导出 name / inject / Config / apply，**不写 export default**
  *   - inject 只需要 ["tools", "subagents"]：注册工具 + 派发子代理
  *   - 不设任何审批字段（spike Q8：无 approvalRule 机制，不调 ctx.approval 即不弹窗）

@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-swarm",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "DSH bundle: batch subagent swarm tool with adaptive rate-limit scheduling (clean-room)",
@@ -17,13 +17,13 @@
     "prepublishOnly": "pnpm run build"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/cordis": "^4.0.5",
     "@deepseek-ai/cordis-plugin-loader": "^1.0.5",
-    "@deepseek-ai/dsh-subagent": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-typert-registry": "0.2.0-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.4",
+    "@deepseek-ai/dsh-subagent": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-typert-registry": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "^3.18.5",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^22.20.4",

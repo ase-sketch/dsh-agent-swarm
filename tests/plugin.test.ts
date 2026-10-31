@@ -2,7 +2,7 @@
  * dsh-agent-swarm — 插件契约测试（M2）
  *
  * 两层：
- *   A. mock Context 契约测试：捕获 ctx.tools.register 的入参、stub ctx.subagents.start，
+ *   A. mock Context 契约测试：捕获 ctx.tools.register 的入参、stub ctx.subagents.startActivation，
  *      断言 inject 键、defineTool 形态、六道校验的结构化失败、start/dispose 配对、
  *      signal 级联、失败聚合与 XML 如实呈现。
  *   B. 真实 Loader 加载测试：用 @deepseek-ai/cordis + cordis-plugin-loader 走真实
@@ -30,18 +30,20 @@ import { hasLoneSurrogate } from "./helpers/surrogates.js";
 
 interface StartCall {
   provider: string;
+  label: string;
+  signal: AbortSignal;
+  delivery: "caller";
   request: Record<string, unknown>;
 }
 
-/** 交给自定义 run 工厂的一次 start 调用（index 为 0-based 调用序号）。 */
+/** 交给自定义 activation 工厂的一次 startActivation 调用（index 为 0-based 调用序号）。 */
 interface StartInvocation extends StartCall {
   index: number;
 }
 
-/** start() 返回的 run 句柄桩（形状对齐 SubagentRun 中本插件用到的字段）。 */
-interface MockRun {
-  id: string;
-  localAgent?: unknown;
+/** startActivation() 返回的 activation 句柄桩（只含本插件用到的字段）。 */
+interface MockActivation {
+  childId: string;
   result: Promise<unknown>;
   dispose: () => Promise<void>;
 }
@@ -64,7 +66,7 @@ interface MockContextOptions {
    * 完全接管 run 的构造（信号驱动、事件驱动、可控 result 等场景）。
    * 给了它，stopReasons / failStartAt / rejectResultAt 都不再生效；dispose 计数仍由 harness 统计。
    */
-  runFactory?: (call: StartInvocation) => Promise<MockRun>;
+  runFactory?: (call: StartInvocation) => Promise<MockActivation>;
   /** ctx.subagents 上 start 之外的桩方法（resolveMaxDepth / getProvider 等）。 */
   subagents?: Record<string, unknown>;
 }
@@ -112,26 +114,25 @@ function createHarness(options: MockContextOptions = {}): MockHarness {
     configurable: true,
     value: {
       ...options.subagents,
-      start: (provider: string, request: Record<string, unknown>) => {
+      startActivation: (spec: StartCall) => {
         const current = callIndex;
         callIndex += 1;
-        startCalls.push({ provider, request });
+        startCalls.push(spec);
         if (options.runFactory !== undefined) {
-          return options.runFactory({ provider, request, index: current }).then((run) => ({
-            ...run,
+          return options.runFactory({ ...spec, index: current }).then((activation) => ({
+            ...activation,
             dispose: () => {
               disposeCount += 1;
-              return run.dispose();
+              return activation.dispose();
             },
           }));
         }
         if (failStartAt.has(current)) {
-          return Promise.reject(new Error(`provider "${String(provider)}" refused to start`));
+          return Promise.reject(new Error(`provider "${String(spec.provider)}" refused to start`));
         }
         const stopReason = stopReasons[current] ?? "completed";
         return Promise.resolve({
-          id: `run-${String(current)}`,
-          localAgent: undefined,
+          childId: `run-${String(current)}`,
           result: rejectResultAt.has(current)
             ? Promise.reject(new Error("infrastructure fault"))
             : Promise.resolve({
@@ -308,7 +309,7 @@ describe("A. 插件声明形态", () => {
       configurable: true,
       value: { register: () => ((registered = true), () => undefined) },
     });
-    Object.defineProperty(ctx, "subagents", { configurable: true, value: { start: () => Promise.reject() } });
+    Object.defineProperty(ctx, "subagents", { configurable: true, value: { startActivation: () => Promise.reject() } });
     expect(() => plugin.apply(ctx, { ...defaultConfig(), firstWave: 0 })).toThrow(/initialLaunchLimit/);
     // 没有注册工具，也没有挂 swarmRemote 服务：失败不留下任何半装配状态。
     expect(registered).toBe(false);
@@ -453,7 +454,7 @@ describe("C. 六道硬校验在启动任何子代理之前完成", () => {
     });
     Object.defineProperty(ctx, "subagents", {
       configurable: true,
-      value: { start: (...args: unknown[]) => void startCalls.push(args) },
+      value: { startActivation: (...args: unknown[]) => void startCalls.push(args) },
     });
     // maxItems=3 低于 128 硬上限 → 生效值为 3
     plugin.apply(ctx, { ...defaultConfig(), maxItems: 3 });
@@ -484,7 +485,7 @@ describe("C. 六道硬校验在启动任何子代理之前完成", () => {
     });
     Object.defineProperty(ctx, "subagents", {
       configurable: true,
-      value: { start: (...args: unknown[]) => void startCalls.push(args) },
+      value: { startActivation: (...args: unknown[]) => void startCalls.push(args) },
     });
     plugin.apply(ctx, { ...defaultConfig(), maxItems: 999 });
     if (definition === undefined) throw new Error("not registered");
@@ -556,7 +557,7 @@ describe("C. 六道硬校验在启动任何子代理之前完成", () => {
 // ───────────────────────── D. 派发红线 ─────────────────────────
 
 describe("D. 派发红线", () => {
-  it("start 收到的字段：parent=exec.agent、prompt 文本块、label、signal；无 timeout", async () => {
+  it("startActivation 收到的字段：parent=exec.agent、prompt 文本块、label、signal；无 timeout", async () => {
     const harness = createHarness();
     await harness.definition.execute(validArgs(), makeExec() as never);
     expect(harness.startCalls).toHaveLength(3);
@@ -566,9 +567,10 @@ describe("D. 派发红线", () => {
     expect(first.request.prompt).toEqual([
       { type: "text", text: "Review a.md and report findings." },
     ]);
-    expect(first.request.label).toBe("1/3: a.md");
-    expect(first.request.signal).toBeInstanceOf(AbortSignal);
-    // start 请求没有 timeout 字段（spike Q2.2）
+    expect(first.label).toBe("1/3: a.md");
+    expect(first.signal).toBeInstanceOf(AbortSignal);
+    expect(first.delivery).toBe("caller");
+    // startActivation 请求没有 timeout 字段（spike Q2.2）
     expect(first.request).not.toHaveProperty("timeout");
   });
 
@@ -581,8 +583,8 @@ describe("D. 派发红线", () => {
       makeExec() as never,
     );
     const [first, second] = harness.startCalls as [StartCall, StartCall];
-    expect(first.request.label).toBe(`1/2: ${"x".repeat(80)}…`);
-    expect(second.request.label).toBe("2/2: line one line two");
+    expect(first.label).toBe(`1/2: ${"x".repeat(80)}…`);
+    expect(second.label).toBe("2/2: line one line two");
     expect(first.request.prompt).toEqual([
       { type: "text", text: `Review ${longItem} and report findings.` },
     ]);
@@ -593,7 +595,7 @@ describe("D. 派发红线", () => {
     const item = `${"x".repeat(79)}🚀tail`;
     const harness = createHarness();
     await harness.definition.execute(validArgs({ items: [item, "other"] }), makeExec() as never);
-    const label = String((harness.startCalls[0] as StartCall).request.label);
+    const label = String((harness.startCalls[0] as StartCall).label);
     expect(hasLoneSurrogate(label)).toBe(false);
     expect(label).toBe(`1/2: ${"x".repeat(79)}…`);
   });
@@ -627,7 +629,7 @@ describe("D. 派发红线", () => {
       expect(harness.startCalls.length).toBeGreaterThan(0);
     });
     // 父 signal 被中断 → start 收到的 signal 应随之 abort（级联）
-    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
+    const memberSignal = (harness.startCalls[0] as StartCall).signal as AbortSignal;
     expect(memberSignal.aborted).toBe(false);
     controller.abort();
     await vi.waitFor(() => {
@@ -645,10 +647,9 @@ describe("D. 派发红线", () => {
       // 挂起直到被 abort，这样断言期间 attempt 仍存活，级联可观测。
       // 时序本身就是回归证据：若拼了 AbortSignal.timeout(0)，
       // 每个成员会在一个微任务后被 abort，永远走不到 completed。
-      runFactory: ({ request, index }) => {
-        const signal = request.signal as AbortSignal;
+      runFactory: ({ signal, index }) => {
         return Promise.resolve({
-          id: `run-${String(index + 1)}`,
+          childId: `run-${String(index + 1)}`,
           result: settleOnAbort(signal, (resolve) => {
             resolve({ output: [{ type: "text", text: "ok" }], stopReason: "aborted" });
           }),
@@ -664,7 +665,7 @@ describe("D. 派发红线", () => {
     await vi.waitFor(() => {
       expect(harness.startCalls).toHaveLength(3);
     });
-    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
+    const memberSignal = (harness.startCalls[0] as StartCall).signal as AbortSignal;
 
     // 关键断言：signal 没有被自动 abort（配置成「不超时」不能把每个成员秒杀）。
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -685,10 +686,10 @@ describe("D. 派发红线", () => {
       // 很短的超时，让调度器的闸门先于任何真实完成触发
       config: { ...defaultConfig(), taskTimeoutMs: 10 },
       // 只有被 abort 才会 settle：真实 provider 在 signal 触发后返回 aborted。
-      runFactory: ({ request }) =>
+      runFactory: ({ signal }) =>
         Promise.resolve({
-          id: "run-timeout",
-          result: settleOnAbort(request.signal as AbortSignal, (resolve) => {
+          childId: "run-timeout",
+          result: settleOnAbort(signal, (resolve) => {
             resolve({ output: [], stopReason: "aborted" });
           }),
           dispose: () => Promise.resolve(),
@@ -698,7 +699,7 @@ describe("D. 派发红线", () => {
     expect(result.xml).toContain("Subagent timed out.");
     expect(result.xml).toContain('<summary>failed: 3</summary>');
     // 子代理被取消的原因就是调度器超时闸门的原因（单一来源），而不是另一个计时器的 TimeoutError。
-    const memberSignal = (harness.startCalls[0] as StartCall).request.signal as AbortSignal;
+    const memberSignal = (harness.startCalls[0] as StartCall).signal as AbortSignal;
     expect(memberSignal.reason).toBeInstanceOf(Error);
     expect((memberSignal.reason as Error).message).toBe("Subagent timed out.");
   });
@@ -781,11 +782,10 @@ describe("E. 收齐全部结果再渲染，个别失败不拖垮整次调用", (
     Object.defineProperty(ctx, "subagents", {
       configurable: true,
       value: {
-        start: (_p: string, request: Record<string, unknown>) => {
-          const text = String((request.prompt as Array<{ text: string }>)[0]?.text ?? "");
+        startActivation: (spec: StartCall) => {
+          const text = String((spec.request.prompt as Array<{ text: string }>)[0]?.text ?? "");
           return Promise.resolve({
-            id: "run-x",
-            localAgent: undefined,
+            childId: "run-x",
             result: Promise.resolve({
               output: [{ type: "text", text: `5 < 6 & 7 > 3 for ${String(text)}` }],
               stopReason: "completed",
@@ -832,13 +832,12 @@ describe("E2. 渲染兜底：一次渲染失败不得赔进整批正文（缺陷
     Object.defineProperty(ctx, "subagents", {
       configurable: true,
       value: {
-        start: () => {
+        startActivation: () => {
           const current = call;
           call += 1;
           return Promise.resolve({
-            // 中间那条给一个对象型 id：类型层是 string，运行时是脏数据。
-            id: current === 1 ? ({ bad: true } as unknown as string) : `run-${String(current)}`,
-            localAgent: undefined,
+            // 中间那条给一个对象型 childId：类型层是 string，运行时是脏数据。
+            childId: current === 1 ? ({ bad: true } as unknown as string) : `run-${String(current)}`,
             result: Promise.resolve({
               output: [{ type: "text", text: `result of member ${String(current)}` }],
               stopReason: "completed",
@@ -926,7 +925,7 @@ describe("F. 真实 Loader 加载路径", () => {
         };
       },
     });
-    root.provide("subagents", { start: () => Promise.reject(new Error("unused in this test")) });
+    root.provide("subagents", { startActivation: () => Promise.reject(new Error("unused in this test")) });
 
     const entryId = await loader.create({ name: "dsh-agent-swarm", config: defaultConfig() });
     expect(entryId).toBeTruthy();
@@ -1014,8 +1013,7 @@ function createSignalDrivenHarness(options: {
   const memberSignals: AbortSignal[] = [];
   const harness = createHarness({
     config: { ...defaultConfig(), taskTimeoutMs: options.taskTimeoutMs },
-    runFactory: ({ request }) => {
-      const signal = request.signal as AbortSignal;
+    runFactory: ({ signal }) => {
       memberSignals.push(signal);
       const result =
         options.firstFailsImmediately === true && memberSignals.length === 1
@@ -1028,7 +1026,7 @@ function createSignalDrivenHarness(options: {
               reject(new Error("run.result rejected after the swarm was interrupted"));
             });
       return Promise.resolve({
-        id: "run-" + String(memberSignals.length),
+        childId: "run-" + String(memberSignals.length),
         result,
         dispose: () => Promise.resolve(),
       });
@@ -1552,7 +1550,7 @@ describe("L. 限流退避接线", () => {
 
   /**
    * 脚本化的子代理桩：start 返回后，先经真实 cordis 事件总线（ctx.emit "session/event"）
-   * 在子会话里追加脚本事件，再以脚本给定的 stopReason 收场。子会话 id = run.id。
+   * 在子会话里追加脚本事件，再以脚本给定的 stopReason 收场。子会话 id = activation.childId。
    * 按 label 里的成员序号取脚本（重试会再次 start 同一成员）。
    */
   function scriptedHarness(
@@ -1572,14 +1570,14 @@ describe("L. 限流退避接线", () => {
           ? {}
           : { rateLimit: { failureCodes: ["RATE_LIMIT"], maxRetries: 3, ...rateLimit } }),
       },
-      runFactory: ({ request, index }) => {
-        const memberIndex = Number(String(request.label).split("/")[0]);
+      runFactory: ({ label, index }) => {
+        const memberIndex = Number(String(label).split("/")[0]);
         const attempt = (attempts.get(memberIndex) ?? 0) + 1;
         attempts.set(memberIndex, attempt);
         const script = scriptFor(memberIndex, attempt);
         const id = `child-${String(index)}`;
         return Promise.resolve({
-          id,
+          childId: id,
           result: (async () => {
             // 与真实时序一致：子会话事件发生在 start() 返回之后
             await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1663,11 +1661,11 @@ describe("L. 限流退避接线", () => {
     let ctxRef: Context | undefined;
     const harness = createHarness({
       config: { ...defaultConfig(), releaseIntervalMs: 1, backoffInitialMs: 60_000, rateLimit: { enabled: true, failureCodes: ["RATE_LIMIT"], maxRetries: 3 } },
-      runFactory: ({ request, index }) => {
+      runFactory: ({ label, signal, index }) => {
         const id = `child-${String(index)}`;
-        const limited = String(request.label).startsWith("1/");
+        const limited = String(label).startsWith("1/");
         return Promise.resolve({
-          id,
+          childId: id,
           result: limited
             ? (async () => {
                 await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1675,7 +1673,7 @@ describe("L. 限流退避接线", () => {
                 for (const event of rateLimitedEnd().events) bus.emit("session/event", { id }, event);
                 return { output: [], stopReason: "error" };
               })()
-            : settleOnAbort(request.signal as AbortSignal, (resolve) => {
+            : settleOnAbort(signal, (resolve) => {
                 resolve({ output: [], stopReason: "aborted" });
               }),
           dispose: limited

@@ -19,7 +19,7 @@
 
 ## 安装
 
-需要 DSH 0.2（developer preview）。
+需要 DSH 0.2.1-rc.5 或更高版本（developer preview）。
 
 ```sh
 # 从 git 仓库直接安装
@@ -86,7 +86,7 @@ pnpm run build      # 编译 host 半 + 预构建 client 半到 dist/
 
 ## Install
 
-Requires DSH 0.2 (developer preview).
+Requires DSH 0.2.1-rc.5 or later (developer preview).
 
 ```sh
 dsh plugin add ase-sketch/dsh-agent-swarm

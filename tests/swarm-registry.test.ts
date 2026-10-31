@@ -463,7 +463,7 @@ describe("中断后 registry 与调度器结论一致", () => {
 /**
  * 终态粘性回归（WP-B 之后由父代理补的守卫）：
  * 中断时调度器会先把"尚未 ready"的成员落 aborted；而此刻可能仍有在飞的
- * ctx.subagents.start，它之后才 reject，宿主 catch 会再调一次 markSettled("failed")。
+ * ctx.subagents.startActivation，它之后才 reject，宿主 catch 会再调一次 markSettled("failed")。
  * 若允许覆写，这次"后到者"会把 aborted 改成 failed，批次又被 endBatch 推导成 failed，
  * 与 XML 侧"全员 aborted"的结论重新矛盾。守卫语义：**先到的终态才是真实结局**。
  */

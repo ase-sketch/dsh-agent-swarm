@@ -13,7 +13,7 @@
  * 拿不到最终失败码时，退而看**收场那一轮**最后一次 llm/retry 的失败码（不跨轮沿用）。
  *
  * ⚠️ 待实机验证（M3 / spike R1）：失败码的实际取值、事件 data 形状、插件级 `session/event`
- * 监听能否收到子会话事件、子会话 id 是否等于 run.id。因此宿主侧默认**关闭**（config.rateLimit.enabled），
+ * 监听能否收到子会话事件、子会话 id 是否等于 activation.childId。因此宿主侧默认**关闭**（config.rateLimit.enabled），
  * 关闭时本模块完全不被调用，运行时行为与引入前逐字节一致。
  *
  * 为什么是"实时观察"而不是事后读日志：DSH 已废弃全部同步读事件的 API
