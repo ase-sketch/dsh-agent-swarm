@@ -59,7 +59,7 @@ export interface SwarmBatchPlan {
 
 /**
  * 规划一批任务。检查顺序即报错优先级：
- *   ① 六道硬校验 + 展开 + 宿主策略上限；② 起始上下文（fork 的参数冲突与条数上限）；
+ *   ① 八道硬校验 + 展开 + 宿主策略上限；② 起始上下文（fork 的参数冲突与条数上限）；
  *   ③ per-call 模型路由（白名单）；④ 父 Agent 与会话；⑤ provider 可用性（fork）；
  *   ⑥ 委派深度上限（父 agent 的成员是否会超出宿主深度限制）。
  */
@@ -93,7 +93,7 @@ export function planSwarmBatch(
 // ───────────────────────── ① 校验 + 展开 + 宿主策略上限 ─────────────────────────
 
 /**
- * 六道硬校验与宿主策略上限一律在**启动任何子代理之前**完成；两者失败都抛结构化错误
+ * 八道硬校验与宿主策略上限一律在**启动任何子代理之前**完成；两者失败都抛结构化错误
  * （code + 人可读 message + 机器可读 details）。
  */
 function resolveSwarmSpecs(args: SwarmExecuteArgs, config: SwarmPluginConfig): SwarmTaskSpec[] {

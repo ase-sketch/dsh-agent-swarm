@@ -230,6 +230,22 @@ describe("正常模式节奏", () => {
     expect(await runSwarm([], h.deps)).toEqual([]);
   });
 
+  it("128 项并发 8：第 9 项必须等待名额释放", async () => {
+    const h = harness();
+    const p = runSwarm(specsOf(128), h.deps, { initialLaunchLimit: 5, maxConcurrency: 8 });
+    await flush(2_100);
+    expect(h.started()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    await flush(10_000);
+    expect(h.started()).toHaveLength(8);
+
+    h.complete(1);
+    await flush(0);
+    expect(h.started()).toHaveLength(8);
+    await flush(700); // 名额已释放，但仍遵守首波之后的放量间隔。
+    expect(h.started()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    await drain(h, p);
+  });
+
   it("maxConcurrency 压住首波，完成后放行下一个", async () => {
     const h = harness();
     const p = runSwarm(specsOf(6), h.deps, { maxConcurrency: 2 });
@@ -1032,6 +1048,55 @@ describe("超时", () => {
     expect(results[0]?.outcome).toBe("failed");
     expect(results[0]?.error).toBe("Subagent timed out.");
     expect(results[1]?.outcome).toBe("completed");
+  });
+
+  it("执行器忽略 abort 时，超时仍按时收尾并释放并发名额", async () => {
+    const started: number[] = [];
+    const h = harness({
+      executor: {
+        run: (spec, ctx) => {
+          started.push(spec.index);
+          ctx.setAgentId(`agent-${String(spec.index)}`);
+          ctx.markReady();
+          return new Promise<SwarmAttemptResult>(() => undefined);
+        },
+      },
+    });
+    let settled = false;
+    const p = runSwarm(specsOf(2), h.deps, { initialLaunchLimit: 2, maxConcurrency: 1, timeoutMs: 10 });
+    void p.then(() => { settled = true; });
+
+    await flush(10);
+    expect(started).toEqual([1, 2]);
+    await flush(10);
+    const results = await p;
+    expect(settled).toBe(true);
+    expect(results.map((r) => r.outcome)).toEqual(["failed", "failed"]);
+    expect(results.map((r) => r.error)).toEqual(["Subagent timed out.", "Subagent timed out."]);
+  });
+
+  it("超时后晚到的成功不能改写终态", async () => {
+    const completions = new Map<number, (result: SwarmAttemptResult) => void>();
+    const h = harness({
+      executor: {
+        run: (spec, ctx) => {
+          ctx.setAgentId(`agent-${String(spec.index)}`);
+          ctx.markReady();
+          return new Promise<SwarmAttemptResult>((resolve) => completions.set(spec.index, resolve));
+        },
+      },
+    });
+    const p = runSwarm(specsOf(2), h.deps, { initialLaunchLimit: 2, timeoutMs: 5 });
+    await flush(5);
+    const results = await p;
+    expect(results.map((r) => r.outcome)).toEqual(["failed", "failed"]);
+
+    completions.get(1)?.({ result: "late-ok-1" });
+    completions.get(2)?.({ result: "late-ok-2" });
+    await flush(30);
+    expect(results.map((r) => r.outcome)).toEqual(["failed", "failed"]);
+    expect(results.map((r) => r.result)).toEqual([undefined, undefined]);
+    expect(results.map((r) => r.error)).toEqual(["Subagent timed out.", "Subagent timed out."]);
   });
 
   it("timeoutMs 为 0 或未设时不超时", async () => {

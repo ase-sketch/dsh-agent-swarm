@@ -7,7 +7,7 @@
  * 不变量（缺一不可）：
  *   1. startActivation() **成功后**必须有配对 dispose()（startActivation 抛错时无 activation 可 dispose）
  *   2. stopReason "aborted" 归取消/超时，绝不当限流（spike Q5）
- *   3. 不向 startActivation 传它不支持的字段（如 timeout）；单任务超时由调度器的超时闸门 abort 成员信号实现
+ *   3. 不向 startActivation 传它不支持的字段（如 timeout）；单任务超时由调度器立即落终态并 abort 成员信号
  *   4. parent 传 exec.agent，子代理沙箱档位据此自动继承（spike Q9）
  *   5. 成员终态由**批次信号**归属，不是成员信号（见 settleOutcomeAfter）
  *   6. **失败必须用 throw 表达**：调度器把 executor 的 resolve 一律当作 completed

@@ -564,8 +564,7 @@ export class SwarmScheduler {
       timeoutMs === undefined || timeoutMs <= 0
         ? undefined
         : this.#deps.setTimeout(() => {
-            attempt.timedOut = true;
-            attempt.controller.abort(new Error(TIMED_OUT));
+            this.#timeoutAttempt(attempt);
           }, timeoutMs);
 
     if (batchSignal?.aborted === true) abortFromBatch();
@@ -575,6 +574,20 @@ export class SwarmScheduler {
       if (timeout !== undefined) this.#deps.clearTimeout(timeout);
       batchSignal?.removeEventListener("abort", abortFromBatch);
     };
+  }
+
+  /**
+   * 超时是调度终态，不只是取消通知：立即落 failed、释放并发名额并继续整批。
+   * 底层 executor 可以忽略 abort；它之后的成功、失败或限流结果都会因 attempt 已离开
+   * #active 而在 #releaseAttempt 处被丢弃，不能改写这里的超时终态。
+   */
+  #timeoutAttempt(attempt: Attempt): void {
+    if (this.#finished || !this.#active.has(attempt)) return;
+    attempt.timedOut = true;
+    attempt.controller.abort(new Error(TIMED_OUT));
+    this.#results[attempt.state.index] = this.#failedResult(attempt.state, TIMED_OUT);
+    this.#releaseAttempt(attempt);
+    this.#schedule();
   }
 
   #markAttemptReady(attempt: Attempt): void {

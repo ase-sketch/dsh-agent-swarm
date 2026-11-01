@@ -3,7 +3,9 @@ import { hasLoneSurrogate } from "./helpers/surrogates.js";
 
 import {
   SWARM_ERROR_CODES,
+  SWARM_MAX_PROMPT_CHARS,
   SWARM_MAX_SUBAGENTS,
+  SWARM_MAX_TOTAL_PROMPT_CHARS,
   SWARM_MIN_ITEMS,
   SWARM_PROMPT_PLACEHOLDER,
   type SwarmRequestInput,
@@ -312,7 +314,7 @@ describe("校验 6：展开后 prompt 互不相同", () => {
   it("超长 item/prompt 只把截断片段放进 details，全量长度另行给出", () => {
     // 截断点落在 x 段内部（后半段是 y），这样"只取开头"这件事是被逼出来的，而不是碰巧成立
     const head = "x".repeat(DUPLICATE_SNIPPET_MAX_CHARS);
-    const longItem = `${head}${"y".repeat(99_880)}`; // 总长 100_000
+    const longItem = `${head}${"y".repeat(49_880)}`; // 总长 50_000，低于单 prompt 上限
     const r = validateSwarmInput(input({ items: [longItem, longItem] }));
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -326,9 +328,9 @@ describe("校验 6：展开后 prompt 互不相同", () => {
       expect(details.itemSnippet).toBe(`${head}…`);
       expect(details.promptSnippet).toBe(`work on ${head.slice("work on ".length)}…`);
       // 被截掉多少是可解释的：全量长度照旧带出去
-      expect(details.itemChars).toBe(100_000);
-      expect(details.promptChars).toBe(100_000 + "work on ".length);
-      // 整个 details 仍然很小：1e5 字符的原文一个字都不进 details
+      expect(details.itemChars).toBe(50_000);
+      expect(details.promptChars).toBe(50_000 + "work on ".length);
+      // 整个 details 仍然很小：长原文一个字都不进 details
       expect(JSON.stringify(details).length).toBeLessThan(500);
       expect(JSON.stringify(r.error)).not.toContain(longItem);
     }
@@ -353,16 +355,16 @@ describe("校验 6：展开后 prompt 互不相同", () => {
   });
 
   it("huge 模板场景：片段策略按码元截断，不依赖模板长度", () => {
-    const item = "z".repeat(50_000);
+    const item = "z".repeat(30_000);
     const r = validateSwarmInput({
       items: [item, item],
-      promptTemplate: `${"P".repeat(50_000)}{{item}}`,
+      promptTemplate: `${"P".repeat(30_000)}{{item}}`,
     });
     expect(r.ok).toBe(false);
     if (!r.ok) {
       const details = r.error.details as { promptSnippet: string; promptChars: number };
       expect(details.promptSnippet).toBe(`${"P".repeat(DUPLICATE_SNIPPET_MAX_CHARS)}…`);
-      expect(details.promptChars).toBe(50_000 + item.length);
+      expect(details.promptChars).toBe(30_000 + item.length);
     }
   });
 
@@ -385,6 +387,37 @@ describe("校验 6：展开后 prompt 互不相同", () => {
     const r = validateSwarmInput(input({ items: ["a", "b", "c", "a"] }));
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.details).toMatchObject({ previousIndex: 1, index: 4 });
+  });
+});
+
+describe("展开尺寸上限", () => {
+  it("单成员 prompt 超过上限时在任何派发前拒绝", () => {
+    const item = "x".repeat(8_192);
+    const r = validateSwarmInput({ promptTemplate: "{{item}}".repeat(512), items: [item, `${item}y`] });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe(SWARM_ERROR_CODES.PROMPT_TOO_LARGE);
+      expect(r.error.details).toMatchObject({ index: 1, maxPromptChars: SWARM_MAX_PROMPT_CHARS });
+    }
+  });
+
+  it("单条都合法但全批合计超限时同样拒绝", () => {
+    const itemCount = 32;
+    const perPrompt = Math.floor(SWARM_MAX_TOTAL_PROMPT_CHARS / itemCount) + 1;
+    expect(perPrompt).toBeLessThanOrEqual(SWARM_MAX_PROMPT_CHARS);
+    const items = Array.from({ length: itemCount }, (_, i) => `${String(i)}:${"x".repeat(perPrompt - 3)}`);
+    const r = validateSwarmInput({ promptTemplate: "{{item}}", items });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe(SWARM_ERROR_CODES.PROMPTS_TOTAL_TOO_LARGE);
+  });
+
+  it("边界值：单条与全批都不超限时接受", () => {
+    const item = "x".repeat(SWARM_MAX_PROMPT_CHARS);
+    const r = validateSwarmInput({ promptTemplate: "{{item}}", items: [item, `${item}y`] });
+    // 第二条多一个字符，应明确报单条超限；再把第二条缩回边界则两条都合法。
+    expect(r.ok).toBe(false);
+    const valid = validateSwarmInput({ promptTemplate: "{{item}}", items: [item, `y${item.slice(1)}`] });
+    expect(valid.ok).toBe(true);
   });
 });
 

@@ -69,6 +69,10 @@ export const SWARM_ERROR_CODES = {
   PROMPT_TEMPLATE_PLACEHOLDER_MISSING: "PROMPT_TEMPLATE_PLACEHOLDER_MISSING",
   /** 两个 item 展开出完全相同的 prompt。 */
   DUPLICATE_PROMPTS: "DUPLICATE_PROMPTS",
+  /** 单个展开后的 prompt 超过 SWARM_MAX_PROMPT_CHARS。 */
+  PROMPT_TOO_LARGE: "PROMPT_TOO_LARGE",
+  /** 全批展开后的 prompt 合计超过 SWARM_MAX_TOTAL_PROMPT_CHARS。 */
+  PROMPTS_TOTAL_TOO_LARGE: "PROMPTS_TOTAL_TOO_LARGE",
   /**
    * 给了 per-call `model`，但宿主的子代理模型选择不可用：
    * 设置服务未挂载、或已挂载但 enabled=false。
@@ -144,6 +148,10 @@ export const SWARM_MAX_SUBAGENTS = 128;
 export const SWARM_MIN_ITEMS = 2;
 /** 模板占位符字面量。 */
 export const SWARM_PROMPT_PLACEHOLDER = "{{item}}";
+/** 单个展开后 prompt 的最大 UTF-16 码元数。 */
+export const SWARM_MAX_PROMPT_CHARS = 65_536;
+/** 全批展开后 prompt 合计的最大 UTF-16 码元数。 */
+export const SWARM_MAX_TOTAL_PROMPT_CHARS = 1_048_576;
 
 // ───────────────────────── 调度器 ─────────────────────────
 

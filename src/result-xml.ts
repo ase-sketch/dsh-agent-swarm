@@ -16,8 +16,15 @@
  */
 
 import { SWARM_MAX_SUBAGENTS, type SwarmTaskResult } from "./types.js";
+import { clipText } from "./text-clip.js";
 
 export const SWARM_RESULT_TAG = "agent_swarm_result";
+/** 完整汇总 XML 的最大 UTF-16 码元数；截断必须保留合法 XML 与逐项终态。 */
+export const SWARM_RESULT_MAX_CHARS = 262_144;
+/** 结果属性里的 item 摘要上限；完整 item 已在成员 prompt 中派发。 */
+export const SWARM_RESULT_ITEM_MAX_CHARS = 1_024;
+/** 给 summary 的截断说明预留空间，避免正文算满后头部又超限。 */
+const SWARM_RESULT_SUMMARY_RESERVE_CHARS = 128;
 
 /**
  * 剥离 XML 1.0 非法字符。
@@ -213,14 +220,22 @@ function findIndexAlignmentMismatch(results: readonly SwarmTaskResult[]): string
 /**
  * 渲染单个 `<subagent>` 元素。
  *
- * 属性顺序固定：agent_id → item → state → outcome → stop_reason。
+ * 属性顺序固定：agent_id → item → state → outcome → stop_reason → truncated。
  * agent_id 排在最前与上游标准输出一致（`<subagent agent_id="xxx" item="…" state="…" …>`）；
  * 二期若加入 resume 型成员，届时还需在最前面补 `mode` 属性（本期 kind 只有 spawn）。
  *
  * agent_id / state / stop_reason 都是可选属性：undefined 时**整体省略**，不输出空属性。
  * agent_id 是二期 resume_agent_ids 的唯一取值来源，因此它同样走属性转义这一条路径。
  */
-export function renderSubagentElement(result: SwarmTaskResult): string {
+export interface RenderSubagentElementOptions {
+  /** 正文或 item 因总输出上限被截断；显式标记，不把摘要冒充完整结果。 */
+  truncated?: boolean;
+}
+
+export function renderSubagentElement(
+  result: SwarmTaskResult,
+  options: RenderSubagentElementOptions = {},
+): string {
   const attrs: string[] = [];
   if (result.agentId !== undefined) {
     attrs.push(`agent_id="${escapeXmlAttribute(result.agentId)}"`);
@@ -231,8 +246,75 @@ export function renderSubagentElement(result: SwarmTaskResult): string {
   if (result.stopReason !== undefined) {
     attrs.push(`stop_reason="${escapeXmlAttribute(result.stopReason)}"`);
   }
+  if (options.truncated === true) attrs.push(`truncated="true"`);
   const body = escapeXmlText(bodyOf(result));
   return `<subagent ${attrs.join(" ")}>${body}</subagent>`;
+}
+
+interface BoundedSubagentElement {
+  xml: string;
+  truncated: boolean;
+}
+
+/**
+ * 在序列化后的预算内渲染一个成员。正文与 item 都按实际 XML 转义后的长度二分收缩，
+ * 因此 `a < b` 这类会膨胀的文本也不能绕过总上限；省略号与 truncated 属性同时留痕。
+ */
+function renderBoundedSubagentElement(result: SwarmTaskResult, maxChars: number): BoundedSubagentElement {
+  const originalBody = bodyOf(result);
+  const render = (item: string, body: string, truncated: boolean): string =>
+    renderSubagentElement(
+      {
+        ...result,
+        spec: { ...result.spec, item },
+        ...(result.outcome === "completed" ? { result: body } : { error: body }),
+      },
+      { truncated },
+    );
+
+  let item = clipText(result.spec.item, SWARM_RESULT_ITEM_MAX_CHARS);
+  let truncated = item !== result.spec.item;
+  // 原始文本已经明显超预算时不构造完整 XML，避免为了判断超限再分配一份超大字符串。
+  if (originalBody.length + item.length <= maxChars) {
+    const full = render(item, originalBody, truncated);
+    if (full.length <= maxChars) return { xml: full, truncated };
+  }
+
+  // 极端情况下 item 属性本身就超过本成员预算；先收缩 item，再给正文留空间。
+  if (render(item, "", true).length > maxChars) {
+    let low = 0;
+    let high = Math.min(result.spec.item.length, maxChars);
+    let bestItem: string | undefined;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidateItem = clipText(result.spec.item, mid);
+      if (render(candidateItem, "", true).length <= maxChars) {
+        bestItem = candidateItem;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    if (bestItem === undefined) throw new Error("Swarm member attributes exceed their result budget.");
+    item = bestItem;
+  }
+
+  let low = 0;
+  let high = Math.min(originalBody.length, maxChars);
+  let best: string | undefined;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = render(item, clipText(originalBody, mid), true);
+    if (candidate.length <= maxChars) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (best === undefined) throw new Error("Swarm member cannot fit its result budget.");
+  truncated = true;
+  return { xml: best, truncated };
 }
 
 export interface RenderSwarmResultOptions {
@@ -276,16 +358,37 @@ export function renderSwarmResult(
     : [...results];
   // 错位时把说明并进 summary：summary 是读取方必读的汇总行，放这里保证"降级了"这件事
   // 一定被看到，而不是只写在某条成员正文里被淹没（不静默吞错）。
-  const summary = mismatch === undefined
+  const baseSummary = mismatch === undefined
     ? renderSwarmSummary(members)
     : renderSwarmSummary(members) + "; render degraded: " + mismatch;
+  const prefix = `<${SWARM_RESULT_TAG}>\n<summary>${escapeXmlText(baseSummary)}</summary>`;
+  const suffix = `</${SWARM_RESULT_TAG}>`;
+  // 空成员占位只为精确计算标签之间的换行开销；实际正文按剩余预算公平分配，
+  // 短成员用不完的预算会自然留给后续成员，且不会饿死队尾。
+  const fixedChars = [prefix, ...new Array<string>(members.length).fill(""), suffix].join("\n").length;
+  let remaining = SWARM_RESULT_MAX_CHARS - fixedChars - SWARM_RESULT_SUMMARY_RESERVE_CHARS;
+  const renderedMembers: string[] = [];
+  let truncatedCount = 0;
+  for (let i = 0; i < members.length; i += 1) {
+    const budget = Math.floor(remaining / (members.length - i));
+    const rendered = renderBoundedSubagentElement(members[i] as SwarmTaskResult, budget);
+    remaining -= rendered.xml.length;
+    if (rendered.truncated) truncatedCount += 1;
+    renderedMembers.push(rendered.xml);
+  }
+  const truncationNote = truncatedCount === 0
+    ? ""
+    : `output truncated for ${String(truncatedCount)} member(s) to fit ${String(SWARM_RESULT_MAX_CHARS)} characters`;
+  const summary = [baseSummary, truncationNote].filter((part) => part !== "").join("; ");
   const lines = [
     `<${SWARM_RESULT_TAG}>`,
     `<summary>${escapeXmlText(summary)}</summary>`,
-    ...members.map((result) => renderSubagentElement(result)),
+    ...renderedMembers,
     `</${SWARM_RESULT_TAG}>`,
   ];
-  return lines.join("\n");
+  const xml = lines.join("\n");
+  if (xml.length > SWARM_RESULT_MAX_CHARS) throw new Error("Swarm result exceeded its serialized size limit.");
+  return xml;
 }
 
 /**

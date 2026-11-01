@@ -4,7 +4,7 @@
  * 只做装配：声明插件元信息（name / inject / Config），在 apply 里注册 `agent_swarm` 工具。
  * 一次工具调用的完整链路是三段，各自一个模块：
  *
- *   batch-plan.ts   规划：六道硬校验 + 宿主策略上限 + 模型路由 + 父 agent/会话 → 批次计划
+ *   batch-plan.ts   规划：八道硬校验 + 宿主策略上限 + 模型路由 + 父 agent/会话 → 批次计划
  *                   （**所有整体拒绝都发生在这里**，在任何子代理启动、任何批次登记之前）
  *   batch-run.ts    执行：开批次 → 调度器（scheduler.ts）→ 逐成员 ctx.subagents.startActivation → 收批次
  *   result-xml.ts   渲染：renderSwarmResultSafely → <agent_swarm_result>（成员状态的唯一权威）

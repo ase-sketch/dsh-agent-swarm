@@ -8,7 +8,13 @@
  * clean-room：本文件全部文案为本仓自拟英文，未复制任何上游原文。
  */
 
-import { SWARM_MAX_SUBAGENTS, SWARM_MIN_ITEMS } from "./types.js";
+import {
+  SWARM_MAX_PROMPT_CHARS,
+  SWARM_MAX_SUBAGENTS,
+  SWARM_MAX_TOTAL_PROMPT_CHARS,
+  SWARM_MIN_ITEMS,
+} from "./types.js";
+import { SWARM_RESULT_MAX_CHARS } from "./result-xml.js";
 
 /** 模型可调用的工具名。 */
 export const SWARM_TOOL_NAME = "agent_swarm";
@@ -37,7 +43,7 @@ export function effectiveMaxForkItems(configuredMaxItems: number, configuredMaxF
 
 /**
  * 工具描述：英文、面向模型、全部自拟（clean-room，未复制任何上游原文）。
- * 覆盖四块：用途 / 六道硬校验（与 validate.ts 一一对应）/ 与单个 subagent 工具的分工 / 禁止嵌套。
+ * 覆盖四块：用途 / 八道硬校验（与 validate.ts 一一对应）/ 与单个 subagent 工具的分工 / 禁止嵌套。
  *
  * 文案里的**上界一律取生效上限**，不是协议常量 128。
  * 理由：模型是照着这段说明去规划批量的——若宿主把 config.maxItems 调到 10，
@@ -63,6 +69,8 @@ export function buildToolDescription(effectiveMax: number, effectiveForkMax: num
     "4. prompt_template must contain the {{item}} placeholder, which is replaced once per item.",
     "5. every item must expand to a distinct prompt; items that expand to the same prompt are rejected.",
     "6. every item must be a string with at least one non-whitespace character.",
+    `7. each expanded prompt must contain at most ${String(SWARM_MAX_PROMPT_CHARS)} characters.`,
+    `8. expanded prompts must contain at most ${String(SWARM_MAX_TOTAL_PROMPT_CHARS)} characters in total across the batch.`,
     "",
     `Item-count limit: the protocol hard limit is ${String(SWARM_MAX_SUBAGENTS)} entries and cannot be raised; the host can only lower it, and the effective limit on this deployment is ${String(effectiveMax)}. Plan and split your batch against the number stated in requirement 2 above — submitting more than the effective limit is rejected.`,
     "",
@@ -71,7 +79,7 @@ export function buildToolDescription(effectiveMax: number, effectiveForkMax: num
     "- Use a single-subagent tool when the work is one cohesive task, or when a later step depends on an earlier step's result — swarm members cannot see each other or your intermediate work.",
     "- Do not call this tool from inside a swarm member's subtask. Nesting a swarm within a swarm member is not supported: members run under the host's subagent depth limit (1 by default), and a call that would exceed it is rejected before any subagent starts. Call it from your own turn instead.",
     "",
-    "Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next.",
+    `Individual members may fail; that is reported per member in the result rather than failing the whole call. Read the per-member outcomes to decide what to do next. The aggregated XML is capped at ${String(SWARM_RESULT_MAX_CHARS)} characters; oversized member text is marked with truncated="true" and counted in the summary.`,
     "",
     "Optional model routing: pass model as \"provider/model\" (or a bare model id that is unique in this deployment's allowed subagent models) to run the whole batch on that route. The route must appear in the deployment's subagent model allowlist — discover candidates with list_subagent_models when that tool is available. Omit model to inherit the calling agent's route (or the plugin's configured fixed route). A rejected model fails the call before any subagent starts.",
     "",

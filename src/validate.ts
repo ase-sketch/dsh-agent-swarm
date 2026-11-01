@@ -5,7 +5,7 @@
  * clean-room 重写：只依据机制文档描述的行为，未复制上游源码；本文件每条错误文案
  * 都是本仓独立拟写的（与上游文案无逐字等同、无长串连续同词）。
  *
- * 六条硬校验（一期，无 resume 运行时分支）：
+ * 八条硬校验（一期，无 resume 运行时分支）：
  *   0. **入参自身**必须是非 null 的非数组对象（INVALID_INPUT）——
  *      排在最前是因为它是其余六条的前提；入参不是对象时读 .items 就会抛 TypeError，
  *      而本文件的立意恰恰是"绝不让校验函数抛异常"（2026-10-01 审查实证该防护曾形同虚设）。
@@ -15,11 +15,15 @@
  *   4. 提供了 items 就必须提供 prompt_template
  *   5. prompt_template 必须含 `{{item}}` 占位符
  *   6. 展开后的 prompt 必须互不相同
+ *   7. 单个展开后的 prompt 不得超过 SWARM_MAX_PROMPT_CHARS
+ *   8. 全批展开后的 prompt 合计不得超过 SWARM_MAX_TOTAL_PROMPT_CHARS
  */
 
 import {
   SWARM_ERROR_CODES,
+  SWARM_MAX_PROMPT_CHARS,
   SWARM_MAX_SUBAGENTS,
+  SWARM_MAX_TOTAL_PROMPT_CHARS,
   SWARM_MIN_ITEMS,
   SWARM_PROMPT_PLACEHOLDER,
   type SwarmContextMode,
@@ -201,9 +205,28 @@ export function validateSwarmInput(input: SwarmRequestInput): SwarmValidationRes
   const template = promptTemplate;
   const seenPrompts = new Map<string, number>();
   const specs: SwarmTaskSpec[] = [];
+  const placeholderCount = template.split(SWARM_PROMPT_PLACEHOLDER).length - 1;
+  let totalPromptChars = 0;
 
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i] as string;
+    // 先算展开尺寸再分配字符串，避免超大模板在校验拒绝前先复制出数 MiB prompt。
+    const promptChars = template.length + placeholderCount * (item.length - SWARM_PROMPT_PLACEHOLDER.length);
+    if (promptChars > SWARM_MAX_PROMPT_CHARS) {
+      return fail(
+        SWARM_ERROR_CODES.PROMPT_TOO_LARGE,
+        `Expanded prompt for item ${String(i + 1)} has ${String(promptChars)} characters; the per-member limit is ${String(SWARM_MAX_PROMPT_CHARS)}.`,
+        { index: i + 1, promptChars, maxPromptChars: SWARM_MAX_PROMPT_CHARS },
+      );
+    }
+    totalPromptChars += promptChars;
+    if (totalPromptChars > SWARM_MAX_TOTAL_PROMPT_CHARS) {
+      return fail(
+        SWARM_ERROR_CODES.PROMPTS_TOTAL_TOO_LARGE,
+        `Expanded prompts total ${String(totalPromptChars)} characters at item ${String(i + 1)}; the batch limit is ${String(SWARM_MAX_TOTAL_PROMPT_CHARS)}.`,
+        { index: i + 1, totalPromptChars, maxTotalPromptChars: SWARM_MAX_TOTAL_PROMPT_CHARS },
+      );
+    }
     const prompt = expandPromptTemplate(template, item);
     const previousIndex = seenPrompts.get(prompt);
     if (previousIndex !== undefined) {

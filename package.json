@@ -3,7 +3,7 @@
   "version": "0.4.2",
   "private": true,
   "type": "module",
-  "description": "DSH bundle: batch subagent swarm tool with adaptive rate-limit scheduling (clean-room)",
+  "description": "DSH bundle: bounded batch subagent swarm with progressive scheduling (clean-room)",
   "license": "MIT",
   "engines": {
     "node": ">=22"
@@ -14,7 +14,7 @@
     "test": "pnpm run build && vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && node scripts/build-client.mjs",
-    "prepublishOnly": "pnpm run build"
+    "prepare": "pnpm run build"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.5",

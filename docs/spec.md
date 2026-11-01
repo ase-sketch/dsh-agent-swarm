@@ -8,17 +8,17 @@
 - 【硬约束】**公开分发** → clean-room：实现只依据 `01-机制文档/`（行为描述）与 `03-v1源码/`、`04-协议层/v1-*`（MIT，可参考须带 THIRD-PARTY-NOTICES）。`02-v2源码/` 对实现者**封存**；提示词原文（05-提示词全文.md）同样不可照抄，工具描述须重写。
 - 【硬约束】不复刻 Kimi UI。官方智能体团队面板**对 one-shot 子代理不可见**（spike Q10 证据：agent-team 过滤带 subagent/descriptor 的会话）→ 可视化走**自研 client 面板**（M4，host/client 双半，自有事件桥，不依赖 agentTeam 投影）。
 - 【硬约束】DSH 0.2 developer preview，API 可能变；插件声明兼容版本范围。
-- 【偏好】调度参数（首波并发 5、放量 700ms、退避 3000ms×2ⁿ、超时 2h）做成插件 config，默认值照 Kimi 实测。
+- 【偏好】调度参数（硬并发上限、首波并发 5、放量 700ms、退避 3000ms×2ⁿ、超时 2h）做成插件 config；默认硬并发上限 8 是本仓为保护宿主与供应商额外设置的边界。
 
 ## 功能清单（终态 = 完整功能除 UI，分期交付）
 
 一期（本次）：
 1. `agent_swarm` 工具：`description` + `prompt_template`（含 `{{item}}`）+ `items[]` 展开为 N 个子代理任务
-2. 六道硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同；item 元素必须是非空字符串（第六道，2026-10-01 审查后补）
-3. 并发调度器：首波 5 并发、之后每 700ms 放 1 个、限流指数退避（3000ms×2ⁿ）、容量收缩防抖 2000ms、每 180s 恢复 +1（下限 1）、最后任务持续限流判 failed（死锁防护）；~~首个请求未发出的限流重罚~~（2026-10-01 废弃删除：宿主无法观测「首个请求未发出」，该档位在生产接线下永不可达，见限流能力状态笔记）
+2. 八道硬校验：items≥2、总数≤128、有 items 必有 template、template 必含占位符、展开后 prompt 互不相同、item 元素必须是非空字符串；单成员展开 prompt≤65,536 字符、全批合计≤1,048,576 字符（后两道为 2026-11-01 边界收紧）
+3. 并发调度器：硬并发上限默认 8（`maxConcurrency` 可配）、首波 5 并发、之后每 700ms 放 1 个、限流指数退避（3000ms×2ⁿ）、容量收缩防抖 2000ms、每 180s 恢复 +1（下限 1）、最后任务持续限流判 failed（死锁防护）；~~首个请求未发出的限流重罚~~（2026-10-01 废弃删除：宿主无法观测「首个请求未发出」，该档位在生产接线下永不可达，见限流能力状态笔记）
    —— **交付态修正（2026-10-01）**：本条前半（首波/放量/超时/中断/结果落位）已交付；**限流相关的后半（退避、容量收缩恢复、死锁防护）在交付态默认关闭**（接线已就绪，开启前置条件见下「交付状态」）。
-4. 每任务超时（默认 2h 可配；start() 无 timeout 字段，由**调度器的超时闸门**到点 abort 成员信号——该信号同时级联用户中断，取消与超时文案单一来源；2026-10-01 第三轮去掉了重复的 `AbortSignal.timeout`）+ 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
-5. 结果汇总：`<agent_swarm_result>` XML，**body 转义**、编号一致（规避 Kimi 已核实缺陷 D13/D14）
+4. 每任务超时（默认 2h 可配；start() 无 timeout 字段）：调度器到点立即落 `failed / Subagent timed out.`、释放并发名额并 abort 成员信号，不等待执行器响应取消；晚到成功、失败或限流结果均不能覆盖超时终态 + 用户中断级联取消；每个 `start()` 成功必须配对 `run.dispose()`
+5. 结果汇总：`<agent_swarm_result>` XML，**body 转义**、编号一致（规避 Kimi 已核实缺陷 D13/D14）；完整 XML 上限 262,144 字符，超大成员内容以 `truncated="true"` 和 summary 计数显式标记，保留全部成员终态
 6. 插件 config：并发/节奏/超时参数；**自动批准无需声明**（spike Q8：无 approvalRule 机制，不调 ctx.approval 即不弹窗）；子代理沙箱档位经 `parent: exec.agent` 自动继承
 7. 测试三层：纯函数单测 + mock Context 契约测试 + 真实 Loader 加载测试
 
@@ -63,7 +63,7 @@
   子代理一律抛 `NOT_RESUMABLE`（`@deepseek-ai/dsh-subagent` 续跑路径的 `descriptor.mode !== "continuable"` 判定）。
   真正的前置条件与三条候选路线见 `.agents/notes/proposed/feature/2026-10-01-resume-agent-ids.md`。
 - **测试链改为先构建**：`pnpm test` 现在前置 `pnpm run build`，client 侧测试在内存里打包，host 侧 Loader 测试加载 `dist/index.js`
-  （此前各测各的：client 测盘上旧产物、host 测源码命名空间、`dist/index.js` 无人验证）。
+  （此前各测各的：client 测盘上旧产物、host 测源码命名空间、`dist/index.js` 无人验证）。`prepare` 同时负责 Git 安装与 `npm pack` 前自动构建，避免分发包只有源码清单却没有运行入口。
 - **clean-room 文案修正**：三条与上游逐字相同的文案/常量已改写为本仓自拟（见 `THIRD-PARTY-NOTICES.md`）。
 
 ## 非目标
@@ -74,7 +74,7 @@
 
 ## 验收
 
-- M1：`pnpm test` 全绿（六道校验分支、模板展开、XML 转义往返、调度节奏 fake-timers）
+- M1：`pnpm test` 全绿（八道校验分支、模板展开、XML 转义与尺寸上限、调度节奏及超时终态 fake-timers）
 - M2：契约测试 + 真实 Loader 测试全绿；`dsh --profile web --dump-config` 可见插件
 - M3：用户重启 DSH 后真实会话调 `agent_swarm` 跑 3 个小任务：批量执行、XML 结果汇总正确（成员状态以 XML 为准）
 - M3 顺带实机验证 spike 风险项：R1 限流事件 `llm/retry` 的 failure.code 取值、R3 并发活跃度、R4 沙箱继承、R5 子代理审批行为

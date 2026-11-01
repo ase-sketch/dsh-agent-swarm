@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  SWARM_RESULT_MAX_CHARS,
   SWARM_RESULT_TAG,
   escapeXmlAttribute,
   escapeXmlText,
@@ -41,6 +42,34 @@ function parseResult(xml: string): { summary: string; members: { attrs: Record<s
   }
   return { summary, members };
 }
+
+describe("总输出尺寸上限", () => {
+  it("128 个大结果仍保留全部成员与终态，XML 不越界且明确标记截断", () => {
+    const results = Array.from({ length: 128 }, (_, i) =>
+      res(i + 1, `item-${String(i + 1)}`, { result: "r".repeat(8_192) }),
+    );
+    const xml = renderSwarmResult(results);
+    const parsed = parseResult(xml);
+    expect(xml.length).toBeLessThanOrEqual(SWARM_RESULT_MAX_CHARS);
+    expect(parsed.members).toHaveLength(128);
+    expect(parsed.members.every((member) => member.attrs["outcome"] === "completed")).toBe(true);
+    expect(parsed.members.some((member) => member.attrs["truncated"] === "true")).toBe(true);
+    expect(parsed.summary).toContain("completed: 128");
+    expect(parsed.summary).toContain("output truncated for");
+  });
+
+  it("XML 转义膨胀与超长 item 也不能绕过上限", () => {
+    const xml = renderSwarmResult([
+      res(1, "&".repeat(20_000), { result: "<&".repeat(20_000) }),
+      res(2, "plain", { result: "ok" }),
+    ]);
+    const parsed = parseResult(xml);
+    expect(xml.length).toBeLessThanOrEqual(SWARM_RESULT_MAX_CHARS);
+    expect(parsed.members).toHaveLength(2);
+    expect(parsed.members[0]?.attrs["truncated"]).toBe("true");
+    expect(parsed.members[1]?.body).toBe("ok");
+  });
+});
 
 describe("转义", () => {
   it("escapeXmlAttribute 覆盖四字符且 & 最先", () => {

@@ -3,7 +3,7 @@
  *
  * 两层：
  *   A. mock Context 契约测试：捕获 ctx.tools.register 的入参、stub ctx.subagents.startActivation，
- *      断言 inject 键、defineTool 形态、六道校验的结构化失败、start/dispose 配对、
+ *      断言 inject 键、defineTool 形态、八道校验的结构化失败、start/dispose 配对、
  *      signal 级联、失败聚合与 XML 如实呈现。
  *   B. 真实 Loader 加载测试：用 @deepseek-ai/cordis + cordis-plugin-loader 走真实
  *      插件加载路径，断言插件确实被激活（apply 被调用、工具注册成功、卸载即注销）。
@@ -24,6 +24,7 @@ import {
 } from "../src/types.js";
 import type { SwarmBatch, SwarmPhase, SwarmRegistry } from "../src/swarm-registry.js";
 import { RateLimitWatchRouter } from "../src/rate-limit-signal.js";
+import { toSchedulerConfig } from "../src/config.js";
 import { hasLoneSurrogate } from "./helpers/surrogates.js";
 
 // ───────────────────────── mock Context ─────────────────────────
@@ -180,6 +181,7 @@ function defaultConfig(): Parameters<typeof plugin.apply>[1] {
   return {
     provider: "spawn",
     firstWave: 5,
+    maxConcurrency: 8,
     releaseIntervalMs: 700,
     backoffInitialMs: 3000,
     retryFactor: 2,
@@ -256,6 +258,7 @@ describe("A. 插件声明形态", () => {
     expect(resolved).toMatchObject({
       provider: "spawn",
       firstWave: 5,
+      maxConcurrency: 8,
       releaseIntervalMs: 700,
       backoffInitialMs: 3000,
       retryFactor: 2,
@@ -269,6 +272,15 @@ describe("A. 插件声明形态", () => {
     // undefined = 不超时，把它一起默认成 2h 属于行为变更，这里钉死这条边界。
     expect("timeoutMs" in DEFAULT_SWARM_SCHEDULER_CONFIG).toBe(false);
     expect(DEFAULT_SWARM_SCHEDULER_CONFIG.timeoutMs).toBeUndefined();
+  });
+
+  it("maxConcurrency 默认 8、限制在 1..128，并原样透传给调度器", () => {
+    const resolve = plugin.Config as (v?: unknown) => Record<string, unknown>;
+    expect(resolve().maxConcurrency).toBe(8);
+    expect(resolve({ maxConcurrency: 8 }).maxConcurrency).toBe(8);
+    expect(() => resolve({ maxConcurrency: 0 })).toThrow(/maxConcurrency/);
+    expect(() => resolve({ maxConcurrency: 129 })).toThrow(/maxConcurrency/);
+    expect(toSchedulerConfig({ ...defaultConfig(), maxConcurrency: 8 }).maxConcurrency).toBe(8);
   });
 
   it("Config 在加载期拒绝调度器必拒的值（firstWave/retryFactor < 1），并接受小数因子", () => {
