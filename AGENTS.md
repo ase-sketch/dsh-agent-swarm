@@ -15,5 +15,5 @@ pnpm run build      # 编译到 dist/（发布/安装必须，见下）
 - 参考了 v1 MIT 代码的模块，在文件头注释标注来源并在 THIRD-PARTY-NOTICES.md 登记。
 - 插件只用命名导出（`export const name/inject` + `export function apply`），**绝不写 `export default`**。
 - 所有 `ctx` 副作用（监听器、定时器、注册）必须可逆，卸载时清理。
-- 不要在 `disabled`/`isolate`/`intercept` 元数据上写 `!!js` 表达式（Cordis 只对 config 插值）。
+- 配置表达式只用于当前支持求值的 `config` 与 `disabled`；不要在 `isolate`/`intercept` 等字面值元数据上写 `!!js`。
 - **入口必须指向构建产物**：Node 拒绝对 node_modules 下的 .ts 做类型剥离（实测报错 "Stripping types is currently unsupported for files under node_modules"），所以 main 必须是 dist/index.js；改完代码要重新 pnpm run build + npm pack 再装。

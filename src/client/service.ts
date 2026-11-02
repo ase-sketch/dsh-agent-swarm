@@ -109,10 +109,15 @@ export class ClientSwarmService {
     const stop = (): void => {
       if (stopped) return;
       stopped = true;
+      const reportDisposeFailure = (error: unknown): void => {
+        console.warn(`[agent-swarm] failed to dispose roster stream for session ${sessionId}`, error);
+      };
       try {
-        stream.dispose();
-      } catch {
-        // ignore
+        // dispose 可以同时返回 void 或 Promise：同步异常与异步拒绝都必须带上下文留痕，
+        // 不能静默吞掉，也不能让 Promise rejection 逃出卸载路径。
+        void Promise.resolve(stream.dispose()).catch(reportDisposeFailure);
+      } catch (error) {
+        reportDisposeFailure(error);
       }
     };
     const entry: StreamEntry = { count: 1, stop };

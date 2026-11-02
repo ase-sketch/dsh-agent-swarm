@@ -143,7 +143,7 @@ export const TOOL_OUTPUT = {
   schema: {
     type: "object",
     additionalProperties: false,
-    properties: { xml: { type: "string" } },
+    properties: { xml: { type: "string", required: true } },
   },
   render: (_args: unknown, value: { xml: string }): ContentBlock[] => [{ type: "text", text: value.xml }],
 } as const;

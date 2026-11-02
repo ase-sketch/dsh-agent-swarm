@@ -354,11 +354,11 @@ describe("B. defineTool 注册形态", () => {
     expect(parameters.properties.items).toMatchObject({ type: "array" });
   });
 
-  it("工具描述是英文自拟文本，覆盖用途/六道校验/分工/禁止嵌套", () => {
+  it("工具描述是英文自拟文本，覆盖用途/八道校验/分工/禁止嵌套", () => {
     const { definition } = createHarness();
     const description = definition.description;
     expect(description).toMatch(/subagents/i);
-    // 六道硬校验
+    // 八道硬校验
     expect(description).toMatch(/at least \d+ entries/);
     expect(description).toMatch(/at most \d+ entries/);
     expect(description).toMatch(/prompt_template/);
@@ -394,11 +394,12 @@ describe("B. defineTool 注册形态", () => {
   it("output.schema 是 {xml:string}，render 两参并返回内容块数组", () => {
     const { definition } = createHarness();
     const output = definition.output as {
-      schema: { type: string; properties: Record<string, unknown> };
+      schema: { type: string; properties: Record<string, unknown>; required?: string[] };
       render: (args: unknown, value: unknown) => unknown[];
     };
     expect(output.schema.type).toBe("object");
     expect(output.schema.properties.xml).toMatchObject({ type: "string" });
+    expect(output.schema.required).toEqual(["xml"]);
     expect(output.render.length).toBe(2);
     expect(output.render({}, { xml: "<x/>" })).toEqual([{ type: "text", text: "<x/>" }]);
   });
@@ -427,7 +428,7 @@ describe("B. defineTool 注册形态", () => {
 
 // ───────────────────────── C. 校验失败的结构化错误 ─────────────────────────
 
-describe("C. 六道硬校验在启动任何子代理之前完成", () => {
+describe("C. 八道硬校验在启动任何子代理之前完成", () => {
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ["items 少于 2", { items: ["only-one"] }, "ITEMS_TOO_FEW"],
     ["items 超过 128", { items: Array.from({ length: 129 }, (_, i) => `item-${String(i)}`) }, "TOO_MANY_SUBAGENTS"],

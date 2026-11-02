@@ -362,6 +362,52 @@ describe("ClientSwarmService 流异常可见性与重建", () => {
     }
   });
 
+  it("主动取消时 dispose 的同步异常与异步拒绝都会留痕", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const mode of ["sync", "async"] as const) {
+        const model = new ClientSwarmModel();
+        const sessionId = `sess-dispose-${mode}`;
+        const release: Array<() => void> = [];
+        const failure = new Error(`${mode} dispose failed`);
+        const dispose = vi.fn(() => {
+          release.forEach((resolve) => resolve());
+          if (mode === "sync") throw failure;
+          return Promise.reject(failure);
+        });
+        const mockRemote = {
+          $stream: vi.fn(() => ({
+            async *[Symbol.asyncIterator]() {
+              yield { value: rosterFrame(sessionId), accept: vi.fn() };
+              await new Promise<void>((resolve) => {
+                release.push(resolve);
+              });
+            },
+            dispose,
+          })),
+          swarm: { roster: vi.fn() },
+        };
+        const service = new ClientSwarmService(mockRemote as any, model);
+        const unsub = service.watchSwarm(sessionId);
+        await flush();
+
+        unsub();
+        await flush();
+
+        expect(dispose).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0]?.[0])).toContain(sessionId);
+        expect(String(warn.mock.calls[0]?.[0])).toMatch(/dispose/i);
+        expect(warn.mock.calls[0]?.[1]).toBe(failure);
+        // 主动取消仍不是流失败；需要暴露的是清理动作本身的失败。
+        expect(model.getSnapshot().streamFailures[sessionId]).toBeUndefined();
+        warn.mockClear();
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("用户主动取消订阅不产生误报，且取消后仍可重新订阅", async () => {
     const model = new ClientSwarmModel();
     const release: Array<() => void> = [];

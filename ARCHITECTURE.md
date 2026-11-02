@@ -1,6 +1,6 @@
 # dsh-agent-swarm 架构
 
-DSH host 插件：把"批量子代理任务"包装成一个模型可调用的 `agent_swarm` 工具，自带限流自适应调度。
+DSH host 插件：把"批量子代理任务"包装成一个模型可调用的 `agent_swarm` 工具，自带渐进放量调度与可选限流退避。
 同一份包还含一个 client 半（会话标题栏状态面板），由预构建脚本单独产出并随包分发。
 
 ## 模块边界
@@ -9,7 +9,7 @@ DSH host 插件：把"批量子代理任务"包装成一个模型可调用的 `a
 src/
   ── 纯逻辑层（零 DSH 运行时依赖，可脱离宿主单测）──
   types.ts               纯类型：任务规格、结果、调度器配置、错误码、默认调度参数
-  validate.ts            纯函数：六道硬校验 + 模板展开（{{item}}）+ prompt 去重 + per-call 模型路由匹配（白名单）
+  validate.ts            纯函数：八道硬校验 + 模板展开（{{item}}）+ prompt 去重 + per-call 模型路由匹配（白名单）
   result-xml.ts          纯函数：<agent_swarm_result> 渲染（属性/body 转义、编号一致）+ 生产用兜底渲染
   scheduler.ts           纯逻辑调度器：首波/放量/退避/容量收缩恢复；执行函数、限流判定、时钟全部注入
   swarm-registry.ts      纯逻辑状态机：成员七态生命周期 + 100ms 合帧 roster 广播（面板的数据源）
@@ -51,9 +51,9 @@ host 半：`index.ts` 是唯一装配点 → `batch-plan.ts`、`batch-run.ts`、
 `batch-plan.ts` → `validate.ts`、`swarm-error.ts`、`tool-spec.ts`、`config.ts`；
 `batch-run.ts` → `scheduler.ts`、`config.ts`（以及 `batch-plan.ts` / `swarm-registry.ts` / `rate-limit-signal.ts` 的**类型**）；
 `index.ts` → `rate-limit-signal.ts`（构造路由器）；
-`remote.ts` → `swarm-registry.ts`；纯逻辑层内部只依赖 `types.ts`
-（`scheduler.ts`、`validate.ts`、`result-xml.ts` **互不依赖**；`tool-spec.ts`、`swarm-error.ts` 同样只依赖 `types.ts`；
-`text-clip.ts` 无任何依赖，被 `validate.ts` / `swarm-error.ts` / `swarm-registry.ts` / `batch-run.ts` 共用）。
+`remote.ts` → `swarm-registry.ts`；`tool-spec.ts` → `result-xml.ts`（工具描述复用 XML 总上限）；
+（`scheduler.ts`、`validate.ts`、`result-xml.ts` **互不依赖**；`swarm-error.ts` → `text-clip.ts`；
+`text-clip.ts` 无任何依赖，被 `validate.ts` / `result-xml.ts` / `swarm-error.ts` / `swarm-registry.ts` / `batch-run.ts` 共用）。
 
 **方向别读错**：`scheduler.ts` 不依赖 `validate.ts` / `result-xml.ts`——它们在一次工具调用里先后被调用（那是**数据流**，见下节），不是模块依赖。
 纯逻辑层**绝不**反向依赖宿主集成层。
